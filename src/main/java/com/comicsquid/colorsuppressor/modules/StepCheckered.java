@@ -1527,14 +1527,14 @@ public class StepCheckered extends Module implements MapPrinter {
         }
 
         if ((state.equals(State.Mining) || state.equals(State.AwaitBlockBreak)) && nextBlockPos != null) {
-            // Break block if miningPos is not null. Stop walking if further away than maxMiningRange
+            // Break block if miningPos is not null
             if (miningBlockState(nextBlockPos).isAir()) {
                 nextBlockPos = null;
                 state = State.Mining;
-                // Full-area sweep: the block we were breaking is gone - pause briefly
-                // for the dropped items to be picked up by proximity, then find the next
+                // Full-area sweep: immediately find the next target — no pause.
+                // Items drop at the bot's feet and get picked up by vanilla proximity
+                // while it keeps breaking. Continuous breaking is faster than pause-and-collect.
                 if (fullSweepActive) {
-                    timeoutTicks = 5;   // ~0.25s for items to settle + vanilla pickup
                     checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("fullSweepTick", null)));
                 }
             } else {
