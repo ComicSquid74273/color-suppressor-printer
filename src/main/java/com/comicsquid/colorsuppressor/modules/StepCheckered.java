@@ -1527,10 +1527,18 @@ public class StepCheckered extends Module implements MapPrinter {
                     checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("fullSweepTick", null)));
                 }
             } else {
-                // Break up to breaks-per-tick blocks per game tick (shared pattern
-                // with the batch breaking and placement loops)
+                // Break up to breaks-per-tick blocks per game tick. During the full-sweep
+                // (RESET), currentBuildPlan is null so subsequent targets come from the
+                // world scan instead of the plan.
                 for (int broken = 0; broken < breaksPerTick.get(); broken++) {
-                    BlockPos breakTarget = broken == 0 ? nextBlockPos : getNextBatchBreakPos();
+                    BlockPos breakTarget;
+                    if (broken == 0) {
+                        breakTarget = nextBlockPos;
+                    } else if (fullSweepActive) {
+                        breakTarget = findNearestPrintBoxBlock();
+                    } else {
+                        breakTarget = getNextBatchBreakPos();
+                    }
                     if (breakTarget == null) break;
                     if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
                     nextBlockPos = breakTarget;
