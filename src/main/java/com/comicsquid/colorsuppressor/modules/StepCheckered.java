@@ -2218,6 +2218,15 @@ public class StepCheckered extends Module implements MapPrinter {
             Block planned = currentBuildPlan.get(nextBlockPos);
             if (planned == null) return;
             material = planned.asItem();
+            // PLACEMENT DIAGNOSTIC: log every batch placement with its z relative to the bot
+            // — positive = AHEAD (south), negative = BEHIND (north). If any positive value
+            // appears, the behind-filter is broken.
+            if (debugPrints.get()) {
+                double dz = nextBlockPos.getZ() - mc.player.getZ();
+                info(String.format("§3[dbg] PLACE %s at z=%d (bot z=%.1f, dz=%+.1f %s)",
+                    material.getName().getString(), nextBlockPos.getZ(), mc.player.getZ(), dz,
+                    dz > 0 ? "§cAHEAD!" : "§abehind"));
+            }
         } else {
             BlockPos relativePos = nextBlockPos.subtract(getActiveMapCorner());
             material = getActiveMapLayer()[relativePos.getX()][relativePos.getZ()][relativePos.getY()].asItem();
