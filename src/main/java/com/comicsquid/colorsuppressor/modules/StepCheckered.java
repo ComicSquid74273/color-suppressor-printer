@@ -522,6 +522,7 @@ public class StepCheckered extends Module implements MapPrinter {
     int fullSweepBudget;                                             // tick budget for the full-area sweep
     boolean fullSweepCenterChecked;                                  // center vantage already scanned
     int restockCooldown;                                             // blocks repeat supply-run triggers
+    HashMap<BlockPos, Integer> placementCooldowns;                   // litematica-style: retry timer per position
     volatile boolean break2Permitted;                                // master calls (TCP "step:break2")
     volatile boolean breakAllPermitted;                              // master calls (TCP "step:breakall")
     volatile boolean masterBatchBuilt;                               // slave→master: batch k fully printed
@@ -840,6 +841,7 @@ public class StepCheckered extends Module implements MapPrinter {
         lastReportedZ = -1;
         heartbeatTicks = 0;
         pendingDisable = false;
+        placementCooldowns = new HashMap<>();
         synchronized (pendingStepCommands) {
             pendingStepCommands.clear();
         }
@@ -1267,6 +1269,14 @@ public class StepCheckered extends Module implements MapPrinter {
 
         // Supply-run cooldown ticks down; tryPlacingBlock can't re-trigger mid-trip
         if (restockCooldown > 0) restockCooldown--;
+
+        // Placement cooldowns tick down (litematica-style): expired positions become
+        // eligible for retry; successfully placed positions are already skipped by the
+        // world-state check in getNextBatchPlacementPos
+        if (!placementCooldowns.isEmpty()) {
+            placementCooldowns.replaceAll((pos, ticks) -> ticks - 1);
+            placementCooldowns.values().removeIf(ticks -> ticks <= 0);
+        }
 
         if (pendingDisable) {
             pendingDisable = false;
@@ -1988,12 +1998,14 @@ public class StepCheckered extends Module implements MapPrinter {
         if (state.equals(State.Walking)) {
             if (breakStage == 0 && currentBuildPlan != null) {
                 // Place up to blocks-per-tick blocks per game tick. Each iteration
-                // re-targets the nearest eligible block behind the bot. Stops early
-                // if a placement doesn't land (out of materials, swap pending).
+                // re-targets the nearest eligible block behind the bot. Adds a
+                // cooldown to each attempted position (litematica-style) so failed
+                // placements don't get hammered repeatedly in the same tick window.
                 for (int placed = 0; placed < blocksPerTick.get(); placed++) {
                     BlockPos target = getNextBatchPlacementPos();
                     if (target == null) break;
                     nextBlockPos = target;
+                    placementCooldowns.put(target, 4);  // ~0.2s before retry
                     tryPlacingBlock();
                     // Stop if the block didn't land (swap/restock path triggered)
                     if (!miningBlockState(target).isAir()) continue;  // placed, next
@@ -4017,6 +4029,9 @@ public class StepCheckered extends Module implements MapPrinter {
         double bestDist = Double.MAX_VALUE;
         for (BlockPos pos : currentBuildPlan.keySet()) {
             if (!miningBlockState(pos).isAir()) continue;
+            // Skip positions on placement cooldown (litematica-style: don't hammer the
+            // same failed block — let the timeout expire, then retry)
+            if (placementCooldowns.getOrDefault(pos, 0) > 0) continue;
             // HARD GATE: skip everything within 2 blocks of or ahead of the walking direction
             if (walkingSouth && pos.getZ() >= botZ - 2) continue;
             if (!walkingSouth && pos.getZ() <= botZ + 2) continue;
