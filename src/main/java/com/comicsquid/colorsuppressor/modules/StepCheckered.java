@@ -49,6 +49,7 @@ import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
 import net.minecraft.util.Pair;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
@@ -1767,7 +1768,7 @@ public class StepCheckered extends Module implements MapPrinter {
                         // blocks from there, then proceeds to the normal break(2) wait.
                         printRepairPending = false;
                         double repairX = lowerMapCorner.getX() + 2 * currentBatch + 2 + 0.5;  // lane 2 block center
-                        double laneMinus1X = lowerMapCorner.getX() + 2 * currentBatch - 1 + 0.5;
+                        double laneMinus1X = lowerMapCorner.getX() + 2.0 * currentBatch + 1.5;
                         double northZ = lowerMapCorner.getZ() - 2;
                         double southZ = lowerMapCorner.getZ() + 128.7;
                         checkpoints.add(0, new Pair(new Vec3d(laneMinus1X, lowerMapCorner.getY(), northZ), new Pair("break2Done", null)));
@@ -2268,8 +2269,15 @@ public class StepCheckered extends Module implements MapPrinter {
             if (mc.player.getInventory().getStack(slot).isEmpty()) continue;
             Item foundMaterial = mc.player.getInventory().getStack(slot).getItem();
             if (foundMaterial.equals(material)) {
-                // No rotation: 6b6t anticheat allows placing forward without rotating
-                BlockUtils.place(nextBlockPos, Hand.MAIN_HAND, slot, false, 50, true, true, false);
+                // Direct placement via interaction manager (litematica-style air-place):
+                // construct a BlockHitResult on the target position itself (inside-block
+                // hit = true). This works through walls because we don't rely on a visible
+                // neighbor face — soft anticheats (6b6t) accept this without rotation.
+                mc.player.getInventory().setSelectedSlot(slot);
+                BlockHitResult hitResult = new BlockHitResult(
+                    nextBlockPos.toCenterPos(), Direction.UP, nextBlockPos, true);
+                mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hitResult);
+                mc.player.swingHand(Hand.MAIN_HAND);
                 if (material == lastSwappedMaterial) lastSwappedMaterial = null;
                 return;
             }
@@ -3330,7 +3338,7 @@ public class StepCheckered extends Module implements MapPrinter {
         checkpoints.clear();
         state = State.Walking;
         double walkX = lowerMapCorner.getX() + 2.0 * k + 4.0;
-        double laneMinus1X = lowerMapCorner.getX() + 2 * k - 1 + 0.5;
+        double laneMinus1X = lowerMapCorner.getX() + 2.0 * k + 1.5;
         double northZ = lowerMapCorner.getZ() - 2;
         double southZ = lowerMapCorner.getZ() + 128.7;
 
@@ -3725,7 +3733,7 @@ public class StepCheckered extends Module implements MapPrinter {
         }
         batchPassRetries++;
         info("§eBatch " + currentBatch + " break(2) leftover (" + remaining.size() + ") - walking back for a retry pass.");
-        double laneMinus1X = lowerMapCorner.getX() + 2 * currentBatch - 1 + 0.5;
+        double laneMinus1X = lowerMapCorner.getX() + 2.0 * currentBatch + 1.5;
         checkpoints.add(new Pair(new Vec3d(laneMinus1X, lowerMapCorner.getY(), lowerMapCorner.getZ() + 128.7), new Pair("sprint", null)));
         checkpoints.add(new Pair(new Vec3d(laneMinus1X, lowerMapCorner.getY(), lowerMapCorner.getZ() - 2), new Pair("break2Done", null)));
         state = State.Mining;
@@ -3874,7 +3882,7 @@ public class StepCheckered extends Module implements MapPrinter {
     /** Rebuilds the remaining batch route after an interruption (supply run / deposit trip). */
     private void resumeBatchRoute(int stage) {
         double walkX = lowerMapCorner.getX() + 2.0 * currentBatch + 4.0;
-        double laneMinus1X = lowerMapCorner.getX() + 2 * currentBatch - 1 + 0.5;
+        double laneMinus1X = lowerMapCorner.getX() + 2.0 * currentBatch + 1.5;
         double northZ = lowerMapCorner.getZ() - 2;
         double southZ = lowerMapCorner.getZ() + 128.7;
         switch (stage) {
