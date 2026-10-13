@@ -84,12 +84,13 @@ public class StepCheckered extends Module implements MapPrinter {
         .build()
     );
 
-    private final Setting<Integer> placeDelay = sgGeneral.add(new IntSetting.Builder()
-        .name("place-delay")
-        .description("How many milliseconds to wait after placing.")
-        .defaultValue(10)
+    private final Setting<Integer> blocksPerTick = sgGeneral.add(new IntSetting.Builder()
+        .name("blocks-per-tick")
+        .description("How many blocks to place per game tick (max 4 per tick — server limit).")
+        .defaultValue(4)
         .min(1)
-        .sliderRange(10, 300)
+        .max(4)
+        .sliderRange(1, 4)
         .build()
     );
 
@@ -1304,9 +1305,9 @@ public class StepCheckered extends Module implements MapPrinter {
 
         if (state == null) return;
 
-        long timeDifference = System.currentTimeMillis() - lastTickTime;
-        int allowedPlacements = (int) Math.floor(timeDifference / (long) placeDelay.get());
-        lastTickTime += allowedPlacements * placeDelay.get();
+        // Blocks-per-tick pacing: up to N blocks placed per game tick. The old
+        // millisecond-delay approach let the bot walk past blocks faster than it
+        // could place them (1/tick = 20/s vs ~22/s needed at sprint speed).
 
         if (!state.equals(debugPreviousState)) {
             debugPreviousState = state;
@@ -1971,7 +1972,22 @@ public class StepCheckered extends Module implements MapPrinter {
         nextBlockPos = tempPos;
 
         if (state.equals(State.Walking)) {
-            if (breakStage == 0) tryPlacingBlock();
+            if (breakStage == 0 && currentBuildPlan != null) {
+                // Place up to blocks-per-tick blocks per game tick. Each iteration
+                // re-targets the nearest eligible block behind the bot. Stops early
+                // if a placement doesn't land (out of materials, swap pending).
+                for (int placed = 0; placed < blocksPerTick.get(); placed++) {
+                    BlockPos target = getNextBatchPlacementPos();
+                    if (target == null) break;
+                    nextBlockPos = target;
+                    tryPlacingBlock();
+                    // Stop if the block didn't land (swap/restock path triggered)
+                    if (!miningBlockState(target).isAir()) continue;  // placed, next
+                    break;  // not placed — stop and let the tick handle the swap/restock
+                }
+            } else if (breakStage == 0) {
+                tryPlacingBlock();  // legacy path (no batch plan)
+            }
         } else {
             if (rotatePlace.get()) {
                 BlockPos mapCorner = getActiveMapCorner();
