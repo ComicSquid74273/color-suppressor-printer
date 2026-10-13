@@ -1553,7 +1553,7 @@ public class StepCheckered extends Module implements MapPrinter {
                     if (breakTarget == null) break;
                     if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
                     nextBlockPos = breakTarget;
-                    BlockUtils.breakBlock(breakTarget, true);
+                    ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(breakTarget); mc.player.swingHand(Hand.MAIN_HAND);
                     if (!miningBlockState(breakTarget).isAir()) break;  // server didn't accept, stop
                 }
 
@@ -2035,7 +2035,7 @@ public class StepCheckered extends Module implements MapPrinter {
                     if (breakTarget == null) break;
                     if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
                     nextBlockPos = breakTarget;
-                    BlockUtils.breakBlock(breakTarget, true);
+                    ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(breakTarget); mc.player.swingHand(Hand.MAIN_HAND);
                     if (!miningBlockState(breakTarget).isAir()) continue;  // not yet broken, stop
                 }
                 return;
@@ -2061,7 +2061,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 return;
             }
             InvUtils.swap(bestHotbarSlot, false);
-            BlockUtils.breakBlock(nextBlockPos, true);
+            ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(nextBlockPos); mc.player.swingHand(Hand.MAIN_HAND);
             state = State.Mining;
         }
     }
