@@ -3958,21 +3958,23 @@ public class StepCheckered extends Module implements MapPrinter {
     /** Nearest unplaced plan block within reach that does not intersect the player's body. */
     private BlockPos getNextBatchPlacementPos() {
         if (currentBuildPlan == null) return null;
-        // PRINT BEHIND (1 block gap): only place blocks the bot is at least 1 block
-        // past. Placing at or near the bot's own z position creates blocks beside/under
-        // it that look like "printing in front" and can impede movement. Direction is
-        // inferred from the current checkpoint: southward = place at z < botZ - 1;
-        // northward (repair) = place at z > botZ + 1.
+        // PRINT BEHIND (HARD 2-BLOCK GAP): the bot must be at least 2 blocks PAST a block
+        // row before it can be placed. No blocks appear at, beside, or within 2 blocks
+        // ahead of the bot — only well behind it in the walking direction. The bot enters
+        // the north checkpoint, walks 2+ blocks south, then starts placing what it passed.
         double botZ = mc.player.getZ();
         double goalZ = !checkpoints.isEmpty() ? checkpoints.getFirst().getLeft().z : botZ;
         boolean walkingSouth = goalZ > botZ;
+        // Only place when the bot has entered the print area (past the first row)
+        if (walkingSouth && botZ < lowerMapCorner.getZ() + 1.5) return null;
+        if (!walkingSouth && botZ > lowerMapCorner.getZ() + 126.5) return null;
         BlockPos best = null;
         double bestDist = Double.MAX_VALUE;
         for (BlockPos pos : currentBuildPlan.keySet()) {
             if (!miningBlockState(pos).isAir()) continue;
-            // Skip blocks within 1 block of or ahead of the walking direction
-            if (walkingSouth && pos.getZ() >= botZ - 1) continue;
-            if (!walkingSouth && pos.getZ() <= botZ + 1) continue;
+            // HARD GATE: skip everything within 2 blocks of or ahead of the walking direction
+            if (walkingSouth && pos.getZ() >= botZ - 2) continue;
+            if (!walkingSouth && pos.getZ() <= botZ + 2) continue;
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist > interactionRange.get()) continue;
             if (mc.player.getBoundingBox().intersects(new Box(pos))) continue;
