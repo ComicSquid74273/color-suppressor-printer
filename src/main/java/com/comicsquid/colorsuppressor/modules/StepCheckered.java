@@ -3281,7 +3281,7 @@ public class StepCheckered extends Module implements MapPrinter {
 
         checkpoints.clear();
         state = State.Walking;
-        double walkX = lowerMapCorner.getX() + 2.0 * k + 2.0;
+        double walkX = lowerMapCorner.getX() + 2.0 * k + 4.0;
         double laneMinus1X = lowerMapCorner.getX() + 2 * k - 1 + 0.5;
         double northZ = lowerMapCorner.getZ() - 2;
         double southZ = lowerMapCorner.getZ() + 128.7;
@@ -3680,7 +3680,7 @@ public class StepCheckered extends Module implements MapPrinter {
     private void startBreakAll() {
         breakStage = 4;
         checkpoints.clear();
-        double walkX = lowerMapCorner.getX() + 2.0 * currentBatch + 2.0;
+        double walkX = lowerMapCorner.getX() + 2.0 * currentBatch + 4.0;
         double northZ = lowerMapCorner.getZ() - 2;
         double southZ = lowerMapCorner.getZ() + 128.7;
 
@@ -3808,14 +3808,14 @@ public class StepCheckered extends Module implements MapPrinter {
             }
         }
         resumeBatchRoute(savedStage);
-        prependNorthCorridor(lowerMapCorner.getX() + 2.0 * currentBatch + 2.0);
+        prependNorthCorridor(lowerMapCorner.getX() + 2.0 * currentBatch + 4.0);
         state = State.Walking;
         Utils.setForwardPressed(false);
     }
 
     /** Rebuilds the remaining batch route after an interruption (supply run / deposit trip). */
     private void resumeBatchRoute(int stage) {
-        double walkX = lowerMapCorner.getX() + 2.0 * currentBatch + 2.0;
+        double walkX = lowerMapCorner.getX() + 2.0 * currentBatch + 4.0;
         double laneMinus1X = lowerMapCorner.getX() + 2 * currentBatch - 1 + 0.5;
         double northZ = lowerMapCorner.getZ() - 2;
         double southZ = lowerMapCorner.getZ() + 128.7;
@@ -3851,7 +3851,7 @@ public class StepCheckered extends Module implements MapPrinter {
             checkpoints.addFirst(new Pair(chest.getRight(), new Pair("depositBuilding", chest.getLeft())));
             prependNorthCorridor(chest.getRight().x);
         } else {
-            prependNorthCorridor(lowerMapCorner.getX() + 2.0 * currentBatch + 2.0);
+            prependNorthCorridor(lowerMapCorner.getX() + 2.0 * currentBatch + 4.0);
         }
         state = State.Walking;
     }
