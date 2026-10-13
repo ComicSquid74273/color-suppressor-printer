@@ -3937,10 +3937,20 @@ public class StepCheckered extends Module implements MapPrinter {
     /** Nearest unplaced plan block within reach that does not intersect the player's body. */
     private BlockPos getNextBatchPlacementPos() {
         if (currentBuildPlan == null) return null;
+        // PRINT BEHIND: only place blocks the bot has already walked past. Placing ahead
+        // walls the bot in — the 4-lane slice blocks its own path and it can't move
+        // forward. Direction inferred from the current checkpoint: walking south = only
+        // place at z ≤ bot's z; walking north (repair pass) = only place at z ≥ bot's z.
+        double botZ = mc.player.getZ();
+        double goalZ = !checkpoints.isEmpty() ? checkpoints.getFirst().getLeft().z : botZ;
+        boolean walkingSouth = goalZ > botZ;
         BlockPos best = null;
         double bestDist = Double.MAX_VALUE;
         for (BlockPos pos : currentBuildPlan.keySet()) {
             if (!miningBlockState(pos).isAir()) continue;
+            // Skip blocks ahead of the walking direction — they'd block the path
+            if (walkingSouth && pos.getZ() > botZ) continue;
+            if (!walkingSouth && pos.getZ() < botZ) continue;
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist > interactionRange.get()) continue;
             if (mc.player.getBoundingBox().intersects(new Box(pos))) continue;
