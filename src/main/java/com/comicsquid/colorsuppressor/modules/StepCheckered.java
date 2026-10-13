@@ -86,21 +86,19 @@ public class StepCheckered extends Module implements MapPrinter {
 
     private final Setting<Integer> blocksPerTick = sgGeneral.add(new IntSetting.Builder()
         .name("blocks-per-tick")
-        .description("How many blocks to place per game tick (max 4 per tick — server limit).")
+        .description("How many blocks to place per game tick (default 4, some servers allow more).")
         .defaultValue(4)
         .min(1)
-        .max(4)
-        .sliderRange(1, 4)
+        .sliderRange(1, 20)
         .build()
     );
 
     private final Setting<Integer> breaksPerTick = sgGeneral.add(new IntSetting.Builder()
         .name("breaks-per-tick")
-        .description("How many blocks to break per game tick (max 4 per tick — server limit).")
+        .description("How many blocks to break per game tick (default 4, some servers allow more).")
         .defaultValue(4)
         .min(1)
-        .max(4)
-        .sliderRange(1, 4)
+        .sliderRange(1, 20)
         .build()
     );
 
