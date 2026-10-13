@@ -1,0 +1,58 @@
+# gradle
+
+.gradle/
+build/
+out/
+classes/
+
+# eclipse
+
+*.launch
+
+# idea
+
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# vscode
+
+.settings/
+.vscode/
+bin/
+.classpath
+.project
+
+# macos
+
+*.DS_Store
+
+# fabric
+
+run/
+
+# local knowledgebase (reference docs, never committed)
+
+knowledgebase/
+
+# local research tools + run artifacts (never committed)
+
+tools/
+
+# local-only bot controller/monitoring tool (reflection-hooked from StepCheckered; fresh clones skip it)
+
+
+# pre-reset snapshot for the Step-Checker module rebuild (never committed)
+
+reference/
+
+# AI assistant local file
+
+.zcodeignore
+
+AGENTS.md
+
+CHANGELOG.md
+
+.editorconfig

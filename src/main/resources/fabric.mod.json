@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "color-suppressor-printer",
+  "version": "${version}",
+  "name": "Color Suppressor Printer",
+  "description": "Two-bot colour-suppression map printer using the step-checker method.",
+  "authors": [
+    "ComicSquid74273"
+  ],
+  "contact": {
+    "repo": "https://github.com/ComicSquid74273/color-suppressor-printer"
+  },
+  "icon": "assets/color-suppressor/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "meteor": [
+      "com.comicsquid.colorsuppressor.Addon"
+    ]
+  },
+  "mixins": [
+    "colorsuppressor.mixins.json"
+  ],
+  "custom": {
+    "meteor-client:color": "20,255,210"
+  },
+  "depends": {
+    "java": ">=17",
+    "minecraft": ">=${mc_version}",
+    "meteor-client": "*"
+  }
+}
