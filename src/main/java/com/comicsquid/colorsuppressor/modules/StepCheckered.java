@@ -3958,10 +3958,11 @@ public class StepCheckered extends Module implements MapPrinter {
     /** Nearest unplaced plan block within reach that does not intersect the player's body. */
     private BlockPos getNextBatchPlacementPos() {
         if (currentBuildPlan == null) return null;
-        // PRINT BEHIND: only place blocks the bot has already walked past. Placing ahead
-        // walls the bot in — the 4-lane slice blocks its own path and it can't move
-        // forward. Direction inferred from the current checkpoint: walking south = only
-        // place at z ≤ bot's z; walking north (repair pass) = only place at z ≥ bot's z.
+        // PRINT BEHIND (1 block gap): only place blocks the bot is at least 1 block
+        // past. Placing at or near the bot's own z position creates blocks beside/under
+        // it that look like "printing in front" and can impede movement. Direction is
+        // inferred from the current checkpoint: southward = place at z < botZ - 1;
+        // northward (repair) = place at z > botZ + 1.
         double botZ = mc.player.getZ();
         double goalZ = !checkpoints.isEmpty() ? checkpoints.getFirst().getLeft().z : botZ;
         boolean walkingSouth = goalZ > botZ;
@@ -3969,9 +3970,9 @@ public class StepCheckered extends Module implements MapPrinter {
         double bestDist = Double.MAX_VALUE;
         for (BlockPos pos : currentBuildPlan.keySet()) {
             if (!miningBlockState(pos).isAir()) continue;
-            // Skip blocks ahead of the walking direction — they'd block the path
-            if (walkingSouth && pos.getZ() > botZ) continue;
-            if (!walkingSouth && pos.getZ() < botZ) continue;
+            // Skip blocks within 1 block of or ahead of the walking direction
+            if (walkingSouth && pos.getZ() >= botZ - 1) continue;
+            if (!walkingSouth && pos.getZ() <= botZ + 1) continue;
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist > interactionRange.get()) continue;
             if (mc.player.getBoundingBox().intersects(new Box(pos))) continue;
