@@ -730,6 +730,17 @@ public class StepCheckered extends Module implements MapPrinter {
     public void onStepMasterCommand(String command) {
         if (command == null || command.isBlank()) return;
         if (debugPrints.get()) info("§3[dbg] TCP master→slave: §b" + command);
+        // ABORT clears the entire command queue and puts itself at the head — a stuck
+        // "build" command at the front would otherwise block it from ever being processed
+        // (the slave's processPendingStepCommands only peeks at the HEAD of the queue,
+        // so a mid-phase build that can't be consumed traps everything behind it)
+        if ("abort".equals(command.split(":")[0])) {
+            synchronized (pendingStepCommands) {
+                pendingStepCommands.clear();
+                pendingStepCommands.addLast(command);
+            }
+            return;
+        }
         synchronized (pendingStepCommands) {
             pendingStepCommands.addLast(command);
         }
@@ -3432,6 +3443,7 @@ public class StepCheckered extends Module implements MapPrinter {
     /** Master RESET: break every remaining batch block, deposit the items, return to standby. */
     private void stepAbort() {
         info("§cRESET: full-area clear starting.");
+        // Force-clear ALL active state — any phase the slave was in is now dead
         checkpoints.clear();
         printRepairPending = false;
         depositBacklogSlots.clear();
@@ -3441,6 +3453,15 @@ public class StepCheckered extends Module implements MapPrinter {
         currentBuildPlan = null;
         breakStage = 0;
         collectingStragglers = false;
+        nextBlockPos = null;
+        toBeHandledInvPacket = null;
+        closeNextInvPacket = false;
+        toBeSwappedSlot = -1;
+        fullSweepActive = false;
+        timeoutTicks = 0;
+        interactTimeout = 0;
+        Utils.setForwardPressed(false);
+        Utils.setSneakPressed(false);
 
         // Full-area sweep: the slave walks to vantage points where its render distance
         // covers the 128x128 print box and breaks every non-air block (spatial awareness,
