@@ -94,6 +94,16 @@ public class StepCheckered extends Module implements MapPrinter {
         .build()
     );
 
+    private final Setting<Integer> breaksPerTick = sgGeneral.add(new IntSetting.Builder()
+        .name("breaks-per-tick")
+        .description("How many blocks to break per game tick (max 4 per tick — server limit).")
+        .defaultValue(4)
+        .min(1)
+        .max(4)
+        .sliderRange(1, 4)
+        .build()
+    );
+
     private final Setting<List<Block>> startBlocks = sgGeneral.add(new BlockListSetting.Builder()
         .name("start-blocks")
         .description("Which block to interact with to start the printing process.")
@@ -125,12 +135,8 @@ public class StepCheckered extends Module implements MapPrinter {
         .build()
     );
 
-    private final Setting<Boolean> rotatePlace = sgGeneral.add(new BoolSetting.Builder()
-        .name("rotate-place")
-        .description("Rotate when placing a block.")
-        .defaultValue(true)
-        .build()
-    );
+    // rotate-place setting removed: 6b6t anticheat is soft, allows placing/breaking
+    // without rotation. All placement and breaking goes forward without rotating.
 
     private final Setting<Boolean> customFolderPath = sgGeneral.add(new BoolSetting.Builder()
         .name("custom-folder-path")
@@ -1523,14 +1529,15 @@ public class StepCheckered extends Module implements MapPrinter {
                     checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("fullSweepTick", null)));
                 }
             } else {
-                // Only break when the block is actually within interaction range
-                if (mc.player.getEyePos().distanceTo(nextBlockPos.toCenterPos()) <= interactionRange.get()) {
-                    if (rotatePlace.get()) {
-                        BlockPos mapCorner = getActiveMapCorner();
-                        Vec3d lookPos = new Vec3d(mc.player.getX(), mapCorner.toCenterPos().y + 0.5f, nextBlockPos.toCenterPos().z);
-                        mc.player.setPitch((float) Rotations.getPitch(lookPos));
-                    }
-                    BlockUtils.breakBlock(nextBlockPos, true);
+                // Break up to breaks-per-tick blocks per game tick (shared pattern
+                // with the batch breaking and placement loops)
+                for (int broken = 0; broken < breaksPerTick.get(); broken++) {
+                    BlockPos breakTarget = broken == 0 ? nextBlockPos : getNextBatchBreakPos();
+                    if (breakTarget == null) break;
+                    if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
+                    nextBlockPos = breakTarget;
+                    BlockUtils.breakBlock(breakTarget, true);
+                    if (!miningBlockState(breakTarget).isAir()) break;  // server didn't accept, stop
                 }
 
                 if (state.equals(State.AwaitBlockBreak)) {
@@ -1989,11 +1996,6 @@ public class StepCheckered extends Module implements MapPrinter {
                 tryPlacingBlock();  // legacy path (no batch plan)
             }
         } else {
-            if (rotatePlace.get()) {
-                BlockPos mapCorner = getActiveMapCorner();
-                Vec3d lookPos = new Vec3d(mc.player.getX(), mapCorner.toCenterPos().y + 0.5f, nextBlockPos.toCenterPos().z);
-                mc.player.setPitch((float) Rotations.getPitch(lookPos));
-            }
             if (breakStage != 0) {
                 // Batch breaking always swings the reserved pickaxe slot (hotbar slot 8)
                 ItemStack reserved = mc.player.getInventory().getStack(8);
@@ -2007,8 +2009,15 @@ public class StepCheckered extends Module implements MapPrinter {
                     return;
                 }
                 mc.player.getInventory().setSelectedSlot(8);
-                if (mc.player.getEyePos().distanceTo(nextBlockPos.toCenterPos()) <= interactionRange.get()) {
-                    BlockUtils.breakBlock(nextBlockPos, true);
+                // Break up to breaks-per-tick blocks per game tick (same loop pattern
+                // as the placement: re-target the nearest eligible block each iteration)
+                for (int broken = 0; broken < breaksPerTick.get(); broken++) {
+                    BlockPos breakTarget = broken == 0 ? nextBlockPos : getNextBatchBreakPos();
+                    if (breakTarget == null) break;
+                    if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
+                    nextBlockPos = breakTarget;
+                    BlockUtils.breakBlock(breakTarget, true);
+                    if (!miningBlockState(breakTarget).isAir()) continue;  // not yet broken, stop
                 }
                 return;
             }
@@ -2253,11 +2262,8 @@ public class StepCheckered extends Module implements MapPrinter {
             if (mc.player.getInventory().getStack(slot).isEmpty()) continue;
             Item foundMaterial = mc.player.getInventory().getStack(slot).getItem();
             if (foundMaterial.equals(material)) {
-                // Batch placement never rotates: the plan reaches around/behind the bot, and a
-                // rotated placement against an occluded face gets rejected by the server (the
-                // "66 missing" case). Placing forward like the legacy printers goes through
-                // standing blocks under BOTH rotate-place settings.
-                BlockUtils.place(nextBlockPos, Hand.MAIN_HAND, slot, currentBuildPlan == null && rotatePlace.get(), 50, true, true, false);
+                // No rotation: 6b6t anticheat allows placing forward without rotating
+                BlockUtils.place(nextBlockPos, Hand.MAIN_HAND, slot, false, 50, true, true, false);
                 if (material == lastSwappedMaterial) lastSwappedMaterial = null;
                 return;
             }
