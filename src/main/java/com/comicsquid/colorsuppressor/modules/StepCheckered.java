@@ -3734,7 +3734,10 @@ public class StepCheckered extends Module implements MapPrinter {
                     double farZ = fromSouth ? lowerMapCorner.getZ() - 2 : lowerMapCorner.getZ() + 128.7;
                     checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("batchBegin", null)));
                     checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("printDone", null)));
-                    checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("awaitBreakAll", null)));
+                    // "awaitBreak2" (NOT "awaitBreakAll") - only this sends step:ready:N,
+                    // which the master needs to start W2. The breakall handler's batch-0
+                    // split path then picks the slave up from AwaitBreakPermission2.
+                    checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("awaitBreak2", null)));
                     prependLaneCentering(walkX);
                     state = State.Walking;
                     Utils.setForwardPressed(false);
