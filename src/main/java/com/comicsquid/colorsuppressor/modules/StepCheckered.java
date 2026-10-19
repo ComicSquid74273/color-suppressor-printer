@@ -1597,24 +1597,29 @@ public class StepCheckered extends Module implements MapPrinter {
         // in interaction range wherever it walks — no walking past blocks, noobline
         // included. When no blocks remain in range, target nearby DROPPED ITEMS for
         // pickup (prevents items being left behind during the pass).
-        if (state == State.Mining && nextBlockPos == null && fullSweepActive && resetLadderCol < 32
+        if (state == State.Mining && fullSweepActive && resetLadderCol < 32
             && !checkpoints.isEmpty()
             && ("resetPass".equals(checkpoints.getFirst().getRight().getLeft())
                 || "resetStation".equals(checkpoints.getFirst().getRight().getLeft()))) {
-            int bx0 = lowerMapCorner.getX();
-            int bx1 = bx0 + 127;
-            int bz0 = lowerMapCorner.getZ() - 1;   // noobline row included
-            int bz1 = lowerMapCorner.getZ() + 127;
-            nextBlockPos = findNearestBlockInArea(bx0, bx1, bz0, bz1);
-
-            // No blocks to break nearby → pick up dropped items in range
-            if (nextBlockPos == null && freeInventoryCapacity() > 0) {
-                ItemEntity nearbyItem = findNearestGroundItem(4);
-                if (nearbyItem != null && mc.player.getEyePos().distanceTo(nearbyItem.getEntityPos()) < 8) {
-                    // Walk to the item for vanilla proximity pickup
-                    checkpoints.addFirst(new Pair(
-                        new Vec3d(nearbyItem.getX(), nearbyItem.getY(), nearbyItem.getZ()),
-                        new Pair("resetStation", null)));
+            // ARM BLOCK TARGETS (nearest in the whole box)
+            if (nextBlockPos == null) {
+                int bx0 = lowerMapCorner.getX();
+                int bx1 = bx0 + 127;
+                int bz0 = lowerMapCorner.getZ() - 1;
+                int bz1 = lowerMapCorner.getZ() + 127;
+                nextBlockPos = findNearestBlockInArea(bx0, bx1, bz0, bz1);
+            }
+            // PICK UP NEARBY ITEMS — every tick, alongside breaking (not gated on
+            // blocks being absent; items within 4 blocks get a walk-to side-step)
+            if (freeInventoryCapacity() > 0) {
+                ItemEntity nearbyItem = findNearestGroundItem(3);
+                if (nearbyItem != null) {
+                    double itemDist = mc.player.getEyePos().distanceTo(nearbyItem.getEntityPos());
+                    if (itemDist < 4.0 || (itemDist < 8.0 && nextBlockPos == null)) {
+                        checkpoints.addFirst(new Pair(
+                            new Vec3d(nearbyItem.getX(), nearbyItem.getY(), nearbyItem.getZ()),
+                            new Pair("resetStation", null)));
+                    }
                 }
             }
         }
