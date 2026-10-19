@@ -92,6 +92,155 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-10-20 — live stall diagnosed + fixed: print-pass deadlock at pass start
+User ran START ALL with the (d) build; the slave froze at the start of the priming
+phase twice (01:01 run: 2 PLACE lines at the staging then minutes of silence; 01:36
+run: froze on the first refill-chest walk). THREE defects found and fixed from the
+logs:
+
+1. **RANGE-METRIC MISMATCH deadlock (the stall)**: the walk-act gate measured range
+   from the FEET (PlayerUtils.distanceTo, full 3D) while the target picker arms with
+   EYE distance. An upper-layer block (y+2.5 over the feet) at picker eye-range 4.4
+   is ~5.0 feet-range -> the placement branch refused to attempt the very target the
+   new adaptive pace was holding the bot on -> attempts never incremented -> the hold
+   never released -> total silent stall. Fix: the gate now uses eye distance (the
+   picker's own metric). The mismatch predates (d) — it silently skipped placements
+   before; only the pace-hold turned it into a freeze.
+2. **Wait heartbeat counted pause-gate ticks**: the wait bookkeeping sat behind the
+   20-tick requeue pause (~1 reachable tick in 21), stretching the "30s" heartbeat to
+   ~10 real minutes and the timeout to hours — which is why the master showed NO
+   heartbeat during the stall. Fix: bookkeeping moved to the top of tickStepMaster,
+   before every pause gate; the consuming switch stays where it is.
+
+3. **Pace-hold fired on non-placement legs (the 01:36 stall)**: the hold only checked
+   "placeable target in range" — but "refill"/"centerLane" legs are NOT in
+   ALLOW_PLACE_ACTIONS, so the placement branch never runs on them, attempts never
+   increment, and the hold never released: the bot froze at the staging with the
+   first refill chest queued. Fix: the hold now mirrors the placement branch's FULL
+   preconditions (same allowlist, same picker, material carried via
+   `isMaterialCarried`, attempt cap) PLUS a 100-tick watchdog that force-releases
+   any hold and logs it — no future gap in these conditions can freeze the bot again.
+
+Also hardened: the adaptive pace hold now requires the target's material to be
+carried — a missing-material target never holds, so the placement attempt routes it
+straight into the emergency mid-batch supply run (the 01:01 run also showed an
+under-supplied "Not all necessary stacks restocked" refill immediately before the
+stall). Build green; UNCOMMITTED.
+
+### 2026-10-19 (d) — FLOW OPTIMIZATION: merged batch 0, zero repositioning legs, tick-level waits
+User-directed ("optimize the flow, reduce unwanted walks; slave fixes in real time;
+carry batch-0 supply once, emergency refill only; master maps from any direction").
+Build green; UNCOMMITTED pending approval.
+
+- **MERGED BATCH 0** (~1.5 min/run saved): the priming build IS the floor half
+  (identical plans) and the priming walk IS W1 (identical world state at record
+  time). PRIMING_WALK completion now requests `buildhalf:0:t` directly and waits in
+  place — the floor-half request, its supply trips, its verification pass, and the
+  W1 re-sweep are all gone. The old split entry (buildhalf:0:f) remains as a
+  direct-resume safety path.
+- **ONE-TRIP BATCH-0 SUPPLY**: the priming supply run now computes requirements from
+  the MERGED plan (priming recessives + dominant pair 0 tops) — the tops pass needs
+  no refill walk; mid-print shortages fall back to the existing emergency restock.
+- **ZERO REPOSITIONING LEGS on the master**: waits now happen IN PLACE
+  (`stepQueueWaitHere` — nearest platform to the current position, map stowed =
+  safe anywhere), and EVERY sweep (priming / W1 / W2 / closing) starts from
+  whichever end the master is at (record content is direction-independent; the doc's
+  own W2 is S->N). Result: W2 of batch k runs on lane 2k+129 = W1 lane of batch k+1,
+  so the master's total movement is exactly the record sweeps — the dead north-only
+  `stepQueueSafeRoute` was removed. Chain check: fill(south) -> priming S->N ->
+  W2 N->S -> W1 S->N ... -> batch 62's W2 lands on lane 253 = the closing lane.
+- **TICK-LEVEL WAIT CONSUMPTION (fixes the START ALL deadlock class, known issue
+  #11)**: WAIT_PRIMING_BUILD / WAIT_BATCH_BUILD / WAIT_CLOSING_BUILD / WAIT_BREAK_ALL
+  consume their slave signals directly in tickStepMaster every tick — the fragile
+  checkpoint-arrival re-check chain is now a fallback only. Every wait heartbeats
+  every 30s ("Still waiting for ready:N (Xs)...") and aborts with a named signal
+  after 10 minutes — a silent hang is no longer possible.
+- **ADAPTIVE PRINT PACE (slave real-time repair)**: while walking a print pass, the
+  slave holds forward whenever an in-range plan block is placeable right now (air,
+  off-cooldown) — the placement retries immediately instead of being outpaced and
+  left for an end-of-pass repair walk. Per-position attempt cap (5) so a permanently
+  rejected block cannot stall the pass; capped blocks fall through to the rare
+  end-of-pass repair. `placementAttempts` cleared at every plan reset.
+- **break(2) pickup**: verified no targeted pickup exists in break(2) in any recent
+  jar — what was observed is vanilla proximity passively collecting drops that pop
+  1.5-3.5 blocks from the mandatory breaking lane (zero walking cost, and it reduces
+  break(4)'s sweep work). No change made.
+
+### 2026-10-19 (c) — batch-0 flow audit: priming/floor redundancy + break(2) pickup verdict
+User asked for a doc-vs-code-vs-logs comparison of all batch-0 phases and the
+unnecessary NS walking named. Findings (no code changed — merge proposal awaits go-ahead):
+
+- **The priming build and the batch-0 FLOOR half are the SAME 450 blocks** —
+  `assemblePriming()` = `addLayerAt(rec[0], 0) + addLayerAt(rec[1], 2)` = exactly the
+  buildhalf:0:f plan (verified identical at lines 5819/3992). Log-proven in the 21:24
+  run: priming placed 450 fresh (2m26s), then the floor-half phase ran 4 refill chest
+  cycles + a 24s verification pass that placed nothing new — followed by W1 sweeping
+  lane 125 over the SAME world state the priming walk had already recorded (no tops
+  standing in both cases). Net waste per run: the floor-half request + supply trips +
+  verification pass + the W1 sweep + one extra south->north return ~= 1.5 min.
+  **Proposed merge:** treat the priming walk AS W1 — after PRIMING_WALK completes, send
+  `buildhalf:0:t` directly (master already supports this: the split lane logic at the
+  stepBatchSafe case picks lane 127 for W2 when stepMasterBreak2Sent is set). The tops
+  half would need a supply run added (in the merged flow no floor-half beginBatch(0)
+  fetches the dominant materials — today's "materials at hand" assumption breaks).
+- **Standard batches (k>=1) match the doc exactly**: master W1 N->S on 2k+127, W2 S->N
+  on 2k+129 (= next batch's W1 lane, so the chain never walks a dead NS leg; all
+  south->north returns are parallel with slave builds). Slave does 3 NS passes
+  (print / break(2) / break(4)) — the minimum the doc's build->break(2)->break(4)
+  ordering allows. No dead walks found for k>=1.
+- **break(2) item pickup verdict: the current code already complies** — the only item
+  chase path is sweepTick (reachable only through finishBatch at batchExit, i.e. after
+  break(4)), my breakAllDone gate is break(4)-only, the legacy mineEnd collection is
+  unreachable in the step flow, and no inventory/deposit logic triggers at breakStage 2.
+  Drops landing at the slave's feet during break(2) are collected by vanilla proximity
+  passively (no walking, cannot be disabled) — targeted pickup in break(2) existed only
+  in pre-34481ca jars (192d4f7's per-tick side-steps, since removed).
+- Minor: the PRIMING_WALK completion queues two transit checkpoints that
+  `beginStepBatch(0)`'s `stepQueueSafeRoute` clears in the same tick — dead code, no
+  runtime cost.
+
+### 2026-10-19 (b) — BREAK-ALL phase: arrival gate + sweep exit discipline (same logic as RESET)
+Reset work committed as `c9afad0`. User clarification: the advancement problems live in
+the BREAK-ALL phase (break(4)) — the slave's single breaking pass down the batch lane.
+Both the pass-end gate and the exit sweep now carry the RESET verification logic:
+
+- **`breakAllDone` was an EMPTY case** (`case "breakAllDone": break;`) — the breaking
+  pass handed straight off to batchExit with ZERO verification of what it just walked.
+  It is now a full ARRIVAL GATE (same shape as resetPass): census over the batch
+  window incl. margin ({ready, falling, pickupDelay, owned} + pendBrk + vanillaQ),
+  straggler blocks chased through the hybrid Mining loop (nextBlockPos armed; pending
+  guard + vanilla continuation apply), in-flight drops DWELT for, CLEAN only on
+  blocks=0 + ready=0 + in-flight=0, STALL DETECTOR (same signature discipline, 80
+  frozen rounds -> dump + advance to the exit gate). Applies to the closing break
+  route too (same action). NOTE exposed while porting: `startClosingBreak` walks
+  staging x_rel=253.5 (the MASTER's final-walk lane) while the closing pair sits at
+  lanes 126-127 — the pass end is ~125 blocks out of breaking range; the gate's
+  straggler chase now walks to the blocks instead of error-stopping, but the route
+  itself is a suspected pre-existing bug in the UNTESTED closing flow.
+- **finishBatch census gate**: completion now requires blocks=0 AND ready-items=0 AND
+  no in-flight drops over the batch window (census via `itemCensusInBatchWindow` —
+  same states as the RESET census).
+- **In-flight dwell** at the exit: a clean-looking batch with falling/pickup-delayed
+  drops WAITS (bounded 100 rounds, logged) instead of completing and leaving them
+  behind — the RESET premature-CLEAN fix.
+- **Inventory-full deposit trip**: inv full with drops pending queues a deposit chest
+  then re-verifies — previously every sweep re-arm exited instantly and burned all
+  8 retries.
+- **Progress-aware retries**: a finishBatch re-arm only consumes a retry when the
+  sweep state signature (blocks + item states + position) is FROZEN since the last
+  re-arm; progress refunds retries. 8 consecutive frozen re-arms give up with a
+  CRITICAL warning naming what remains.
+- **Anti-stuck exemption**: sweepTick/batchExit/breakAllDone joined resetPass/
+  resetStation outside the generic 10-round force-skip — long re-queue sequences had
+  their only queued checkpoint removed mid-clear, leaving an EMPTY route -> StandBy
+  with the batch unfinished and the master waiting forever.
+- **Logs**: [BREAKALL-VERIFY] pass-end census (on state change), CLEAN, STALL;
+  [SWEEP-VERIFY] early-exit reason (budget/inv), dwell entry, gate census, re-arm
+  with FROZEN marker + retry count, give-up warning.
+State fields `sweepWaitRounds/sweepWaitLogged/sweepReArmSig` cleared on activation,
+batch begin, tops-half begin, and stepAbort; `nearestRemainingPlanBlock` helper added.
+Build green; UNCOMMITTED pending approval.
+
 ### 2026-10-19 — RESET-VERIFY logging + segment-decode fix + item scan margin + full fix pass
 User report: during RESET the bot walks to the next checkpoint before all blocks are
 broken/confirmed and before dropped items are collected — including drops that skid
@@ -372,6 +521,23 @@ watch fields; state cleared on activation + stepAbort. Compiles clean; NOT commi
    blocks gone before reporting; premature signals mark incomplete batches as done
 10. **Deposit backlog**: one stack per delay tick while chest screen stays open;
    full-inventory syncs only arrive on chest open (not per-move)
+11. **START ALL deadlocks on the MASTER's wait stages (diagnosed 2026-10-19 22:00 from
+   live logs, fix pending)**: the master's waits (WAIT_PRIMING_BUILD / WAIT_BATCH_BUILD
+   / WAIT_BREAK_ALL) re-check slave signals ONLY when a checkpoint "arrival" fires
+   (requeueStepWait = re-queued checkpoint + 20-tick pause). That arrival chain has NO
+   timeout, NO watchdog, NO snap/generous radius (0.2-block buffer vs ~0.28 blocks/tick
+   sprint steps), and NO always-on logging. Two START ALL runs tonight deadlocked
+   exactly there while the slave behaved correctly: 21:24 run — priming ok, floor half
+   printed, slave sent ready:0 at 21:27:23, master silent until killed at 21:27:39;
+   21:52 run — slave sent ready:prime at 21:53:37, master NEVER consumed it (and even
+   the slave's 21:54:03 disconnect produced no abort line — the scheduler was wedged
+   below the disconnect check for 14 minutes). Everything on the master is debug-gated,
+   so a wedged wait is indistinguishable from working. Planned fix: tick-level signal
+   consumption in wait stages (not arrival-driven), wait timeouts with named-stage
+   aborts, snap/generous arrival radius + walk-progress detector, always-on stage
+   transition + heartbeat logs.
+   **FIXED 2026-10-19 (d)**: tick-level signal consumption in all wait stages +
+   30s heartbeat + 10-minute named timeout (see change history (d)).
 
 ## Test rig
 
