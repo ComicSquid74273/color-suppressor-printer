@@ -1600,6 +1600,15 @@ public class StepCheckered extends Module implements MapPrinter {
             nextBlockPos = findNearestBlockInArea(px0, px0 + 3, pz0, pz1);
         }
 
+        // Silent break-confirmation processing (runs every tick before break logic):
+        // decrement timers, remove confirmed (now air), silently drop expired entries.
+        // Missed blocks are re-targeted naturally by nearest-first pickers.
+        if (!breakPending.isEmpty()) {
+            breakPending.replaceAll((pos, ticks) -> ticks - 1);
+            breakPending.values().removeIf(ticks -> ticks <= 0);
+            breakPending.keySet().removeIf(pos -> miningBlockState(pos).isAir());
+        }
+
         if ((state.equals(State.Mining) || state.equals(State.AwaitBlockBreak)) && nextBlockPos != null) {
             // Break block if miningPos is not null
             if (miningBlockState(nextBlockPos).isAir()) {
@@ -2306,6 +2315,7 @@ public class StepCheckered extends Module implements MapPrinter {
             }
             InvUtils.swap(bestHotbarSlot, false);
             ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(nextBlockPos); mc.player.swingHand(Hand.MAIN_HAND);
+            breakPending.put(nextBlockPos, 2);  // silent confirmation tracking
             state = State.Mining;
         }
     }
