@@ -230,7 +230,7 @@ public final class Utils {
             for (int z = pz - hRadius; z <= pz + hRadius; z++) {
                 for (int y = py - vRadius; y <= py + vRadius; y++) {
                     blockPos.set(x, y, z);
-                    BlockState blockState = MapAreaCache.getCachedBlockState(blockPos);
+                    BlockState blockState = mc.world.getBlockState(blockPos);
                     function.accept(blockPos, blockState);
                 }
             }
@@ -339,7 +339,7 @@ public final class Utils {
                 BlockPos relativePos = new BlockPos(x, 0, z);
                 BlockPos absolutePos = mapCorner.add(relativePos);
                 if (knownErrors.contains(absolutePos)) continue;
-                BlockState blockState = MapAreaCache.getCachedBlockState(absolutePos);
+                BlockState blockState = mc.world.getBlockState(absolutePos);
                 Block block = blockState.getBlock();
                 if (!blockState.isAir()) {
                     if (map[x][z] != block) invalidPlacements.add(absolutePos);

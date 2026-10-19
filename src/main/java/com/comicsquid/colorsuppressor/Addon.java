@@ -1,7 +1,6 @@
 package com.comicsquid.colorsuppressor;
 
 import com.comicsquid.colorsuppressor.modules.StepCheckered;
-import com.comicsquid.colorsuppressor.utils.MapAreaCache;
 import com.comicsquid.colorsuppressor.utils.SlaveSystem;
 import com.comicsquid.colorsuppressor.utils.Utils;
 import com.mojang.logging.LogUtils;
@@ -20,7 +19,6 @@ public class Addon extends MeteorAddon {
         LOG.info("Initializing Color Suppressor Printer");
         // Subscribe Util classes to Events
         MeteorClient.EVENT_BUS.subscribe(Utils.class);
-        MeteorClient.EVENT_BUS.subscribe(MapAreaCache.class);
         MeteorClient.EVENT_BUS.subscribe(SlaveSystem.class);
 
         // Modules
