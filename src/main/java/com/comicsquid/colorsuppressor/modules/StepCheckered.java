@@ -618,9 +618,9 @@ public class StepCheckered extends Module implements MapPrinter {
 
     private static final int[] STEP_CHECKPOINT_Z = {14, 40, 64, 88, 112};
     /** RESET ladder z-segments: inclusive row ranges and station centres (relative). */
-    private static final int[] RESET_SEG_START = {0, 26, 51, 77, 102};
-    private static final int[] RESET_SEG_END = {25, 50, 76, 101, 127};
-    private static final int[] RESET_SEG_CENTER_Z = {12, 38, 64, 89, 114};
+    private static final int[] RESET_SEG_START = {0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120};
+    private static final int[] RESET_SEG_END = {7, 15, 23, 31, 39, 47, 55, 63, 71, 79, 87, 95, 103, 111, 119, 127};
+    private static final int[] RESET_SEG_CENTER_Z = {4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92, 100, 108, 116, 124};
     /** Route actions during which placement may happen (also gates the Dynamic speed mode:
      *  these + Mining = "working", everything else is transit). */
     private static final List<String> ALLOW_PLACE_ACTIONS = Arrays.asList("lineBegin", "lineEnd", "sprint",
@@ -1604,13 +1604,15 @@ public class StepCheckered extends Module implements MapPrinter {
             && !checkpoints.isEmpty()
             && ("resetPass".equals(checkpoints.getFirst().getRight().getLeft())
                 || "resetStation".equals(checkpoints.getFirst().getRight().getLeft()))) {
-            // (resetItemHoldTicks is managed inside the item-pickup block below)
-            // ARM BLOCK TARGETS (nearest in the whole box)
+            // ARM BLOCK TARGETS: scan ONLY within z±6 of the bot. Prevents
+            // targeting blocks far ahead while missing blocks behind. Items
+            // collected by vanilla proximity + segment confirmation + verify walk.
             if (nextBlockPos == null) {
+                int botZ = mc.player.getBlockZ();
                 int bx0 = lowerMapCorner.getX();
                 int bx1 = bx0 + 127;
-                int bz0 = lowerMapCorner.getZ() - 1;
-                int bz1 = lowerMapCorner.getZ() + 127;
+                int bz0 = Math.max(lowerMapCorner.getZ() - 1, botZ - 6);
+                int bz1 = Math.min(lowerMapCorner.getZ() + 127, botZ + 6);
                 nextBlockPos = findNearestBlockInArea(bx0, bx1, bz0, bz1);
             }
             // NO item targeting from the feed — queuing item checkpoints here
@@ -3845,8 +3847,8 @@ public class StepCheckered extends Module implements MapPrinter {
      *  (column, segment) - and appends the two-vantage final verification. */
     private void queueResetLadder(int fromCol, int fromSeg) {
         for (int col = fromCol; col <= resetLadderEndCol; col++) {
-            for (int i = 0; i < 5; i++) {
-                int seg = (col % 2 == 0) ? i : 4 - i;
+            for (int i = 0; i < RESET_SEG_START.length; i++) {
+                int seg = (col % 2 == 0) ? i : RESET_SEG_START.length - 1 - i;
                 if (col == fromCol && ((col % 2 == 0 && seg < fromSeg) || (col % 2 == 1 && seg > fromSeg))) continue;
                 // Each pass walks from one segment boundary to the other — the entry
                 // point is whichever end the bot is closer to (handled by the snake
@@ -3871,7 +3873,7 @@ public class StepCheckered extends Module implements MapPrinter {
      *  complete. Any finding re-scopes a ladder sweep (see the verifyWalk handler). */
     private void queueVerifyWalk() {
         Vec3d lastStation = null;
-        for (int seg = 0; seg < 5; seg++) {
+        for (int seg = 0; seg < RESET_SEG_CENTER_Z.length; seg++) {
             double wz = lowerMapCorner.getZ() + RESET_SEG_CENTER_Z[seg] + 0.5;
             lastStation = new Vec3d(lowerMapCorner.getX() + 66.0, lowerMapCorner.getY(), wz);
             checkpoints.add(new Pair(lastStation, new Pair("verifyWalk", null)));
