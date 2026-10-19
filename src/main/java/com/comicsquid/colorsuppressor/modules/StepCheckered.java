@@ -1981,6 +1981,12 @@ public class StepCheckered extends Module implements MapPrinter {
                 }
                 case "resetPass":
                 case "resetStation": {
+                    // ALWAYS Mining during reset — Walking disables the feed (no break
+                    // targets armed), so any block in the path walls the bot. This
+                    // single assignment covers every path below, including the clean
+                    // return (which previously left the state as whatever the previous
+                    // handler set — potentially Walking from an item chase).
+                    state = State.Mining;
                     // PASS ARRIVAL: the serpentine walk already cleared everything in range.
                     // Confirm the segment with a bounded scan; only stragglers (bounced
                     // drops, unconfirmed breaks) get targeted cleanup here - no greedy
@@ -2005,8 +2011,9 @@ public class StepCheckered extends Module implements MapPrinter {
                             checkpoints.add(new Pair(ladderChest.getRight(), new Pair("depositBuilding", ladderChest.getLeft())));
                             queueResetLadder(resetLadderCol, resetLadderSeg);
                             prependNorthCorridor(ladderChest.getRight().x);
-                            state = State.Walking;
+                            state = State.Mining;
                             info("§7Inventory full - depositing, then resuming the reset ladder.");
+                            state = State.Mining;  // resume in Mining: feed stays active on the return walk
                             return;
                         }
                     }
@@ -2036,7 +2043,7 @@ public class StepCheckered extends Module implements MapPrinter {
                     } else {
                         // in-cell item chase WITHOUT clearing the ladder queue
                         checkpoints.addFirst(new Pair(new Vec3d(lItem.getX(), lItem.getY(), lItem.getZ()), new Pair("resetStation", null)));
-                        state = State.Walking;
+                        state = State.Mining;  // Mining: feed stays active, blocks in path get broken
                     }
                     return;
                 }
@@ -3846,6 +3853,8 @@ public class StepCheckered extends Module implements MapPrinter {
     /** Builds the RESET ladder from (fromCol, fromSeg) in snake order - one station per
      *  (column, segment) - and appends the two-vantage final verification. */
     private void queueResetLadder(int fromCol, int fromSeg) {
+        state = State.Mining;   // the ladder IS breaking — always Mining
+        breakStage = 4;
         for (int col = fromCol; col <= resetLadderEndCol; col++) {
             for (int i = 0; i < RESET_SEG_START.length; i++) {
                 int seg = (col % 2 == 0) ? i : RESET_SEG_START.length - 1 - i;
