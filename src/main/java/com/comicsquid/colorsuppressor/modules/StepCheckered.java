@@ -541,7 +541,9 @@ public class StepCheckered extends Module implements MapPrinter {
     // any that the server didn't process — BEFORE the bot walks past them.
     HashMap<BlockPos, Integer> breakPending;                        // pos -> ticks until silently confirmed
     java.util.HashSet<BlockPos> needsVanillaBreak;                  // fastBreak failed → use vanilla mining
-    int resetItemHoldTicks;                                         // forward-hold ticks for item pickup
+    int resetItemHoldTicks;
+    String lastCheckpointAction;
+    int stuckCheckpointCount;                                         // forward-hold ticks for item pickup
     volatile boolean break2Permitted;                                // master calls (TCP "step:break2")
     volatile boolean breakAllPermitted;                              // master calls (TCP "step:breakall")
     volatile boolean masterBatchBuilt;                               // slave→master: batch k fully printed
@@ -1611,46 +1613,11 @@ public class StepCheckered extends Module implements MapPrinter {
                 int bz1 = lowerMapCorner.getZ() + 127;
                 nextBlockPos = findNearestBlockInArea(bx0, bx1, bz0, bz1);
             }
-            // PICK UP NEARBY ITEMS — every tick, alongside breaking. Critical fix:
-            // findNearestGroundItem skips items where groundCollision == false (still
-            // falling after a break). Items take 5-10 ticks to land — the bot is
-            // already 3-5 blocks past by then. So we scan entities directly, accepting
-            // items that are falling but near ground level. Brief forward-hold while
-            // any item within 5 blocks is uncollected.
-            if (freeInventoryCapacity() > 0) {
-                ItemEntity nearest = null;
-                double nearestDist = Double.MAX_VALUE;
-                for (Entity entity : mc.world.getEntities()) {
-                    if (!(entity instanceof ItemEntity itemEntity)) continue;
-                    if (itemEntity.cannotPickup() || itemEntity.getOwner() != null) continue;
-                    // Accept LANDED items AND items still falling near ground level
-                    if (!itemEntity.groundCollision
-                        && Math.abs(itemEntity.getY() - lowerMapCorner.getY()) > 2.5) continue;
-                    if (itemEntity.getX() < lowerMapCorner.getX() - 3
-                        || itemEntity.getX() > lowerMapCorner.getX() + 131) continue;
-                    if (itemEntity.getZ() < lowerMapCorner.getZ() - 3
-                        || itemEntity.getZ() > lowerMapCorner.getZ() + 131) continue;
-                    double dist = mc.player.getEyePos().distanceTo(itemEntity.getEntityPos());
-                    if (dist < nearestDist) { nearestDist = dist; nearest = itemEntity; }
-                }
-                if (nearest != null && nearestDist < 5.0) {
-                    if (nearestDist > 1.2) {
-                        // Outside vanilla pickup range — walk to it
-                        checkpoints.addFirst(new Pair(
-                            new Vec3d(nearest.getX(), nearest.getY(), nearest.getZ()),
-                            new Pair("resetStation", null)));
-                    }
-                    // Brief forward-hold: items nearby but not yet collected → don't
-                    // advance (give them 2-3 ticks to land + proximity pickup).
-                    // Timeout via a counter prevents getting stuck on unreachable items.
-                    if (resetItemHoldTicks < 6) {
-                        Utils.setForwardPressed(false);
-                        resetItemHoldTicks++;
-                    }
-                } else {
-                    resetItemHoldTicks = 0;
-                }
-            }
+            // NO item targeting from the feed — queuing item checkpoints here
+            // created an infinite loop (feed detects item outside segment bounds
+            // → queues checkpoint → handler scans segment → CLEAN → feed detects
+            // the same item again). Items are collected by vanilla proximity on the
+            // serpentine path + segment confirmation + verify walk.
         }
 
         // Silent break-confirmation processing (runs every tick before break logic):
@@ -1760,6 +1727,22 @@ public class StepCheckered extends Module implements MapPrinter {
             if (debugPrints.get() && checkpointAction.getLeft() != null)
                 info("Reached: §a" + checkpointAction.getLeft());
             if (snapToCheckpoints.get()) mc.player.setPosition(goal.x, mc.player.getY(), goal.z);
+            // ANTI-STUCK: if the same action fires 10+ times consecutively (handler
+            // re-queuing itself without progress), force-skip to the next checkpoint
+            if (checkpointAction.getLeft() != null
+                && checkpointAction.getLeft().equals(lastCheckpointAction)) {
+                stuckCheckpointCount++;
+                if (stuckCheckpointCount > 10) {
+                    info("§eAnti-stuck: skipping repeated checkpoint '" + checkpointAction.getLeft() + "'.");
+                    stuckCheckpointCount = 0;
+                    lastCheckpointAction = null;
+                    checkpoints.remove(0);
+                    return;
+                }
+            } else {
+                lastCheckpointAction = checkpointAction.getLeft();
+                stuckCheckpointCount = 0;
+            }
             checkpoints.remove(0);
 
             switch (checkpointAction.getLeft()) {
