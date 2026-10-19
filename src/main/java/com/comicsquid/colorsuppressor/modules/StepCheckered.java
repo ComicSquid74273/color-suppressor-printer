@@ -1590,14 +1590,19 @@ public class StepCheckered extends Module implements MapPrinter {
             }
         }
 
-        // Serpentine pass feed: while walking to the resetPass exit, keep a break
-        // target armed from the CURRENT segment so the pass clears continuously
+        // Serpentine pass feed: while the reset ladder is active, keep a break target
+        // armed from the ENTIRE print box (nearest to the bot). The bot breaks everything
+        // in interaction range wherever it walks — no walking past blocks, noobline
+        // included. Segment bounds are ONLY used for the arrival confirmation check.
         if (state == State.Mining && nextBlockPos == null && fullSweepActive && resetLadderCol < 32
-            && !checkpoints.isEmpty() && "resetPass".equals(checkpoints.getFirst().getRight().getLeft())) {
-            int px0 = lowerMapCorner.getX() + 4 * resetLadderCol;
-            int pz0 = lowerMapCorner.getZ() + RESET_SEG_START[resetLadderSeg] - (resetLadderSeg == 0 ? 1 : 0);
-            int pz1 = lowerMapCorner.getZ() + RESET_SEG_END[resetLadderSeg];
-            nextBlockPos = findNearestBlockInArea(px0, px0 + 3, pz0, pz1);
+            && !checkpoints.isEmpty()
+            && ("resetPass".equals(checkpoints.getFirst().getRight().getLeft())
+                || "resetStation".equals(checkpoints.getFirst().getRight().getLeft()))) {
+            int bx0 = lowerMapCorner.getX();
+            int bx1 = bx0 + 127;
+            int bz0 = lowerMapCorner.getZ() - 1;   // noobline row included
+            int bz1 = lowerMapCorner.getZ() + 127;
+            nextBlockPos = findNearestBlockInArea(bx0, bx1, bz0, bz1);
         }
 
         // Silent break-confirmation processing (runs every tick before break logic):
@@ -1614,13 +1619,7 @@ public class StepCheckered extends Module implements MapPrinter {
             if (miningBlockState(nextBlockPos).isAir()) {
                 nextBlockPos = null;
                 state = State.Mining;
-                // Old-sweep re-arm: ONLY during the post-ladder verify phase (col >= 32).
-                // During ladder work (resetStation) this injection stole the flow and ran
-                // the vantage sweep's completion logic mid-segment.
-                if (fullSweepActive && !checkpoints.isEmpty()
-                    && "fullSweepTick".equals(checkpoints.getFirst().getRight().getLeft())) {
-                    checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("fullSweepTick", null)));
-                }
+
             } else {
                 // Break up to breaks-per-tick blocks per game tick. During the full-sweep
                 // (RESET), currentBuildPlan is null so subsequent targets come from the
@@ -2026,120 +2025,6 @@ public class StepCheckered extends Module implements MapPrinter {
                         return;
                     }
                     // Clean station: queue advances (next station or deposit + complete)
-                    return;
-                }
-                case "fullSweepStart":
-                case "fullSweepCenter":
-                    // Arrived at a vantage point: begin tick-based spatial sweep of the
-                    // entire print box (nearest non-air block, walk + break, re-evaluate).
-                    // This now only runs as the FINAL verification after the ladder.
-                    fullSweepActive = true;
-                    fullSweepBudget = 600;
-                    resetLadderCol = 32;   // ladder done - interrupts resume the verify, not the ladder
-                    checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("fullSweepTick", null)));
-                    state = State.Walking;
-                    info("§7Full-area sweep: scanning print box from vantage point.");
-                    return;
-                case "fullSweepTick": {
-                    // Pickaxe health FIRST: this handler also runs in the Walking phase
-                    // (chasing items), where the Mining-branch check never executes — a
-                    // dead pickaxe left the bot pushing noobline walls it couldn't break
-                    ItemStack sweepPick = mc.player.getInventory().getStack(8);
-                    if (!sweepPick.isIn(ItemTags.PICKAXES) || ToolUtils.getRemainingDamage(sweepPick) < minDurability.get()) {
-                        if (!hasGoodPickaxe()) {
-                            pauseForRestockTrip(true);
-                            return;
-                        }
-                        movePickaxeToSlot8();
-                    }
-                    // Spatial awareness full-area sweep: find the nearest actionable target
-                    // (block to break OR ground item to collect), walk to it, handle it.
-                    // Uses the SAME shared helpers as the batch SWEEP (findNearestGroundItem,
-                    // targetGroundItem) — no duplicated item-scan code.
-                    // Vantage progression: north-center → map-center → complete only when
-                    // both confirm empty (unloaded chunks read as air).
-                    fullSweepBudget--;
-                    BlockPos target = findNearestPrintBoxBlock();
-                    // Drops on the ground + full inventory: deposit first, then resume the
-                    // sweep. With a full inventory items were invisible to the completion
-                    // check below and got left behind at the end of the reset.
-                    if (freeInventoryCapacity() == 0 && findNearestGroundItem(3) != null) {
-                        Pair<BlockPos, Vec3d> fullDepositChest = getBestDepositChest();
-                        if (fullDepositChest != null) {
-                            checkpoints.clear();
-                            checkpoints.add(new Pair(fullDepositChest.getRight(), new Pair("depositBuilding", fullDepositChest.getLeft())));
-                            checkpoints.add(new Pair(new Vec3d(lowerMapCorner.getX() + 64.0, lowerMapCorner.getY(), lowerMapCorner.getZ() - 2), new Pair("fullSweepStart", null)));
-                            prependNorthCorridor(checkpoints.getFirst().getLeft().x);
-                            state = State.Walking;
-                            info("§7Inventory full with drops still down - depositing, then resuming the sweep.");
-                            return;
-                        }
-                    }
-                    ItemEntity nearestItem = freeInventoryCapacity() > 0 ? findNearestGroundItem(3) : null;
-                    double itemDist = nearestItem != null
-                        ? mc.player.getEyePos().distanceTo(nearestItem.getEntityPos()) : Double.MAX_VALUE;
-
-                    if (target == null && nearestItem == null || fullSweepBudget <= 0) {
-                        if (target == null && nearestItem == null) {
-                        // Nothing visible from HERE — but blocks may exist beyond render
-                        // distance. Progress to the center vantage before declaring complete.
-                        if (!fullSweepCenterChecked && fullSweepBudget > 0) {
-                            fullSweepCenterChecked = true;
-                            double centerX = lowerMapCorner.getX() + 64.0;
-                            double mapCenterZ = lowerMapCorner.getZ() + 64.0;
-                            checkpoints.clear();
-                            checkpoints.add(new Pair(new Vec3d(centerX, lowerMapCorner.getY(), mapCenterZ), new Pair("fullSweepCenter", null)));
-                            state = State.Walking;
-                            info("§7North vantage clean — moving to map-center to scan the south half.");
-                            return;
-                        }
-                        // Both vantage points confirmed clean (or budget expired)
-                            fullSweepActive = false;
-                            checkpoints.clear();
-                            checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("fullSweepDone", null)));
-                            Pair<BlockPos, Vec3d> depositChest = getBestDepositChest();
-                            if (depositChest != null) {
-                                checkpoints.addFirst(new Pair(depositChest.getRight(), new Pair("depositBuilding", depositChest.getLeft())));
-                            }
-                            state = State.Walking;
-                            info("§aFull-area sweep complete - depositing and returning to standby.");
-                            return;
-                        }
-                        // Budget exhausted WITH work still visible: renew and fall through
-                        // to the work handling below - NEVER declare complete over
-                        // standing blocks/drops (observed leftovers after reset)
-                        fullSweepBudget = 600;
-                        info("§7Sweep budget exhausted with work remaining - renewing.");
-                    }
-
-                    // Target whichever is closer: a block to break or an item to collect
-                    double blockDist = target != null ? mc.player.getEyePos().distanceTo(target.toCenterPos()) : Double.MAX_VALUE;
-                    if (target != null && blockDist <= itemDist) {
-                        nextBlockPos = target;
-                        breakStage = 4;
-                        state = State.Mining;
-                        Vec3d targetCenter = target.toCenterPos();
-                        Vec3d botPos = mc.player.getEntityPos();
-                        double dx = botPos.x - targetCenter.x;
-                        double dz = botPos.z - targetCenter.z;
-                        double len = Math.sqrt(dx * dx + dz * dz);
-                        if (len > 0.5) {
-                            Vec3d walkTo = new Vec3d(
-                                targetCenter.x + (dx / len) * 1.5,
-                                botPos.y,
-                                targetCenter.z + (dz / len) * 1.5);
-                            checkpoints.clear();
-                            checkpoints.add(new Pair(walkTo, new Pair("fullSweepTick", null)));
-                        }
-                        if (debugPrints.get()) {
-                            info(String.format("§3[dbg] fullSweep block §b%s§3 dist=§b%.1f", target.toShortString(), blockDist));
-                        }
-                    } else if (nearestItem != null) {
-                        targetGroundItem(nearestItem, "fullSweepTick");
-                        if (debugPrints.get()) {
-                            info(String.format("§3[dbg] fullSweep item dist=§b%.1f", itemDist));
-                        }
-                    }
                     return;
                 }
                 case "fullSweepDone":
@@ -3907,6 +3792,9 @@ public class StepCheckered extends Module implements MapPrinter {
             for (int i = 0; i < 5; i++) {
                 int seg = (col % 2 == 0) ? i : 4 - i;
                 if (col == fromCol && ((col % 2 == 0 && seg < fromSeg) || (col % 2 == 1 && seg > fromSeg))) continue;
+                // Each pass walks from one segment boundary to the other — the entry
+                // point is whichever end the bot is closer to (handled by the snake
+                // direction per column). The serpentine feed breaks blocks along the way.
                 // One PASS per segment: the exit end of the serpentine walk on the
                 // centre lane. The pass itself clears everything in range continuously;
                 // the arrival handler confirms + cleans up stragglers only.
@@ -4042,7 +3930,11 @@ public class StepCheckered extends Module implements MapPrinter {
         if (currentBatch == -1) scopeCol = 0;          // priming window = lanes 0-3
         resetLadderEndCol = scopeCol;
         resetLadderCol = Math.max(0, scopeCol - 1);
-        resetLadderSeg = 0;
+        // Start from the segment closest to the bot's current position (not always 0):
+        // the bot might be at the south end after a print pass — walking to segment 0
+        // (north) wastes transit time. Snake direction adapts per column anyway.
+        int botRelZ = mc.player != null ? mc.player.getBlockZ() - lowerMapCorner.getZ() : 0;
+        resetLadderSeg = botRelZ > 64 ? 4 : (botRelZ > 26 ? 2 : 0);   // nearest of {0, 2, 4}
         fullSweepBudget = 600;
         queueResetLadder(resetLadderCol, 0);
 
