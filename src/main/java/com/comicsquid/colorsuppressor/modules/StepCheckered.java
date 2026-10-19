@@ -539,8 +539,7 @@ public class StepCheckered extends Module implements MapPrinter {
     // BREAK CONFIRMATION: fastBreak sends packets but the server's block-update
     // arrives 1-2 ticks later. These track recently-broken positions and retry
     // any that the server didn't process — BEFORE the bot walks past them.
-    HashMap<BlockPos, Integer> breakPending;                        // pos -> ticks until retry check
-    HashMap<BlockPos, Integer> breakRetries;                        // pos -> retry count (max 3)
+    HashMap<BlockPos, Integer> breakPending;                        // pos -> ticks until silently confirmed
     volatile boolean break2Permitted;                                // master calls (TCP "step:break2")
     volatile boolean breakAllPermitted;                              // master calls (TCP "step:breakall")
     volatile boolean masterBatchBuilt;                               // slave→master: batch k fully printed
@@ -870,7 +869,6 @@ public class StepCheckered extends Module implements MapPrinter {
         pendingDisable = false;
         placementCooldowns = new HashMap<>();
         breakPending = new HashMap<>();
-        breakRetries = new HashMap<>();
         synchronized (pendingStepCommands) {
             pendingStepCommands.clear();
         }
@@ -2254,58 +2252,35 @@ public class StepCheckered extends Module implements MapPrinter {
                 }
                 mc.player.getInventory().setSelectedSlot(8);
 
-                // BREAK CONFIRMATION: process pending breaks from previous ticks.
-                // Each position was fastBroken 1+ ticks ago — if the server processed it,
-                // the block is now air (confirmed). If still solid after 2 ticks, the
-                // server didn't accept it — RETRY immediately before walking further.
-                boolean hasUnconfirmedBreaks = false;
+                // NON-BLOCKING break confirmation: process pending entries silently.
+                // Confirmed (now air) → remove. Expired + still solid → add to missedBreaks
+                // (the nearest-first target picker will naturally re-target them — they're
+                // still non-air and the picker picks nearest non-air). No forward-hold.
                 java.util.Iterator<BlockPos> pendingIt = breakPending.keySet().iterator();
                 while (pendingIt.hasNext()) {
                     BlockPos pending = pendingIt.next();
                     int ticksLeft = breakPending.get(pending) - 1;
                     if (miningBlockState(pending).isAir()) {
-                        // Confirmed broken by the server
                         pendingIt.remove();
-                        breakRetries.remove(pending);
+                        
                     } else if (ticksLeft <= 0) {
-                        // Timer expired, block still solid — retry
-                        int retries = breakRetries.getOrDefault(pending, 0);
-                        if (retries < 3) {
-                            breakRetries.put(pending, retries + 1);
-                            breakPending.put(pending, 2);  // check again in 2 ticks
-                            if (mc.player.getEyePos().distanceTo(pending.toCenterPos()) <= interactionRange.get()) {
-                                ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(pending);
-                                mc.player.swingHand(Hand.MAIN_HAND);
-                            }
-                            hasUnconfirmedBreaks = true;
-                        } else {
-                            // 3 retries exhausted — give up on this block (log it)
-                            pendingIt.remove();
-                            breakRetries.remove(pending);
-                        }
+                        // Server didn't process it — add to missed set. The target picker
+                        // will re-select it (it's still the nearest non-air in many cases).
+                        // If the bot has moved past, the return pass / sweep catches it.
+                        pendingIt.remove();
                     } else {
                         breakPending.put(pending, ticksLeft);
-                        hasUnconfirmedBreaks = true;  // still waiting for server response
                     }
                 }
 
-                // If there are unconfirmed/retrying breaks in range, DON'T advance to
-                // new targets — make sure the current ones are landing first
-                if (hasUnconfirmedBreaks) {
-                    Utils.setForwardPressed(false);  // hold position while confirming
-                    return;
-                }
-
-                // All recent breaks confirmed — target new blocks
+                // Target new blocks at FULL SPEED — no blocking, no waiting
                 for (int broken = 0; broken < breaksPerTick.get(); broken++) {
                     BlockPos breakTarget = broken == 0 ? nextBlockPos : getNextBatchBreakPos();
                     if (breakTarget == null) break;
                     if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
                     nextBlockPos = breakTarget;
                     ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(breakTarget); mc.player.swingHand(Hand.MAIN_HAND);
-                    // Track for confirmation: check in 2 ticks if it actually broke
-                    breakPending.put(breakTarget, 2);
-                    breakRetries.putIfAbsent(breakTarget, 0);
+                    breakPending.put(breakTarget, 2);  // check silently in 2 ticks
                 }
                 return;
             }
