@@ -540,6 +540,7 @@ public class StepCheckered extends Module implements MapPrinter {
     // arrives 1-2 ticks later. These track recently-broken positions and retry
     // any that the server didn't process — BEFORE the bot walks past them.
     HashMap<BlockPos, Integer> breakPending;                        // pos -> ticks until silently confirmed
+    java.util.HashSet<BlockPos> needsVanillaBreak;                  // fastBreak failed → use vanilla mining
     volatile boolean break2Permitted;                                // master calls (TCP "step:break2")
     volatile boolean breakAllPermitted;                              // master calls (TCP "step:breakall")
     volatile boolean masterBatchBuilt;                               // slave→master: batch k fully printed
@@ -869,6 +870,7 @@ public class StepCheckered extends Module implements MapPrinter {
         pendingDisable = false;
         placementCooldowns = new HashMap<>();
         breakPending = new HashMap<>();
+        needsVanillaBreak = new java.util.HashSet<>();
         synchronized (pendingStepCommands) {
             pendingStepCommands.clear();
         }
@@ -1613,6 +1615,10 @@ public class StepCheckered extends Module implements MapPrinter {
             breakPending.values().removeIf(ticks -> ticks <= 0);
             breakPending.keySet().removeIf(pos -> miningBlockState(pos).isAir());
         }
+        // Clean vanilla-fallback set when blocks break
+        if (!needsVanillaBreak.isEmpty()) {
+            needsVanillaBreak.removeIf(pos -> miningBlockState(pos).isAir());
+        }
 
         if ((state.equals(State.Mining) || state.equals(State.AwaitBlockBreak)) && nextBlockPos != null) {
             // Break block if miningPos is not null
@@ -2158,23 +2164,32 @@ public class StepCheckered extends Module implements MapPrinter {
                         pendingIt.remove();
                         
                     } else if (ticksLeft <= 0) {
-                        // Server didn't process it — add to missed set. The target picker
-                        // will re-select it (it's still the nearest non-air in many cases).
-                        // If the bot has moved past, the return pass / sweep catches it.
+                        // fastBreak failed — this block needs multi-tick mining.
+                        // Flag for vanilla breaking (handles concrete/terracotta/deepslate).
+                        needsVanillaBreak.add(pending);
                         pendingIt.remove();
                     } else {
                         breakPending.put(pending, ticksLeft);
                     }
                 }
 
-                // Target new blocks at FULL SPEED — no blocking, no waiting
+                // Target new blocks — HYBRID: fastBreak (instant) for new targets,
+                // vanilla mining for blocks fastBreak already failed on (multi-tick)
                 for (int broken = 0; broken < breaksPerTick.get(); broken++) {
                     BlockPos breakTarget = broken == 0 ? nextBlockPos : getNextBatchBreakPos();
                     if (breakTarget == null) break;
                     if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
                     nextBlockPos = breakTarget;
-                    ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(breakTarget); mc.player.swingHand(Hand.MAIN_HAND);
-                    breakPending.put(breakTarget, 2);  // check silently in 2 ticks
+                    if (needsVanillaBreak.contains(breakTarget)) {
+                        // fastBreak failed before — this block needs 2-3 tick mining progress.
+                        // Vanilla updateBlockBreakingProgress handles it correctly.
+                        BlockUtils.breakBlock(breakTarget, true);
+                        needsVanillaBreak.remove(breakTarget);
+                    } else {
+                        // First attempt — fastBreak (instant for resin and soft blocks)
+                        ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(breakTarget); mc.player.swingHand(Hand.MAIN_HAND);
+                        breakPending.put(breakTarget, 2);
+                    }
                 }
                 return;
             }
