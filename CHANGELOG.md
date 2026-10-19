@@ -92,6 +92,86 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-10-19 — RESET-VERIFY logging + segment-decode fix + item scan margin + full fix pass
+User report: during RESET the bot walks to the next checkpoint before all blocks are
+broken/confirmed and before dropped items are collected — including drops that skid
+1-2 blocks OUTSIDE the print box and are ignored forever. Root-cause analysis (code
+audit) found SIX defects; user gave the fix go-ahead — ALL FIXED this session:
+
+1. **`resetZToSeg` still used the OLD 5-segment bound** (`for seg = 4..0`) while the
+   redesigned ladder has 16 segments of 8 rows. Every checkpoint anchored in rows
+   >= 32 (segments 5-15 = 75pct of every column) decoded to segment 4, so the arrival
+   scan verified rows 32-39 instead of the segment just walked -> premature CLEAN ->
+   advance with blocks standing. **FIXED** (loop now runs over the full array); the
+   decode-mismatch warning in the logs stays as live proof (it must never fire).
+2. **Item census filters hide in-transit drops**: `findNearestItemInArea` requires
+   `groundCollision && !cannotPickup()`. Fresh drops have a 10-tick pickup delay plus
+   fall/bounce time — invisible at arrival -> CLEAN declared while items exist ->
+   left behind. **FIXED**: the CLEAN verdict now DWELLS (re-queues resetStation in
+   place) while falling/pickup-delayed drops are in the margin window; landing flips
+   them to ready -> chased and collected. Frozen waits still advance via the stall
+   detector with a dump.
+3. **Anti-stuck force-skip abandoned segments**: >10 consecutive same-action arrivals
+   force-advanced regardless of remaining content. **FIXED**: resetPass/resetStation
+   are exempt from the generic force-skip; a per-arrival STALL DETECTOR (signature =
+   block count + every item state + bot position, 80 frozen rounds) provides loop
+   protection that cannot fire while any progress is happening.
+4. **Stale out-of-range feed target jammed the pass**: `nextBlockPos` was only nulled
+   when the block turned air; a target armed beyond interaction range blocked
+   re-arming — the bot walked on breaking nothing. **FIXED**: after 10 out-of-range
+   ticks the feed drops the stale target and re-arms (logged).
+5. **DOUBLE breakPending processor**: a silent processor at the top of the tick
+   decremented and removed expired entries, and the routing processor further down
+   decremented AGAIN — on every tick where the flow returned early (all checkpoint
+   arrival ticks!), expired entries were silently swallowed BEFORE the vanilla
+   routing could flag them. **FIXED**: single unified processor at the top of the
+   tick, runs unconditionally.
+6. **fastBreak hammering starved the vanilla fallback on multi-tick blocks**: the
+   Mining-state break loop (path A), the path-B loop, AND the arrival handler each
+   raw-sent START/STOP every tick without consulting `needsVanillaBreak` or
+   `breakPending` — re-sends reset the server's elapsed-time validation so a
+   multi-tick block could never complete, piling up rounds into the force-skip.
+   Also: path B removed the vanilla flag after ONE call, dropping the block back
+   into fastBreak next tick. **FIXED** everywhere: pending-confirmation guard (one
+   send per pos per 2-tick window), vanilla-flagged blocks go through
+   `BlockUtils.breakBlock` continuously (removal only via the air-cleanup), path B
+   skips re-targeting entirely when path A already sent this tick, and the arrival
+   handler follows the same hybrid rules. Side effect: instamine sends serialize to
+   ~1 per 2 ticks (before: duplicate sends per tick) — no throughput regression on
+   localhost since confirmations arrive in 1-2 ticks anyway.
+
+**ITEM SCAN MARGIN (user-directed, this session):** drops ejected at the box edge
+skid outside and every item scan was box-bounded. All reset item scans now extend
+`RESET_ITEM_MARGIN = 2` blocks past the block bounds in every horizontal direction:
+- resetPass arrival: item target, deposit-full check, census, and the item chase all
+  use the segment bounds +-2 (catches drops that left the segment AND the box).
+- printBoxContentRange (verify walk): item band widened to x corner-2..corner+129,
+  z corner-3..corner+129; re-scoped ladder columns clamped to 0-31 so the walk never
+  routes outside the box — the boundary columns' own +-2 arrival scans reach the
+  outside drops instead.
+Blocks are never margin-scanned (they cannot move).
+
+**Added `[RESET-VERIFY]` logs** (all `info`/`warning`, always-on unless noted):
+- resetPass/resetStation arrival: decode-mismatch WARNING (segment bug, live proof),
+  full census line (blocks + item states ready/falling/pickupDelay/owned over the
+  margin window + in-flight breakPending + vanilla queue), PREMATURE-CLEAN warning
+  when the verdict fires with falling/pickup-delayed drops present, INV-FULL marker
+  when the item scan was skipped.
+- Anti-stuck force-skip: WARNING with exact blocks/items/pending left behind in the
+  abandoned window (items over the margin window).
+- Feed-jam detector: WARNING when the armed target sits out of range 40+ ticks.
+- Break-confirmation processor (debug-prints gated per tick): server-confirmed vs
+  expired-to-vanilla counts + in-flight size; PERSISTENT-REJECTION warning when one
+  block expires into vanilla fallback 4x without ever confirming.
+- verifyWalk stations: box+margin item census including filtered states + warning
+  when the station passes with drops still on/in flight over the box.
+- fullSweepDone: completion-state counters (breakPending / vanilla queue /
+  persistent rejections — all should be 0).
+Implementation: census helpers (`itemCensusInArea`, `countPendingInRange`,
+`countVanillaInRange`, `countBlocksInArea`), `vanillaBreakRetries` map, feed-jam
+watch fields; state cleared on activation + stepAbort. Compiles clean; NOT committed
+(awaiting live verification per commit discipline).
+
 ### 2026-10-18 — CALIBRATED CHECKPOINT + step-reduced batch 0 (THE breakthrough)
 - **THE CALIBRATED CHECKPOINT (user-directed, math-proven):** the doc's kernel table
   reads "sweep lane x=2k+127" as the LITERAL standing coordinate - the block EDGE,

@@ -541,6 +541,12 @@ public class StepCheckered extends Module implements MapPrinter {
     // any that the server didn't process — BEFORE the bot walks past them.
     HashMap<BlockPos, Integer> breakPending;                        // pos -> ticks until silently confirmed
     java.util.HashSet<BlockPos> needsVanillaBreak;                  // fastBreak failed → use vanilla mining
+    HashMap<BlockPos, Integer> vanillaBreakRetries;                 // pos -> times expired into vanilla fallback (server-rejection evidence)
+    BlockPos jamWatchTarget;                                        // feed-jam detector: armed target held out of range
+    int jamWatchTicks;
+    boolean breakSweepActedThisTick;                                // the Mining-state break loop already sent packets this tick
+    String resetStallSig;                                           // reset arrival stall detector: last arrival state signature
+    int resetStallRounds;
     int resetItemHoldTicks;
     String lastCheckpointAction;
     int stuckCheckpointCount;                                         // forward-hold ticks for item pickup
@@ -621,6 +627,10 @@ public class StepCheckered extends Module implements MapPrinter {
     private static final int[] RESET_SEG_START = {0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120};
     private static final int[] RESET_SEG_END = {7, 15, 23, 31, 39, 47, 55, 63, 71, 79, 87, 95, 103, 111, 119, 127};
     private static final int[] RESET_SEG_CENTER_Z = {4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92, 100, 108, 116, 124};
+    /** ITEM SCAN MARGIN: block drops skid 1-2 blocks outside the segment / print box in
+     *  any horizontal direction. Item scans (arrival, verify walk) extend this far past
+     *  the block bounds so outside drops are chased and collected, not ignored. */
+    private static final int RESET_ITEM_MARGIN = 2;
     /** Route actions during which placement may happen (also gates the Dynamic speed mode:
      *  these + Mining = "working", everything else is transit). */
     private static final List<String> ALLOW_PLACE_ACTIONS = Arrays.asList("lineBegin", "lineEnd", "sprint",
@@ -874,6 +884,12 @@ public class StepCheckered extends Module implements MapPrinter {
         placementCooldowns = new HashMap<>();
         breakPending = new HashMap<>();
         needsVanillaBreak = new java.util.HashSet<>();
+        vanillaBreakRetries = new HashMap<>();
+        jamWatchTarget = null;
+        jamWatchTicks = 0;
+        breakSweepActedThisTick = false;
+        resetStallSig = null;
+        resetStallRounds = 0;
         synchronized (pendingStepCommands) {
             pendingStepCommands.clear();
         }
@@ -1615,6 +1631,32 @@ public class StepCheckered extends Module implements MapPrinter {
                 int bz1 = Math.min(lowerMapCorner.getZ() + 127, botZ + 6);
                 nextBlockPos = findNearestBlockInArea(bx0, bx1, bz0, bz1);
             }
+            // FEED-JAM recovery: an armed target beyond interaction range never turns
+            // air and blocks re-arming (feed only arms when nextBlockPos == null) —
+            // the pass would walk on breaking nothing. After 10 stuck ticks, drop the
+            // stale target so the feed re-arms (the block gets re-targeted on a later
+            // pass; the arrival scan and verify walk still gate completeness).
+            if (nextBlockPos != null
+                && mc.player.getEyePos().distanceTo(nextBlockPos.toCenterPos()) > interactionRange.get()) {
+                if (nextBlockPos.equals(jamWatchTarget)) {
+                    jamWatchTicks++;
+                    if (jamWatchTicks >= 10) {
+                        info("§6[RESET-VERIFY]§7 feed re-armed: dropped stale out-of-range target "
+                            + nextBlockPos.toShortString() + " (dist ~"
+                            + Math.round(mc.player.getEyePos().distanceTo(nextBlockPos.toCenterPos()))
+                            + " > " + interactionRange.get() + ") after " + jamWatchTicks + " ticks.");
+                        nextBlockPos = null;
+                        jamWatchTarget = null;
+                        jamWatchTicks = 0;
+                    }
+                } else {
+                    jamWatchTarget = nextBlockPos;
+                    jamWatchTicks = 1;
+                }
+            } else {
+                jamWatchTarget = null;
+                jamWatchTicks = 0;
+            }
             // NO item targeting from the feed — queuing item checkpoints here
             // created an infinite loop (feed detects item outside segment bounds
             // → queues checkpoint → handler scans segment → CLEAN → feed detects
@@ -1622,13 +1664,46 @@ public class StepCheckered extends Module implements MapPrinter {
             // serpentine path + segment confirmation + verify walk.
         }
 
-        // Silent break-confirmation processing (runs every tick before break logic):
-        // decrement timers, remove confirmed (now air), silently drop expired entries.
-        // Missed blocks are re-targeted naturally by nearest-first pickers.
+        // Break-confirmation processing — THE single processor, and it must run EVERY
+        // tick up here: the tick flow returns early on many ticks (every checkpoint
+        // arrival handler returns), and a second processor further down used to
+        // double-decrement the same timers and silently remove expired entries on all
+        // those ticks — failed fastBreaks then NEVER reached the vanilla fallback.
+        // Confirmed (now air) → remove. Expired + still solid → needsVanillaBreak.
+        breakSweepActedThisTick = false;
         if (!breakPending.isEmpty()) {
-            breakPending.replaceAll((pos, ticks) -> ticks - 1);
-            breakPending.values().removeIf(ticks -> ticks <= 0);
-            breakPending.keySet().removeIf(pos -> miningBlockState(pos).isAir());
+            int confirmedThisTick = 0, expiredThisTick = 0;
+            java.util.Iterator<BlockPos> pendingIt = breakPending.keySet().iterator();
+            while (pendingIt.hasNext()) {
+                BlockPos pending = pendingIt.next();
+                int ticksLeft = breakPending.get(pending) - 1;
+                if (miningBlockState(pending).isAir()) {
+                    pendingIt.remove();
+                    confirmedThisTick++;
+                    vanillaBreakRetries.remove(pending);
+                } else if (ticksLeft <= 0) {
+                    // fastBreak failed — this block needs multi-tick mining.
+                    // Flag for vanilla breaking (handles concrete/terracotta/deepslate).
+                    needsVanillaBreak.add(pending);
+                    int retries = vanillaBreakRetries.getOrDefault(pending, 0) + 1;
+                    vanillaBreakRetries.put(pending, retries);
+                    if (retries == 4) {
+                        warning("§6[RESET-VERIFY]§c PERSISTENT REJECTION: " + pending.toShortString()
+                            + " expired into vanilla fallback " + retries
+                            + " times without ever being server-confirmed - the fastBreak/vanilla "
+                            + "cycle is not making progress on this block.");
+                    }
+                    expiredThisTick++;
+                    pendingIt.remove();
+                } else {
+                    breakPending.put(pending, ticksLeft);
+                }
+            }
+            if (debugPrints.get() && (confirmedThisTick + expiredThisTick) > 0) {
+                info("§3[dbg] break-confirmation: §aserver-confirmed=" + confirmedThisTick
+                    + "§3 expired-to-vanilla=§e" + expiredThisTick
+                    + "§3 inFlight=" + breakPending.size() + " vanillaQ=" + needsVanillaBreak.size());
+            }
         }
         // Clean vanilla-fallback set when blocks break
         if (!needsVanillaBreak.isEmpty()) {
@@ -1656,8 +1731,24 @@ public class StepCheckered extends Module implements MapPrinter {
                     }
                     if (breakTarget == null) break;
                     if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
+                    // Confirmation guard: a fastBreak already sent for this pos is still
+                    // awaiting the server's block-update. Re-sending START/STOP every tick
+                    // resets the server's elapsed-time validation — which is what starved
+                    // the vanilla fallback on multi-tick blocks before.
+                    if (breakPending.containsKey(breakTarget)) break;
                     nextBlockPos = breakTarget;
-                    ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(breakTarget); mc.player.swingHand(Hand.MAIN_HAND);
+                    if (needsVanillaBreak.contains(breakTarget)) {
+                        // fastBreak failed before — continue multi-tick vanilla progress.
+                        // NOT removed here: the air-check cleanup above owns removal, so
+                        // progress continues on the following ticks instead of dropping
+                        // the block back into fastBreak after a single vanilla call.
+                        mc.player.getInventory().setSelectedSlot(8);
+                        BlockUtils.breakBlock(breakTarget, true);
+                    } else {
+                        ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(breakTarget); mc.player.swingHand(Hand.MAIN_HAND);
+                        breakPending.put(breakTarget, 2);
+                    }
+                    breakSweepActedThisTick = true;
                     if (!miningBlockState(breakTarget).isAir()) break;  // server didn't accept, stop
                 }
 
@@ -1730,8 +1821,18 @@ public class StepCheckered extends Module implements MapPrinter {
                 info("Reached: §a" + checkpointAction.getLeft());
             if (snapToCheckpoints.get()) mc.player.setPosition(goal.x, mc.player.getY(), goal.z);
             // ANTI-STUCK: if the same action fires 10+ times consecutively (handler
-            // re-queuing itself without progress), force-skip to the next checkpoint
-            if (checkpointAction.getLeft() != null
+            // re-queuing itself without progress), force-skip to the next checkpoint.
+            // EXCEPTION — reset sweep actions: resetPass/resetStation legitimately
+            // re-queue themselves for every straggler block, item chase, and in-flight
+            // drop wait; the generic force-skip abandoned segments with content still
+            // standing. The resetPass handler's own STALL DETECTOR (80 frozen arrival
+            // rounds) provides the loop protection there instead.
+            boolean isResetSweepAction = fullSweepActive && ("resetPass".equals(checkpointAction.getLeft())
+                || "resetStation".equals(checkpointAction.getLeft()));
+            if (isResetSweepAction) {
+                stuckCheckpointCount = 0;
+                lastCheckpointAction = checkpointAction.getLeft();
+            } else if (checkpointAction.getLeft() != null
                 && checkpointAction.getLeft().equals(lastCheckpointAction)) {
                 stuckCheckpointCount++;
                 if (stuckCheckpointCount > 10) {
@@ -1993,7 +2094,16 @@ public class StepCheckered extends Module implements MapPrinter {
                     // nearest-first hopping across the segment.
                     if (checkpointAction.getRight() != null) {
                         resetLadderCol = Math.min(31, (checkpointAction.getRight().getX() - lowerMapCorner.getX()) / 4);
-                        resetLadderSeg = resetZToSeg(checkpointAction.getRight().getZ() - lowerMapCorner.getZ());
+                        int anchorRelZ = checkpointAction.getRight().getZ() - lowerMapCorner.getZ();
+                        int actualSeg = Math.min(RESET_SEG_START.length - 1, Math.max(0, anchorRelZ / 8));
+                        resetLadderSeg = resetZToSeg(anchorRelZ);
+                        if (resetLadderSeg != actualSeg) {
+                            warning("§6[RESET-VERIFY]§e SEGMENT DECODE BUG at col " + resetLadderCol
+                                + ": checkpoint is segment " + actualSeg + " (rows " + (actualSeg * 8) + "-" + (actualSeg * 8 + 7)
+                                + ") but resetZToSeg decoded " + resetLadderSeg
+                                + " (rows " + (RESET_SEG_START[resetLadderSeg]) + "-" + RESET_SEG_END[resetLadderSeg]
+                                + ") - the arrival scan below verifies the WRONG rows, the walked segment is NOT verified.");
+                        }
                     }
                     ItemStack ladderPick = mc.player.getInventory().getStack(8);
                     if (!ladderPick.isIn(ItemTags.PICKAXES) || ToolUtils.getRemainingDamage(ladderPick) < minDurability.get()) {
@@ -2004,7 +2114,12 @@ public class StepCheckered extends Module implements MapPrinter {
                     int lx1 = lx0 + 3;
                     int lz0 = lowerMapCorner.getZ() + RESET_SEG_START[resetLadderSeg] - (resetLadderSeg == 0 ? 1 : 0);  // segment 0 owns the noobline row too
                     int lz1 = lowerMapCorner.getZ() + RESET_SEG_END[resetLadderSeg];
-                    if (freeInventoryCapacity() == 0 && findNearestItemInArea(lx0, lx1, lz0, lz1) != null) {
+                    // ITEM MARGIN window: blocks never move, but their drops skid — scan
+                    // (and chase) items this far past the segment in every horizontal
+                    // direction, including outside the print box at its edges.
+                    int ix0 = lx0 - RESET_ITEM_MARGIN, ix1 = lx1 + RESET_ITEM_MARGIN;
+                    int iz0 = lz0 - RESET_ITEM_MARGIN, iz1 = lz1 + RESET_ITEM_MARGIN;
+                    if (freeInventoryCapacity() == 0 && findNearestItemInArea(ix0, ix1, iz0, iz1) != null) {
                         Pair<BlockPos, Vec3d> ladderChest = getBestDepositChest();
                         if (ladderChest != null) {
                             checkpoints.clear();
@@ -2018,8 +2133,57 @@ public class StepCheckered extends Module implements MapPrinter {
                         }
                     }
                     BlockPos lTarget = findNearestBlockInArea(lx0, lx1, lz0, lz1);
-                    ItemEntity lItem = freeInventoryCapacity() > 0 ? findNearestItemInArea(lx0, lx1, lz0, lz1) : null;
+                    ItemEntity lItem = freeInventoryCapacity() > 0 ? findNearestItemInArea(ix0, ix1, iz0, iz1) : null;
+                    // RESET-VERIFY census: everything the CLEAN verdict is about to be based on,
+                    // including content the filtered scans above cannot see.
+                    int[] census = itemCensusInArea(ix0, ix1, iz0, iz1);
+                    int pendBrk = countPendingInRange(lx0, lx1, lz0, lz1);
+                    int vanilla = countVanillaInRange(lx0, lx1, lz0, lz1);
+                    // STALL DETECTOR (replaces the generic anti-stuck force-skip for this
+                    // handler): the signature covers block count, every item state and the
+                    // bot position — ANY progress changes it (blocks break, drops land,
+                    // states tick over, the bot walks). Only 80 consecutive FROZEN arrivals
+                    // force-advance, with a full dump of what is being left behind.
+                    String arrivalSig = resetLadderCol + ":" + resetLadderSeg + "|b" + countBlocksInArea(lx0, lx1, lz0, lz1)
+                        + "|i" + census[0] + "," + census[1] + "," + census[2] + "," + census[3]
+                        + "|p" + mc.player.getBlockX() + "," + mc.player.getBlockZ();
+                    boolean sigChanged = !arrivalSig.equals(resetStallSig);
+                    if (!sigChanged) {
+                        resetStallRounds++;
+                        if (resetStallRounds > 80) {
+                            warning("§6[RESET-VERIFY]§c STALL: col " + resetLadderCol + " seg " + resetLadderSeg
+                                + " frozen for 80+ arrival rounds - blocks=" + countBlocksInArea(lx0, lx1, lz0, lz1)
+                                + " items+m" + RESET_ITEM_MARGIN + "[ready=" + census[0] + " falling=" + census[1]
+                                + " pickupDelay=" + census[2] + " owned=" + census[3] + "]"
+                                + " pendBrk=" + pendBrk + " - advancing WITHOUT clearing (verify walk will re-scope).");
+                            resetStallRounds = 0;
+                            resetStallSig = null;
+                            return;   // no re-queue: the ladder advances
+                        }
+                    } else {
+                        resetStallSig = arrivalSig;
+                        resetStallRounds = 0;
+                    }
+                    // Census log only on state change: dwell waits and in-place breaking
+                    // fire arrivals every tick — logging each would flood the chat.
+                    if (sigChanged) {
+                        info("§6[RESET-VERIFY]§7 col " + resetLadderCol + " seg " + resetLadderSeg
+                            + " rows " + (lz0 - lowerMapCorner.getZ()) + "-" + (lz1 - lowerMapCorner.getZ())
+                            + " §fblocks=" + (lTarget != null ? "1+ @" + (lTarget.getX() - lowerMapCorner.getX()) + "," + (lTarget.getY() - lowerMapCorner.getY()) + "," + (lTarget.getZ() - lowerMapCorner.getZ()) : "0")
+                            + " §7items+m" + RESET_ITEM_MARGIN + "[ready=" + census[0] + " falling=" + census[1] + " pickupDelay=" + census[2] + " owned=" + census[3] + "]"
+                            + " §3pendBrk=" + pendBrk + " vanillaQ=" + vanilla
+                            + (freeInventoryCapacity() == 0 ? " §cINV-FULL(item scan skipped)" : ""));
+                    }
                     if (lTarget == null && lItem == null) {
+                        if (census[1] + census[2] > 0) {
+                            // WAIT for in-flight drops instead of advancing: they land and
+                            // become pickup-able within ~10-20 ticks, and a sprinting bot
+                            // never returns for them. Dwell in place and re-check — the
+                            // state transitions keep the stall detector fed; a genuinely
+                            // frozen wait still force-advances after 80 rounds.
+                            checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("resetStation", null)));
+                            return;
+                        }
                         info("§aReset col " + resetLadderCol + " segment " + resetLadderSeg + " CLEAN - fully confirmed.");
                         return;   // ladder queue advances on its own
                     }
@@ -2028,8 +2192,18 @@ public class StepCheckered extends Module implements MapPrinter {
                     if (lTarget != null && bDist <= iDist) {
                         if (bDist <= interactionRange.get()) {
                             nextBlockPos = lTarget;
-                            ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(lTarget);
-                            mc.player.swingHand(Hand.MAIN_HAND);
+                            // Same hybrid rules as the per-tick break loop: don't re-send
+                            // fastBreak while a confirmation is pending, and never raw-send
+                            // START/STOP on a vanilla-flagged block (it resets the server's
+                            // elapsed-time validation and starves the multi-tick progress).
+                            if (needsVanillaBreak.contains(lTarget)) {
+                                mc.player.getInventory().setSelectedSlot(8);
+                                BlockUtils.breakBlock(lTarget, true);
+                            } else if (!breakPending.containsKey(lTarget)) {
+                                ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(lTarget);
+                                mc.player.swingHand(Hand.MAIN_HAND);
+                                breakPending.put(lTarget, 2);
+                            }
                             checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("resetStation", null)));
                             state = State.Mining;
                             breakStage = 4;
@@ -2056,6 +2230,12 @@ public class StepCheckered extends Module implements MapPrinter {
                         movePickaxeToSlot8();
                     }
                     int[] found = printBoxContentRange();
+                    int[] boxCensus = itemCensusInArea(lowerMapCorner.getX() - RESET_ITEM_MARGIN, lowerMapCorner.getX() + 127 + RESET_ITEM_MARGIN,
+                        lowerMapCorner.getZ() - 1 - RESET_ITEM_MARGIN, lowerMapCorner.getZ() + 127 + RESET_ITEM_MARGIN);
+                    info("§6[RESET-VERIFY]§7 verify station z=" + (mc.player.getBlockZ() - lowerMapCorner.getZ())
+                        + ": blocks/ready-items scan " + (found != null ? "FOUND cols " + found[0] + "-" + found[1] : "clean")
+                        + " §7box+m" + RESET_ITEM_MARGIN + " item census[ready=" + boxCensus[0] + " falling=" + boxCensus[1]
+                        + " pickupDelay=" + boxCensus[2] + " owned=" + boxCensus[3] + "]");
                     if (found != null) {
                         // Content identified: ladder-sweep exactly those columns, then
                         // the centre walk runs again from the top - complete only on a
@@ -2071,6 +2251,12 @@ public class StepCheckered extends Module implements MapPrinter {
                         breakStage = 4;
                         return;
                     }
+                    if (boxCensus[0] + boxCensus[1] + boxCensus[2] > 0) {
+                        warning("§6[RESET-VERIFY]§e verify station passed but " + (boxCensus[0] + boxCensus[1] + boxCensus[2])
+                            + " drops are on/in flight over the box (ready=" + boxCensus[0] + " falling=" + boxCensus[1]
+                            + " pickupDelay=" + boxCensus[2] + ") - the block scan cannot see "
+                            + (boxCensus[1] + boxCensus[2]) + " of them (filtered).");
+                    }
                     // Clean station: queue advances (next station or deposit + complete)
                     return;
                 }
@@ -2079,6 +2265,10 @@ public class StepCheckered extends Module implements MapPrinter {
                     state = State.StandBy;
                     Utils.setForwardPressed(false);
                     SlaveSystem.sendMessageToMaster("step:done:" + Math.max(currentBatch, 0));
+                    info("§6[RESET-VERIFY]§7 completion state: breakPending(in-flight server confirms)=" + breakPending.size()
+                        + " vanillaQueue=" + needsVanillaBreak.size()
+                        + " persistentRejections=" + vanillaBreakRetries.size()
+                        + " - all should be 0 at completion.");
                     info("§aRESET complete - print area cleared, items deposited, standby.");
                     return;
                 case "depositBuilding":
@@ -2193,31 +2383,17 @@ public class StepCheckered extends Module implements MapPrinter {
                 }
                 mc.player.getInventory().setSelectedSlot(8);
 
-                // NON-BLOCKING break confirmation: process pending entries silently.
-                // Confirmed (now air) → remove. Expired + still solid → add to missedBreaks
-                // (the nearest-first target picker will naturally re-target them — they're
-                // still non-air and the picker picks nearest non-air). No forward-hold.
-                java.util.Iterator<BlockPos> pendingIt = breakPending.keySet().iterator();
-                while (pendingIt.hasNext()) {
-                    BlockPos pending = pendingIt.next();
-                    int ticksLeft = breakPending.get(pending) - 1;
-                    if (miningBlockState(pending).isAir()) {
-                        pendingIt.remove();
-                        
-                    } else if (ticksLeft <= 0) {
-                        // fastBreak failed — this block needs multi-tick mining.
-                        // Flag for vanilla breaking (handles concrete/terracotta/deepslate).
-                        needsVanillaBreak.add(pending);
-                        pendingIt.remove();
-                    } else {
-                        breakPending.put(pending, ticksLeft);
-                    }
-                }
+                // Break-confirmation processing now lives ONCE at the top of the tick
+                // (it used to be duplicated here — see that block for why that was a bug).
 
                 // Target new blocks — HYBRID: fastBreak (instant) for new targets,
                 // vanilla mining for blocks fastBreak already failed on (multi-tick).
                 // During RESET (fullSweepActive), currentBuildPlan is null so
                 // getNextBatchBreakPos() returns nothing — use the ring-scanner instead.
+                // Skipped entirely when the Mining-state loop above already sent packets
+                // this tick: both loops acting on the same target doubles the packets and
+                // re-resets server break-progress on vanilla targets.
+                if (breakSweepActedThisTick) return;
                 for (int broken = 0; broken < breaksPerTick.get(); broken++) {
                     BlockPos breakTarget;
                     if (broken == 0) {
@@ -2229,12 +2405,13 @@ public class StepCheckered extends Module implements MapPrinter {
                     }
                     if (breakTarget == null) break;
                     if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
+                    if (breakPending.containsKey(breakTarget)) break;
                     nextBlockPos = breakTarget;
                     if (needsVanillaBreak.contains(breakTarget)) {
                         // fastBreak failed before — this block needs 2-3 tick mining progress.
-                        // Vanilla updateBlockBreakingProgress handles it correctly.
+                        // Vanilla updateBlockBreakingProgress handles it correctly. NOT removed
+                        // here: the air-check cleanup at the top of the tick owns removal.
                         BlockUtils.breakBlock(breakTarget, true);
-                        needsVanillaBreak.remove(breakTarget);
                     } else {
                         // First attempt — fastBreak (instant for resin and soft blocks)
                         ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(breakTarget); mc.player.swingHand(Hand.MAIN_HAND);
@@ -3912,17 +4089,21 @@ public class StepCheckered extends Module implements MapPrinter {
         for (Entity entity : mc.world.getEntities()) {
             if (!(entity instanceof ItemEntity itemEntity)) continue;
             if (!itemEntity.groundCollision || itemEntity.cannotPickup() || itemEntity.getOwner() != null) continue;
-            if (itemEntity.getX() < lowerMapCorner.getX() || itemEntity.getX() > lowerMapCorner.getX() + 128) continue;
-            if (itemEntity.getZ() < lowerMapCorner.getZ() - 3 || itemEntity.getZ() > lowerMapCorner.getZ() + 130) continue;
+            // ITEM MARGIN: drops skid outside the box at its edges — scan the margin band
+            // too, but clamp the re-scoped ladder to columns 0-31: the boundary columns'
+            // own ±RESET_ITEM_MARGIN arrival scans reach these drops, so the walk never
+            // has to route outside the print box.
+            if (itemEntity.getX() < lowerMapCorner.getX() - RESET_ITEM_MARGIN || itemEntity.getX() > lowerMapCorner.getX() + 127 + RESET_ITEM_MARGIN) continue;
+            if (itemEntity.getZ() < lowerMapCorner.getZ() - 1 - RESET_ITEM_MARGIN || itemEntity.getZ() > lowerMapCorner.getZ() + 127 + RESET_ITEM_MARGIN) continue;
             if (itemEntity.getY() < lowerMapCorner.getY() - 3 || itemEntity.getY() > lowerMapCorner.getY() + 5) continue;
-            int col = (int) Math.floor(itemEntity.getX() - lowerMapCorner.getX()) / 4;
+            int col = Math.max(0, Math.min(31, (int) Math.floor(itemEntity.getX() - lowerMapCorner.getX()) / 4));
             min = Math.min(min, col); max = Math.max(max, col);
         }
         return min == Integer.MAX_VALUE ? null : new int[]{min, max};
     }
 
     private int resetZToSeg(int relZ) {
-        for (int seg = 4; seg >= 0; seg--) if (relZ >= RESET_SEG_START[seg]) return seg;
+        for (int seg = RESET_SEG_START.length - 1; seg >= 0; seg--) if (relZ >= RESET_SEG_START[seg]) return seg;
         return 0;
     }
 
@@ -3962,6 +4143,60 @@ public class StepCheckered extends Module implements MapPrinter {
         return nearest;
     }
 
+    /** RESET verification logging: counts EVERY ItemEntity in a bounded area, split by
+     *  the pickup filters findNearestItemInArea applies. ready = would be targeted now;
+     *  falling / pickupDelay / owned = invisible to the CLEAN check at this instant.
+     *  A CLEAN verdict with falling+pickupDelay > 0 means the segment was declared clean
+     *  while drops from the final breaks were still in flight (they get left behind). */
+    private int[] itemCensusInArea(int x0, int x1, int z0, int z1) {
+        int[] census = new int[4];   // {ready, falling, pickupDelay, owned}
+        if (mc.world == null) return census;
+        for (Entity entity : mc.world.getEntities()) {
+            if (!(entity instanceof ItemEntity itemEntity)) continue;
+            if (itemEntity.getX() < x0 || itemEntity.getX() > x1 + 1) continue;
+            if (itemEntity.getZ() < z0 || itemEntity.getZ() > z1 + 1) continue;
+            if (itemEntity.getY() < lowerMapCorner.getY() - 3 || itemEntity.getY() > lowerMapCorner.getY() + 5) continue;
+            if (itemEntity.getOwner() != null) census[3]++;
+            else if (!itemEntity.groundCollision) census[1]++;
+            else if (itemEntity.cannotPickup()) census[2]++;
+            else census[0]++;
+        }
+        return census;
+    }
+
+    /** RESET verification logging: break-confirmations still in flight inside the
+     *  window (fastBreak sent, server block-update not yet received). */
+    private int countPendingInRange(int x0, int x1, int z0, int z1) {
+        int n = 0;
+        for (BlockPos pos : breakPending.keySet()) {
+            if (pos.getX() >= x0 && pos.getX() <= x1 && pos.getZ() >= z0 && pos.getZ() <= z1) n++;
+        }
+        return n;
+    }
+
+    /** RESET verification logging: non-air blocks (all print-box layers) inside the window. */
+    private int countBlocksInArea(int x0, int x1, int z0, int z1) {
+        if (mc.world == null || lowerMapCorner == null) return -1;
+        int n = 0;
+        for (int x = x0; x <= x1; x++) {
+            for (int z = z0; z <= z1; z++) {
+                for (int y = lowerMapCorner.getY(); y <= lowerMapCorner.getY() + 3; y++) {
+                    if (!miningBlockState(new BlockPos(x, y, z)).isAir()) n++;
+                }
+            }
+        }
+        return n;
+    }
+
+    /** RESET verification logging: blocks flagged for multi-tick vanilla breaking inside the window. */
+    private int countVanillaInRange(int x0, int x1, int z0, int z1) {
+        int n = 0;
+        for (BlockPos pos : needsVanillaBreak) {
+            if (pos.getX() >= x0 && pos.getX() <= x1 && pos.getZ() >= z0 && pos.getZ() <= z1) n++;
+        }
+        return n;
+    }
+
     /** Master RESET: break every remaining batch block, deposit the items, return to standby. */
     private void stepAbort() {
         info("§cRESET: full-area clear starting.");
@@ -3976,6 +4211,12 @@ public class StepCheckered extends Module implements MapPrinter {
         breakStage = 0;
         collectingStragglers = false;
         nextBlockPos = null;
+        vanillaBreakRetries.clear();
+        jamWatchTarget = null;
+        jamWatchTicks = 0;
+        breakSweepActedThisTick = false;
+        resetStallSig = null;
+        resetStallRounds = 0;
         toBeHandledInvPacket = null;
         closeNextInvPacket = false;
         toBeSwappedSlot = -1;
