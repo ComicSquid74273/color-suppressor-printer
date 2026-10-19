@@ -1595,7 +1595,8 @@ public class StepCheckered extends Module implements MapPrinter {
         // Serpentine pass feed: while the reset ladder is active, keep a break target
         // armed from the ENTIRE print box (nearest to the bot). The bot breaks everything
         // in interaction range wherever it walks — no walking past blocks, noobline
-        // included. Segment bounds are ONLY used for the arrival confirmation check.
+        // included. When no blocks remain in range, target nearby DROPPED ITEMS for
+        // pickup (prevents items being left behind during the pass).
         if (state == State.Mining && nextBlockPos == null && fullSweepActive && resetLadderCol < 32
             && !checkpoints.isEmpty()
             && ("resetPass".equals(checkpoints.getFirst().getRight().getLeft())
@@ -1605,6 +1606,17 @@ public class StepCheckered extends Module implements MapPrinter {
             int bz0 = lowerMapCorner.getZ() - 1;   // noobline row included
             int bz1 = lowerMapCorner.getZ() + 127;
             nextBlockPos = findNearestBlockInArea(bx0, bx1, bz0, bz1);
+
+            // No blocks to break nearby → pick up dropped items in range
+            if (nextBlockPos == null && freeInventoryCapacity() > 0) {
+                ItemEntity nearbyItem = findNearestGroundItem(4);
+                if (nearbyItem != null && mc.player.getEyePos().distanceTo(nearbyItem.getEntityPos()) < 8) {
+                    // Walk to the item for vanilla proximity pickup
+                    checkpoints.addFirst(new Pair(
+                        new Vec3d(nearbyItem.getX(), nearbyItem.getY(), nearbyItem.getZ()),
+                        new Pair("resetStation", null)));
+                }
+            }
         }
 
         // Silent break-confirmation processing (runs every tick before break logic):
@@ -1996,8 +2008,11 @@ public class StepCheckered extends Module implements MapPrinter {
                             state = State.Mining;
                             breakStage = 4;
                         } else {
+                            // Keep Mining state — the feed arms targets during the walk,
+                            // so blocks in range get broken continuously. Setting Walking
+                            // here was the bug: no blocks broken while walking to targets.
                             checkpoints.addFirst(new Pair(lTarget.toCenterPos(), new Pair("resetStation", null)));
-                            state = State.Walking;
+                            state = State.Mining;
                         }
                     } else {
                         // in-cell item chase WITHOUT clearing the ladder queue
@@ -2174,9 +2189,18 @@ public class StepCheckered extends Module implements MapPrinter {
                 }
 
                 // Target new blocks — HYBRID: fastBreak (instant) for new targets,
-                // vanilla mining for blocks fastBreak already failed on (multi-tick)
+                // vanilla mining for blocks fastBreak already failed on (multi-tick).
+                // During RESET (fullSweepActive), currentBuildPlan is null so
+                // getNextBatchBreakPos() returns nothing — use the ring-scanner instead.
                 for (int broken = 0; broken < breaksPerTick.get(); broken++) {
-                    BlockPos breakTarget = broken == 0 ? nextBlockPos : getNextBatchBreakPos();
+                    BlockPos breakTarget;
+                    if (broken == 0) {
+                        breakTarget = nextBlockPos;
+                    } else if (fullSweepActive && currentBuildPlan == null) {
+                        breakTarget = findNearestPrintBoxBlock();
+                    } else {
+                        breakTarget = getNextBatchBreakPos();
+                    }
                     if (breakTarget == null) break;
                     if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
                     nextBlockPos = breakTarget;
