@@ -2163,14 +2163,34 @@ public class StepCheckered extends Module implements MapPrinter {
             goal = checkpoints.get(0).getLeft();
         }
 
-        // Set yaw rotation to goal
-        double lookZ = goal.z;
-        if (PlayerUtils.distanceTo(goal) > 2) {
-            lookZ = mc.player.getZ() + Math.max(Math.min(goal.z - mc.player.getZ(), 1), -1);
-        }
-        mc.player.setYaw((float) Rotations.getYaw(new Vec3d(goal.x, goal.y, lookZ)));
-
         String nextAction = checkpoints.get(0).getRight().getLeft();
+
+        // YAW: during breaking sweep passes (sweepTick, fullSweepTick, resetStation,
+        // resetPass), the walking target is a BLOCK being chased - the camera must NOT
+        // follow it (that causes random-facing swings). Instead, keep the yaw locked
+        // to the dominant axis of movement (the serpentine/lane direction).
+        // fastBreak doesn't need any facing direction - the packets go out regardless.
+        boolean isBreakSweep = "sweepTick".equals(nextAction) || "fullSweepTick".equals(nextAction)
+            || "resetStation".equals(nextAction) || "resetPass".equals(nextAction);
+        if (isBreakSweep) {
+            // Lock yaw to the cardinal direction of travel (N/S on lanes, E/W on corridors)
+            double dx = goal.x - mc.player.getX();
+            double dz = goal.z - mc.player.getZ();
+            float lockedYaw;
+            if (Math.abs(dz) > Math.abs(dx)) {
+                lockedYaw = dz > 0 ? 0.0f : 180.0f;   // facing south / north
+            } else {
+                lockedYaw = dx > 0 ? -90.0f : 90.0f;  // facing east / west
+            }
+            mc.player.setYaw(lockedYaw);
+        } else {
+            // Normal yaw steering toward the walking goal
+            double lookZ = goal.z;
+            if (PlayerUtils.distanceTo(goal) > 2) {
+                lookZ = mc.player.getZ() + Math.max(Math.min(goal.z - mc.player.getZ(), 1), -1);
+            }
+            mc.player.setYaw((float) Rotations.getYaw(new Vec3d(goal.x, goal.y, lookZ)));
+        }
 
         // Set sprint mode
         final List<String> noSprintActions = Arrays.asList("lineBegin", "lineEnd", "mineBegin", "mineEnd");
