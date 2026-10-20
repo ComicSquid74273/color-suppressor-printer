@@ -4533,7 +4533,9 @@ public class StepCheckered extends Module implements MapPrinter {
                 if (!materialDict.containsKey(dStack.getItem())) continue;
                 Item dItem = dStack.getItem();
                 carried.put(dItem, carried.getOrDefault(dItem, 0) + dStack.getCount());
-                itemSlots.computeIfAbsent(dItem, k -> new java.util.ArrayList<>()).add(dSlot);
+                java.util.ArrayList<Integer> listForItem = itemSlots.get(dItem);
+                if (listForItem == null) { listForItem = new java.util.ArrayList<>(); itemSlots.put(dItem, listForItem); }
+                listForItem.add(dSlot);
             }
             java.util.HashSet<Item> unneededItems = null;
             java.util.ArrayList<Integer> dumpSlots = new java.util.ArrayList<>();
