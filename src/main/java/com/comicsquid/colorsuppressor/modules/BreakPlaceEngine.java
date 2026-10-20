@@ -124,7 +124,7 @@ final class BreakPlaceEngine {
             if (pick == 0 && mod.nextBlockPos != null && !attempted.contains(mod.nextBlockPos)) {
                 breakTarget = mod.nextBlockPos;
             } else if (fullSweep) {
-                breakTarget = mod.slave.findNearestPrintBoxBlock(attempted);
+                breakTarget = mod.slave.scan.findNearestPrintBoxBlock(attempted);
             } else {
                 breakTarget = getNextBatchBreakPos(attempted);
             }
@@ -250,7 +250,7 @@ final class BreakPlaceEngine {
         }
         if (lastSwappedMaterial == material) return 0;    //Wait for swapped material
         // Mid-print supply run: refill the missing material via the north checkpoint
-        mod.slave.pauseForRestockTrip(false);
+        mod.slave.routes.pauseForRestockTrip(false);
         return -1;
     }
 
@@ -415,7 +415,7 @@ final class BreakPlaceEngine {
             return false;
         } else if (mod.state == State.AwaitBreakPermissionAll && mod.breakAllPermitted) {
             mod.breakAllPermitted = false;
-            mod.slave.startBreakAll();
+            mod.slave.routes.startBreakAll();
             return true;
         }
         return false;
@@ -437,7 +437,7 @@ final class BreakPlaceEngine {
         // LANE GATE: no printing unless the bot stands centered on the phase's lane-2
         // centerline. Off-center (e.g. after a sweep left it straddling lanes), freshly
         // placed floor blocks on the west lanes can catch the bot's side and wall it in.
-        if (mod.lowerMapCorner != null && Math.abs(mc.player.getX() - mod.slave.currentWalkLaneX()) > 0.3) return null;
+        if (mod.lowerMapCorner != null && Math.abs(mc.player.getX() - mod.slave.routes.currentWalkLaneX()) > 0.3) return null;
         // Litematica-style: any plan block is placed the moment it enters interaction
         // range — ahead, beside, or behind. The walking lane (2, the east borrow lane)
         // only carries y2 blocks above the head, so nothing is ever placed at feet level

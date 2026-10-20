@@ -50,23 +50,20 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
  */
 final class SlaveEngine {
     final StepCheckered mod;
+    final WorldScanner scan;
+    final BatchRouter routes;
+    final ResetLadder reset;
 
     // --- Slave run state (moved from the module) ---
     boolean printRepairPending;                        // print pass ended with missing blocks
     int batchPassRetries;
     int sweepBudget;                                   // tick budget for the straggler sweep
     int restockCooldown;                               // blocks repeat supply-run triggers
-    HashMap<BlockPos, Integer> collectSkips;           // collection run: picks per drop (10 = blacklisted)
-    int resetLadderCol;                                // 0..31 current column (32 = verify phase)
-    int resetLadderSeg;                                // 0..4  current z-segment (resume anchor)
-    int resetLadderEndCol;                             // last column of the scoped reset
     String resetStallSig;                              // reset arrival stall detector signature
     int resetStallRounds;
     int sweepWaitRounds;
     boolean sweepWaitLogged;
     String sweepReArmSig;
-    BlockPos jamWatchTarget;                           // feed-jam detector target
-    int jamWatchTicks;
     int heartbeatTicks;
     String debugLastAction;
     State debugPreviousState;
@@ -77,14 +74,13 @@ final class SlaveEngine {
     private final ArrayDeque<String> pendingStepCommands = new ArrayDeque<>();
 
     /** RESET ladder z-segments: inclusive row ranges and station centres (relative). */
-    private static final int[] RESET_SEG_START = {0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120};
-    private static final int[] RESET_SEG_END = {7, 15, 23, 31, 39, 47, 55, 63, 71, 79, 87, 95, 103, 111, 119, 127};
-    private static final int[] RESET_SEG_CENTER_Z = {4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92, 100, 108, 116, 124};
     /** Block drops skid up to 3-4 blocks outside the segment / print box (user-measured). */
-    private static final int RESET_ITEM_MARGIN = 4;
 
     SlaveEngine(StepCheckered mod) {
         this.mod = mod;
+        scan = new WorldScanner(mod);
+        routes = new BatchRouter(mod);
+        reset = new ResetLadder(mod);
     }
 
     /** Full slave-state reset (module onActivation path). */
@@ -93,17 +89,11 @@ final class SlaveEngine {
         batchPassRetries = 0;
         sweepBudget = 0;
         restockCooldown = 0;
-        collectSkips = new HashMap<>();
-        resetLadderCol = 0;
-        resetLadderSeg = 0;
-        resetLadderEndCol = 0;
         resetStallSig = null;
         resetStallRounds = 0;
         sweepWaitRounds = 0;
         sweepWaitLogged = false;
         sweepReArmSig = null;
-        jamWatchTarget = null;
-        jamWatchTicks = 0;
         heartbeatTicks = 0;
         debugLastAction = null;
         debugPreviousState = null;
@@ -113,6 +103,9 @@ final class SlaveEngine {
         synchronized (pendingStepCommands) {
             pendingStepCommands.clear();
         }
+        scan.resetForActivation();
+        routes.resetForActivation();
+        reset.resetForActivation();
     }
 
     /** Master->slave command queue entry (SlaveSystem contract lives on the module). */
@@ -173,60 +166,16 @@ final class SlaveEngine {
             || mod.lowerMapCorner == null || mod.fullSweepActive) return false;
         int scope = mod.resetPendingScope;
         mod.info("§eRESET pending (scope cols 0-" + scope + ") - resuming the reset after re-enable.");
-        resetLadderEndCol = Math.min(31, Math.max(0, scope));
-        resetLadderCol = 0;
-        resetLadderSeg = mc.player.getBlockZ() - mod.lowerMapCorner.getZ() > 64 ? 4
+        reset.resetLadderEndCol = Math.min(31, Math.max(0, scope));
+        reset.resetLadderSeg = mc.player.getBlockZ() - mod.lowerMapCorner.getZ() > 64 ? 4
             : (mc.player.getBlockZ() - mod.lowerMapCorner.getZ() > 26 ? 2 : 0);
-        queueResetLadder(resetLadderCol, 0);
-        prependNorthCorridor(mod.checkpoints.getFirst().getLeft().x);
+        reset.queueResetLadder(reset.resetLadderCol, 0);
+        routes.prependNorthCorridor(mod.checkpoints.getFirst().getLeft().x);
         mod.state = State.Mining;
         mod.breakStage = 4;
         return true;
     }
 
-    void armResetFeedTarget() {
-        if (mod.state != State.Mining || !mod.fullSweepActive || resetLadderCol >= 32
-            || mod.checkpoints.isEmpty()
-            || !"resetPass".equals(mod.checkpoints.getFirst().getRight().getLeft())
-                && !"resetStation".equals(mod.checkpoints.getFirst().getRight().getLeft())) return;
-        // ARM BLOCK TARGETS: scan ONLY within z±6 of the bot. Prevents
-        // targeting blocks far ahead while missing blocks behind. Items
-        // collected by vanilla proximity + segment confirmation + verify walk.
-        if (mod.nextBlockPos == null) {
-            int botZ = mc.player.getBlockZ();
-            int bx0 = mod.lowerMapCorner.getX();
-            int bx1 = bx0 + 127;
-            int bz0 = Math.max(mod.lowerMapCorner.getZ() - 1, botZ - 6);
-            int bz1 = Math.min(mod.lowerMapCorner.getZ() + 127, botZ + 6);
-            mod.nextBlockPos = findNearestBlockInArea(bx0, bx1, bz0, bz1);
-        }
-        // FEED-JAM recovery: an armed target beyond interaction range never turns
-        // air and blocks re-arming (feed only arms when mod.nextBlockPos == null) —
-        // the pass would walk on breaking nothing. After 10 stuck ticks, drop the
-        // stale target so the feed re-arms (the block gets re-targeted on a later
-        // pass; the arrival scan and verify walk still gate completeness).
-        if (mod.nextBlockPos != null
-            && mc.player.getEyePos().distanceTo(mod.nextBlockPos.toCenterPos()) > mod.interactionRange.get()) {
-            if (mod.nextBlockPos.equals(jamWatchTarget)) {
-                jamWatchTicks++;
-                if (jamWatchTicks >= 10) {
-                    mod.info("§6[RESET-VERIFY]§7 feed re-armed: dropped stale out-of-range target "
-                        + mod.nextBlockPos.toShortString() + " (dist ~"
-                        + Math.round(mc.player.getEyePos().distanceTo(mod.nextBlockPos.toCenterPos()))
-                        + " > " + mod.interactionRange.get() + ") after " + jamWatchTicks + " ticks.");
-                    mod.nextBlockPos = null;
-                    jamWatchTarget = null;
-                    jamWatchTicks = 0;
-                }
-            } else {
-                jamWatchTarget = mod.nextBlockPos;
-                jamWatchTicks = 1;
-            }
-        } else {
-            jamWatchTarget = null;
-            jamWatchTicks = 0;
-        }
-    }
 
     void steerTowardGoal(Vec3d goal, String nextAction) {
         boolean isBreakSweep = "sweepTick".equals(nextAction) || "fullSweepTick".equals(nextAction)
@@ -297,7 +246,7 @@ final class SlaveEngine {
             // carried one; with none left the fetch trip is the only recovery.
             mod.restock.mod.restock.movePickaxeToSlot8();
             if (!mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) {
-                pauseForRestockTrip(true);
+                routes.pauseForRestockTrip(true);
             }
             return;
         }
@@ -435,13 +384,13 @@ final class SlaveEngine {
                 Utils.setForwardPressed(false);
                 return true;
             case "stepClosingDone":
-                finishClosing();
+                routes.finishClosing();
                 return true;
             case "sweepTick":
                 return handleSweepTickArrival();
             case "resetPass":
             case "resetStation":
-                return handleResetArrival(checkpointAction);
+                return reset.handleResetArrival(checkpointAction);
             case "fullSweepDone":
                 mod.fullSweepActive = false;
                 mod.clearResetPending();   // the RESET survived to completion
@@ -499,11 +448,11 @@ final class SlaveEngine {
         mod.restock.mod.restock.ensurePickaxeSlot8();
         mod.breakStage = 4;
         mod.state = State.Mining;
-        int remainingBlocks = countRemainingPlanBlocks();
-        int[] census = itemCensusInBatchWindow();
-        int bwx0 = batchWindowWestX() - 2;
-        int pendBrk = countPendingInRange(bwx0, bwx0 + 7, mod.lowerMapCorner.getZ() - 3, mod.lowerMapCorner.getZ() + 129);
-        int vanillaQ = countVanillaInRange(bwx0, bwx0 + 7, mod.lowerMapCorner.getZ() - 3, mod.lowerMapCorner.getZ() + 129);
+        int remainingBlocks = scan.countRemainingPlanBlocks();
+        int[] census = scan.itemCensusInBatchWindow();
+        int bwx0 = scan.batchWindowWestX() - 2;
+        int pendBrk = scan.countPendingInRange(bwx0, bwx0 + 7, mod.lowerMapCorner.getZ() - 3, mod.lowerMapCorner.getZ() + 129);
+        int vanillaQ = scan.countVanillaInRange(bwx0, bwx0 + 7, mod.lowerMapCorner.getZ() - 3, mod.lowerMapCorner.getZ() + 129);
         // STALL DETECTOR (same signature discipline as resetPass): blocks +
         // item states + position — any progress changes it. 80 frozen rounds
         // advance to the exit gate with a dump (the sweep there re-verifies).
@@ -533,7 +482,7 @@ final class SlaveEngine {
                 + " owned=" + census[3] + "] pendBrk=" + pendBrk + " vanillaQ=" + vanillaQ
                 + (mod.restock.mod.restock.freeInventoryCapacity() == 0 ? " §cINV-FULL(item chase skipped)" : ""));
         }
-        BlockPos straggler = nearestRemainingPlanBlock();
+        BlockPos straggler = scan.nearestRemainingPlanBlock();
         int totalDrops = census[0] + census[1] + census[2];
         if (straggler == null && totalDrops == 0) {
             mod.info("§aBreak-all batch " + mod.currentBatch + " CLEAN - fully confirmed.");
@@ -565,7 +514,7 @@ final class SlaveEngine {
 
     boolean handleCollectRunArrival() {
         mod.state = State.Walking;
-        int[] cCensus = itemCensusInBatchWindow();
+        int[] cCensus = scan.itemCensusInBatchWindow();
         if (cCensus[0] + cCensus[1] + cCensus[2] == 0) {
             // The run ends at the NORTH end - replace the stale south-end
             // batchExit (queued by startBreakAll next to breakAllDone) with
@@ -581,7 +530,7 @@ final class SlaveEngine {
             mod.checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("collectRun", null)));
             return true;
         }
-        ItemEntity next = nearestCollectTarget();
+        ItemEntity next = scan.nearestCollectTarget();
         if (next == null) {
             // only unreachable/blacklisted drops remain - hand off to the exit
             // gate HERE (finishBatch census will name them)
@@ -606,7 +555,7 @@ final class SlaveEngine {
                 if (dist < blockDist) { blockDist = dist; nearestBlock = pos; }
             }
         }
-        ItemEntity nearestItem = mod.restock.mod.restock.freeInventoryCapacity() > 0 ? findNearestGroundItem(3) : null;
+        ItemEntity nearestItem = mod.restock.mod.restock.freeInventoryCapacity() > 0 ? scan.findNearestGroundItem(3) : null;
         double itemDist = nearestItem != null
             ? mc.player.getEyePos().distanceTo(nearestItem.getEntityPos()) : Double.MAX_VALUE;
         if (sweepBudget > 0 && mod.restock.mod.restock.freeInventoryCapacity() > 0) {
@@ -616,7 +565,7 @@ final class SlaveEngine {
                 mod.state = State.Mining;
                 return true;
             } else if (nearestItem != null) {
-                targetGroundItem(nearestItem, "sweepTick");
+                scan.targetGroundItem(nearestItem, "sweepTick");
                 return true;
             }
         }
@@ -633,360 +582,20 @@ final class SlaveEngine {
         return true;
     }
 
-    boolean handleResetArrival(Pair<String, BlockPos> checkpointAction) {
-        mod.state = State.Mining;
-        // PASS ARRIVAL: decode the (col, seg) anchor the queue attached, with a decode
-        // cross-check - a mismatch means the arrival scan verifies the WRONG rows.
-        if (checkpointAction.getRight() != null) {
-            resetLadderCol = Math.min(31, (checkpointAction.getRight().getX() - mod.lowerMapCorner.getX()) / 4);
-            int anchorRelZ = checkpointAction.getRight().getZ() - mod.lowerMapCorner.getZ();
-            int actualSeg = Math.min(RESET_SEG_START.length - 1, Math.max(0, anchorRelZ / 8));
-            resetLadderSeg = resetZToSeg(anchorRelZ);
-            if (resetLadderSeg != actualSeg) {
-                mod.warning("§6[RESET-VERIFY]§e SEGMENT DECODE BUG at col " + resetLadderCol
-                    + ": checkpoint is segment " + actualSeg + " (rows " + (actualSeg * 8) + "-" + (actualSeg * 8 + 7)
-                    + ") but resetZToSeg decoded " + resetLadderSeg
-                    + " (rows " + (RESET_SEG_START[resetLadderSeg]) + "-" + RESET_SEG_END[resetLadderSeg]
-                    + ") - the arrival scan below verifies the WRONG rows, the walked segment is NOT verified.");
-            }
-        }
-        ItemStack ladderPick = mc.player.getInventory().getStack(8);
-        if (!ladderPick.isIn(ItemTags.PICKAXES)) {
-            // Worn pickaxes keep working mid-run (exchange only at the pre-batch
-            // restock) - fetch only when none is left at all
-            mod.restock.mod.restock.movePickaxeToSlot8();
-            if (!mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) {
-                pauseForRestockTrip(true);
-                return true;
-            }
-        }
-        int lx0 = mod.lowerMapCorner.getX() + 4 * resetLadderCol;
-        int lx1 = lx0 + 3;
-        int lz0 = mod.lowerMapCorner.getZ() + RESET_SEG_START[resetLadderSeg] - (resetLadderSeg == 0 ? 1 : 0);  // segment 0 owns the noobline row too
-        int lz1 = mod.lowerMapCorner.getZ() + RESET_SEG_END[resetLadderSeg];
-        // ITEM MARGIN window: blocks never move, but their drops skid — scan
-        // (and chase) items this far past the segment in every horizontal
-        // direction, including outside the print box at its edges.
-        int ix0 = lx0 - RESET_ITEM_MARGIN, ix1 = lx1 + RESET_ITEM_MARGIN;
-        int iz0 = lz0 - RESET_ITEM_MARGIN, iz1 = lz1 + RESET_ITEM_MARGIN;
-        if (mod.restock.mod.restock.freeInventoryCapacity() == 0 && findNearestItemInArea(ix0, ix1, iz0, iz1) != null) {
-            Pair<BlockPos, Vec3d> ladderChest = mod.restock.mod.restock.getBestDepositChest();
-            if (ladderChest != null) {
-                mod.checkpoints.clear();
-                mod.checkpoints.add(new Pair(ladderChest.getRight(), new Pair("depositBuilding", ladderChest.getLeft())));
-                queueResetLadder(resetLadderCol, resetLadderSeg);
-                prependNorthCorridor(ladderChest.getRight().x);
-                mod.state = State.Mining;
-                mod.info("§7Inventory full - depositing, then resuming the reset ladder.");
-                mod.state = State.Mining;  // resume in Mining: feed stays active on the return walk
-                return true;
-            }
-        }
-        BlockPos lTarget = findNearestBlockInArea(lx0, lx1, lz0, lz1);
-        ItemEntity lItem = mod.restock.mod.restock.freeInventoryCapacity() > 0 ? findNearestItemInArea(ix0, ix1, iz0, iz1) : null;
-        // RESET-VERIFY census: everything the CLEAN verdict is about to be based on,
-        // including content the filtered scans above cannot see.
-        int[] census = itemCensusInArea(ix0, ix1, iz0, iz1);
-        int pendBrk = countPendingInRange(lx0, lx1, lz0, lz1);
-        int vanilla = countVanillaInRange(lx0, lx1, lz0, lz1);
-        // STALL DETECTOR (replaces the generic anti-stuck force-skip for this
-        // handler): the signature covers block count, every item mod.state and the
-        // bot position — ANY progress changes it (blocks break, drops land,
-        // states tick over, the bot walks). Only 80 consecutive FROZEN arrivals
-        // force-advance, with a full dump of what is being left behind.
-        String arrivalSig = resetLadderCol + ":" + resetLadderSeg + "|b" + countBlocksInArea(lx0, lx1, lz0, lz1)
-            + "|i" + census[0] + "," + census[1] + "," + census[2] + "," + census[3]
-            + "|p" + mc.player.getBlockX() + "," + mc.player.getBlockZ();
-        boolean sigChanged = !arrivalSig.equals(resetStallSig);
-        if (!sigChanged) {
-            resetStallRounds++;
-            if (resetStallRounds > 80) {
-                mod.warning("§6[RESET-VERIFY]§c STALL: col " + resetLadderCol + " seg " + resetLadderSeg
-                    + " frozen for 80+ arrival rounds - blocks=" + countBlocksInArea(lx0, lx1, lz0, lz1)
-                    + " items+m" + RESET_ITEM_MARGIN + "[ready=" + census[0] + " falling=" + census[1]
-                    + " pickupDelay=" + census[2] + " owned=" + census[3] + "]"
-                    + " pendBrk=" + pendBrk + " - advancing WITHOUT clearing (verify walk will re-scope).");
-                resetStallRounds = 0;
-                resetStallSig = null;
-                return true;   // no re-queue: the ladder advances
-            }
-        } else {
-            resetStallSig = arrivalSig;
-            resetStallRounds = 0;
-        }
-        // Census log only on mod.state change: dwell waits and in-place breaking
-        // fire arrivals every tick — logging each would flood the chat.
-        if (sigChanged) {
-            mod.info("§6[RESET-VERIFY]§7 col " + resetLadderCol + " seg " + resetLadderSeg
-                + " rows " + (lz0 - mod.lowerMapCorner.getZ()) + "-" + (lz1 - mod.lowerMapCorner.getZ())
-                + " §fblocks=" + (lTarget != null ? "1+ @" + (lTarget.getX() - mod.lowerMapCorner.getX()) + "," + (lTarget.getY() - mod.lowerMapCorner.getY()) + "," + (lTarget.getZ() - mod.lowerMapCorner.getZ()) : "0")
-                + " §7items+m" + RESET_ITEM_MARGIN + "[ready=" + census[0] + " falling=" + census[1] + " pickupDelay=" + census[2] + " owned=" + census[3] + "]"
-                + " §3pendBrk=" + pendBrk + " vanillaQ=" + vanilla
-                + (mod.restock.mod.restock.freeInventoryCapacity() == 0 ? " §cINV-FULL(item scan skipped)" : ""));
-        }
-        if (lTarget == null && lItem == null) {
-            if (census[1] + census[2] > 0) {
-                // WAIT for in-flight drops instead of advancing: they land and
-                // become pickup-able within ~10-20 ticks, and a mod.sprinting bot
-                // never returns for them. Dwell in place and re-check — the
-                // mod.state transitions keep the stall detector fed; a genuinely
-                // frozen wait still force-advances after 80 rounds.
-                mod.checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("resetStation", null)));
-                return true;
-            }
-            mod.info("§aReset col " + resetLadderCol + " segment " + resetLadderSeg + " CLEAN - fully confirmed.");
-            return true;   // ladder queue advances on its own
-        }
-        double bDist = lTarget != null ? mc.player.getEyePos().distanceTo(lTarget.toCenterPos()) : Double.MAX_VALUE;
-        double iDist = lItem != null ? mc.player.getEyePos().distanceTo(lItem.getEntityPos()) : Double.MAX_VALUE;
-        if (lTarget != null && bDist <= iDist) {
-            if (bDist <= mod.interactionRange.get()) {
-                mod.nextBlockPos = lTarget;
-                // Same hybrid rules as the per-tick break loop - via the ONE
-                // shared sender (pending-guarded: no re-send while a
-                // confirmation is in flight).
-                if (!mod.engine.mod.engine.breakPending.containsKey(lTarget)) mod.engine.mod.engine.sendHybridBreak(lTarget);
-                mod.checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("resetStation", null)));
-                mod.state = State.Mining;
-                mod.breakStage = 4;
-            } else {
-                // Keep Mining mod.state — the feed arms targets during the walk,
-                // so blocks in range get broken continuously. Setting Walking
-                // here was the bug: no blocks broken while walking to targets.
-                mod.checkpoints.addFirst(new Pair(lTarget.toCenterPos(), new Pair("resetStation", null)));
-                mod.state = State.Mining;
-            }
-        } else {
-            // in-cell item chase WITHOUT clearing the ladder queue
-            mod.checkpoints.addFirst(new Pair(new Vec3d(lItem.getX(), lItem.getY(), lItem.getZ()), new Pair("resetStation", null)));
-            mod.state = State.Mining;  // Mining: feed stays active, blocks in path get broken
-        }
-        return true;
-    }
 
-    void beginBatch(int k) {
-        if (!mod.initialSetup()) {
-            mod.state = State.StandBy;
-            return;
-        }
-        mod.currentBatch = k;
-        batchPassRetries = 0;
-        mod.engine.placementAttempts.clear();
-        collectSkips.clear();
-        mod.clearResetPending();   // a new run supersedes any interrupted reset
-        sweepReArmSig = null;
-        sweepWaitRounds = 0;
-        sweepWaitLogged = false;
-        mod.breakStage = 0;
-        printRepairPending = false;
-        mod.break2Permitted = false;
-        mod.breakAllPermitted = false;
-        mod.fullSweepActive = false;   // no reset may survive into a batch
-        mod.currentBuildPlan = mod.assembleBatch(k);
-        mod.info("§aBatch " + k + ": §b" + mod.currentBuildPlan.size() + "§7 blocks planned. Restocking...");
 
-        mod.checkpoints.clear();
-        mod.state = State.Walking;
-        // The whole batch route walks LANE 2 (x = 2k+2.5, block 2k+2's exact center —
-        // the borrow-west lane): its only blocks are borrow recessives at y2, above the
-        // bot's head, so nothing ever sits at feet level on the walking lane and every
-        // batch lane is within interaction range.
-        double walkX = mod.lowerMapCorner.getX() + 2.0 * k + 2.5;
-        double northZ = mod.lowerMapCorner.getZ() - 2;
-        double southZ = mod.lowerMapCorner.getZ() + 128.7;
 
-        // Restock materials (+ pickaxe if missing) and food BEFORE entering the print route.
-        // refillBuildingInventory() adds its first chest at the head of the queue, so the
-        // actual batch route is appended only after preparation is complete.
-        queueStepBuildPreparation(walkX);
 
-        // PHASE TOOL SLOTS (user rule, live 2026-10-21): printing needs NO tools -
-        // the tool slots join the staging set during the print pass. The hotbar is
-        // 0-8 ONLY (slot 9 is main inventory - passing it as performSwap's hotbar
-        // argument crashed the client at batch 3, 02:27): tools park in hotbar
-        // 7 (axe) + 8 (pickaxe); break(2)/break(4) moves them back in.
-        {
-            for (int ts = 7; ts <= 8; ts++) {
-                ItemStack tStack = mc.player.getInventory().getStack(ts);
-                if (!tStack.isEmpty() && (tStack.isIn(ItemTags.PICKAXES) || tStack.isIn(ItemTags.AXES))) {
-                    int freeSlot = -1;
-                    for (int fs = 9; fs < 36 && freeSlot == -1; fs++) {
-                        if (mc.player.getInventory().getStack(fs).isEmpty()) freeSlot = fs;
-                    }
-                    if (freeSlot != -1) {
-                        // hotbar -> main inventory: SWAP's button IS the hotbar index,
-                        // and NO setSelectedSlot may run (it only accepts 0-8).
-                        Utils.swapHotbarToInventory(ts, freeSlot);
-                        if (!mod.availableHotBarSlots.contains(ts)) mod.availableHotBarSlots.add(ts);
-                        mod.info("§7Print phase: " + tStack.getItem().getName().getString() + " moved out of slot " + ts + " - staging slot freed.");
-                    } else {
-                        mod.info("§7Print phase: slot " + ts + " tool stays put - inventory full, no free main slot.");
-                    }
-                }
-            }
-        }
-        // HOTBAR LOOKAHEAD (user rule, live 2026-10-21): pre-arrange the hotbar with
-        // the FIRST distinct materials of this batch's plan (walking order), so the
-        // print pass rarely stalls on mid-run swaps - the old on-demand one-slot
-        // swapping was the print delay. Runs before the route; one swap per material.
-        {
-            LinkedHashSet<Item> coming = new LinkedHashSet<>();
-            for (Map.Entry<BlockPos, Block> le : mod.currentBuildPlan.entrySet()) {
-                if (coming.size() >= mod.availableHotBarSlots.size()) break;
-                coming.add(le.getValue().asItem());
-            }
-            int preSwapped = 0;
-            int slotCursor = 0;
-            for (Item comingItem : coming) {
-                if (mod.restock.isItemInHotbar(comingItem)) continue;
-                int srcSlot = -1;
-                for (int is = 9; is < 36 && srcSlot == -1; is++) {
-                    ItemStack isStack = mc.player.getInventory().getStack(is);
-                    if (!isStack.isEmpty() && isStack.getItem().equals(comingItem)) srcSlot = is;
-                }
-                if (srcSlot == -1) continue;
-                while (slotCursor < mod.availableHotBarSlots.size()) {
-                    int dest = mod.availableHotBarSlots.get(slotCursor);
-                    slotCursor++;
-                    ItemStack destStack = mc.player.getInventory().getStack(dest);
-                    if (destStack.isEmpty() || destStack.getItem().equals(comingItem)) {
-                        Utils.performSwap(srcSlot, dest);
-                        preSwapped++;
-                        break;
-                    }
-                    // skip slots holding other needed materials
-                    boolean destNeeded = false;
-                    for (Item otherComing : coming) {
-                        if (!destStack.isEmpty() && destStack.getItem().equals(otherComing)) { destNeeded = true; break; }
-                    }
-                    if (!destNeeded) { Utils.performSwap(srcSlot, dest); preSwapped++; break; }
-                }
-            }
-            if (preSwapped > 0) mod.info("§7Hotbar lookahead: pre-arranged " + preSwapped + " material slots for the print pass.");
-        }
 
-        // FIXED CYCLE (user rule, live 2026-10-20): every batch runs the same
-        // directions - print N->S, break(2) S->N, break-all N->S (forced in
-        // startBreakAll), collection S->N - ending each batch at the north end where
-        // the next one starts. NO position-based mirroring: it flipped the parity
-        // after any interrupt and manufactured dead NS walks. Repositioning happens
-        // once, at the boundary, via the north corridor.
-        mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), northZ), new Pair("batchBegin", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), southZ), new Pair("printDone", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), southZ), new Pair("awaitBreak2", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), northZ), new Pair("break2Done", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), northZ), new Pair("awaitBreakAll", null)));
-        prependLaneCentering(walkX);
-        prependNorthCorridor(walkX);
-    }
-
-    void beginPriming() {
-        if (!mod.initialSetup()) {
-            mod.state = State.StandBy;
-            return;
-        }
-        mod.currentBatch = 0;
-        mod.breakStage = 0;
-        printRepairPending = false;
-        mod.engine.placementAttempts.clear();
-        mod.clearResetPending();
-        // A new run kills any leftover RESET mod.state - a stale mod.fullSweepActive here made
-        // the first mid-run supply run resurrect the dead reset ladder over the priming
-        mod.fullSweepActive = false;
-        mod.checkpoints.clear();
-        mod.state = State.Walking;
-
-        // Lane 2 center, same as the regular batches: block 2 of the 4-lane window
-        // (lanes 0-3), i.e. corner.x + 2.5 — the borrow-west lane, feet-level clean.
-        double stagingX = mod.lowerMapCorner.getX() + 2.5;
-        double northZ = mod.lowerMapCorner.getZ() - 2;
-        double southZ = mod.lowerMapCorner.getZ() + 128.7;
-        HashMap<BlockPos, Block> floorPlan = mod.assemblePriming();
-        if (mod.stepLayers != null) {
-            StepCheckerLayers.addLayerAt(floorPlan, mod.stepLayers.domLayers.get(0), mod.lowerMapCorner, 2);   // merged batch-0 supply basis
-        }
-        mod.currentBuildPlan = floorPlan;
-        queueStepBuildPreparation(stagingX);
-        mod.currentBuildPlan = mod.assemblePriming();   // the actual print plan (floor only)
-        // FIXED CYCLE: print N->S like every batch (no mirroring - see beginBatch)
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), northZ), new Pair("batchBegin", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), southZ), new Pair("printDone", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), southZ), new Pair("awaitBreak2", null)));
-        prependLaneCentering(stagingX);
-        prependNorthCorridor(stagingX);
-        mod.info("§aBatch 0 floor half: §b" + mod.currentBuildPlan.size() + "§7 blocks planned.");
-    }
-
-    void beginClosing() {
-        if (!mod.initialSetup()) {
-            mod.state = State.StandBy;
-            return;
-        }
-        mod.currentBatch = 63;
-        mod.breakStage = 0;
-        printRepairPending = false;
-        mod.currentBuildPlan = mod.assembleClosing();
-        mod.checkpoints.clear();
-        mod.state = State.Walking;
-
-        // Closing = dominant pair 63 on lanes 126-127 (2-lane window): the slave walks
-        // the second lane's center (block 127, y2-only above the head), NOT the master's
-        // x=253 sweep lane
-        double stagingX = mod.lowerMapCorner.getX() + 127.5;
-        double northZ = mod.lowerMapCorner.getZ() - 2;
-        double southZ = mod.lowerMapCorner.getZ() + 128.7;
-        queueStepBuildPreparation(stagingX);
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), northZ), new Pair("batchBegin", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), southZ), new Pair("stepClosingReady", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), northZ), new Pair("stepClosingWait", null)));
-        prependLaneCentering(stagingX);
-        prependNorthCorridor(stagingX);
-        mod.info("§aClosing: §b" + mod.currentBuildPlan.size() + "§7 dominant blocks planned; sweep must use x=253.");
-    }
-
-    void startClosingBreak() {
-        mod.breakStage = 4;
-        mod.checkpoints.clear();
-        mod.state = State.Walking;
-        double stagingX = mod.lowerMapCorner.getX() + 253.5;
-        double northZ = mod.lowerMapCorner.getZ() - 2;
-        double southZ = mod.lowerMapCorner.getZ() + 128.7;
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), northZ), new Pair("breakAllBegin", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), southZ), new Pair("breakAllDone", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), northZ), new Pair("stepClosingDone", null)));
-        prependNorthCorridor(stagingX);
-        mod.info("§aClosing: recycling pair 63 after the final map verification.");
-    }
-
-    void finishClosing() {
-        ArrayList<BlockPos> remaining = new ArrayList<>();
-        if (mod.currentBuildPlan != null) {
-            for (BlockPos pos : mod.currentBuildPlan.keySet()) {
-                if (!mod.miningBlockState(pos).isAir()) remaining.add(pos);
-            }
-        }
-        if (!remaining.isEmpty()) {
-            mod.error("Closing recycle left " + remaining.size() + " blocks standing; stopped for diagnosis.");
-            mod.state = State.StandBy;
-            mod.master.stepMasterStage = StepMasterStage.ABORTED;
-            Utils.setForwardPressed(false);
-            return;
-        }
-        mod.currentBuildPlan = null;
-        mod.breakStage = 0;
-        mod.state = State.StandBy;
-        Utils.setForwardPressed(false);
-        SlaveSystem.sendMessageToMaster("step:closed");
-    }
 
     void finishBatch() {
         // COMBINED SWEEP: check both remaining blocks and ground items at once.
         // sweepTick handles whichever is nearest (block → break, item → collect).
         // No separate retry walks, no zigzag — one spatial-awareness pass.
-        int remainingBlocks = countRemainingPlanBlocks();
-        int groundItems = countGroundItemsInWindow();
-        int[] census = itemCensusInBatchWindow();
-        int pendBrk = countPendingInRange(batchWindowWestX() - 2, batchWindowWestX() + 5,
+        int remainingBlocks = scan.countRemainingPlanBlocks();
+        int groundItems = scan.countGroundItemsInWindow();
+        int[] census = scan.itemCensusInBatchWindow();
+        int pendBrk = scan.countPendingInRange(scan.batchWindowWestX() - 2, scan.batchWindowWestX() + 5,
             mod.lowerMapCorner.getZ() - 3, mod.lowerMapCorner.getZ() + 129);
         int inFlight = census[1] + census[2];
         if (remainingBlocks == 0 && groundItems == 0 && census[0] == 0) {
@@ -1033,7 +642,7 @@ final class SlaveEngine {
                 mod.checkpoints.clear();
                 mod.checkpoints.add(new Pair(depositChest.getRight(), new Pair("depositBuilding", depositChest.getLeft())));
                 mod.checkpoints.add(new Pair(depositChest.getRight(), new Pair("batchExit", null)));
-                prependNorthCorridor(depositChest.getRight().x);
+                routes.prependNorthCorridor(depositChest.getRight().x);
                 mod.state = State.Mining;
                 mod.info("§6[SWEEP-VERIFY]§7 batch " + mod.currentBatch + ": inventory full with "
                     + (groundItems + inFlight) + " drops pending - depositing, then re-verifying.");
@@ -1078,290 +687,10 @@ final class SlaveEngine {
         SlaveSystem.sendMessageToMaster("step:done:" + doneBatch);
     }
 
-    void stepAbort() {
-        mod.info("§cRESET: full-area clear starting.");
-        // Force-clear ALL active mod.state — any phase the slave was in is now dead
-        mod.checkpoints.clear();
-        printRepairPending = false;
-        mod.restock.mod.restock.depositBacklogSlots.clear();
-        mod.restock.restockBacklogSlots.clear();
-        mod.restock.mod.restock.restockList.clear();
-        batchPassRetries = 0;
-        mod.currentBuildPlan = null;
-        mod.breakStage = 0;
-        mod.nextBlockPos = null;
-        mod.engine.mod.engine.vanillaBreakRetries.clear();
-        jamWatchTarget = null;
-        jamWatchTicks = 0;
-        resetStallSig = null;
-        resetStallRounds = 0;
-        sweepWaitRounds = 0;
-        sweepWaitLogged = false;
-        sweepReArmSig = null;
-        mod.restock.toBeHandledInvPacket = null;
-        mod.restock.closeNextInvPacket = false;
 
-        mod.fullSweepActive = false;
-        mod.timeoutTicks = 0;
-        mod.restock.interactTimeout = 0;
-        Utils.setForwardPressed(false);
-        Utils.setSneakPressed(false);
 
-        // Full-area sweep: the slave walks to vantage points where its render distance
-        // covers the 128x128 print box and breaks every non-air block (spatial awareness,
-        // nearest-first). Vantage points: north center (covers the north half) → map
-        // center (covers everything). Entry always from the north side.
-        // Checkpoint-batch ladder SCOPED to what was actually printed: the batch being
-        // built (or the last one) plus one safety column west for its borrow leftovers.
-        // One batch window = exactly one 4-lane ladder column. The two-vantage verify
-        // after the ladder still covers the whole box as the backstop for older strays.
-        // PROGRESS-DRIVEN SCOPE (user rule, 2026-10-20): only the PRINTED batches are
-        // cleared - the ladder AND the verify walk stay inside them (+1 safety col
-        // east for borrow/drop bounce). Sources: the live in-memory batch (a running
-        // flow) and the shared progress file (a crashed/restarted run - batches 0..k
-        // printed = ladder cols 0..k). No whole-map walks or scans.
-        int progressBatch = mod.master.loadStepProgress();   // shared _configs file; -1-safe on the slave
-        int liveBatch = mod.currentBatch >= 0 ? mod.currentBatch : 0;
-        int scopeCol = Math.min(31, Math.max(liveBatch, Math.max(0, progressBatch)) + 1);
-        resetLadderEndCol = scopeCol;
-        resetLadderCol = 0;   // batches print west->east: everything up to the scope col
-        mod.resetPendingScope = scopeCol;
-        mod.saveResetPending(scopeCol);   // survive disable/crash: re-enable resumes the reset
-        mod.info("§7RESET scoped to cols 0-" + scopeCol + " (live batch " + liveBatch
-            + ", progress batch " + progressBatch + ") - no whole-map pass.");
-        // Start from the segment closest to the bot's current position (not always 0):
-        // the bot might be at the south end after a print pass — walking to segment 0
-        // (north) wastes transit time. Snake direction adapts per column anyway.
-        int botRelZ = mc.player != null ? mc.player.getBlockZ() - mod.lowerMapCorner.getZ() : 0;
-        resetLadderSeg = botRelZ > 64 ? 4 : (botRelZ > 26 ? 2 : 0);   // nearest of {0, 2, 4}
-        queueResetLadder(resetLadderCol, 0);
 
-        // Route via the north corridor (never cross the map area diagonally)
-        double corridorZ = mod.lowerMapCorner.getZ() - 2;
-        if (Math.abs(mc.player.getZ() - corridorZ) > 1.5) {
-            mod.checkpoints.add(0, new Pair(new Vec3d(mc.player.getX(), mod.lowerMapCorner.getY(), corridorZ), new Pair("sprint", null)));
-        }
 
-        mod.state = State.Mining;   // Mining walks AND breaks: the serpentine pass clears as it goes
-        mod.breakStage = 4;
-        mod.fullSweepActive = true;
-        sweepBudget = 600;
-        mod.info("§7RESET ladder (scoped to cols " + resetLadderCol + "-" + resetLadderEndCol
-            + "): serpentine passes, each segment confirmed fully clean before the next.");
-    }
-
-    void queueResetLadder(int fromCol, int fromSeg) {
-        mod.state = State.Mining;   // the ladder IS breaking — always Mining
-        mod.breakStage = 4;
-        for (int col = fromCol; col <= resetLadderEndCol; col++) {
-            for (int i = 0; i < RESET_SEG_START.length; i++) {
-                int seg = (col % 2 == 0) ? i : RESET_SEG_START.length - 1 - i;
-                if (col == fromCol && ((col % 2 == 0 && seg < fromSeg) || (col % 2 == 1 && seg > fromSeg))) continue;
-                // Each pass walks from one segment boundary to the other — the entry
-                // point is whichever end the bot is closer to (handled by the snake
-                // direction per column). The serpentine feed breaks blocks along the way.
-                // One PASS per segment: the exit end of the serpentine walk on the
-                // centre lane. The pass itself clears everything in range continuously;
-                // the arrival handler confirms + cleans up stragglers only.
-                boolean southward = (col % 2 == 0);
-                double sx = mod.lowerMapCorner.getX() + 4.0 * col + 2.0;
-                double sz = mod.lowerMapCorner.getZ() + (southward ? RESET_SEG_END[seg] : RESET_SEG_START[seg]) + 0.5;
-                BlockPos anchor = new BlockPos(mod.lowerMapCorner.getX() + 4 * col, mod.lowerMapCorner.getY(),
-                    mod.lowerMapCorner.getZ() + RESET_SEG_CENTER_Z[seg]);
-                mod.checkpoints.add(new Pair(new Vec3d(sx, mod.lowerMapCorner.getY(), sz), new Pair("resetPass", anchor)));
-            }
-        }
-        // Reset finish: deposit + park at the north staging point
-        queueVerifyWalk();
-    }
-
-    void queueVerifyWalk() {
-        // The finish block is APPENDED with its own corridor legs INSIDE it (live-
-        // caught 2026-10-20: a prepend here ran at LADDER-BUILD time - its legs led
-        // the whole queue and were consumed at the reset START, so when the ladder
-        // finished at the SOUTH end the bare deposit checkpoint was next and the bot
-        // beelined diagonally to the north chest, queue=2 in the log).
-        Pair<BlockPos, Vec3d> doneChest = mod.restock.mod.restock.getBestDepositChest();
-        double corridorZ = mod.lowerMapCorner.getZ() - 2;
-        double y = mod.lowerMapCorner.getY();
-        if (doneChest != null) {
-            double lastLadderX = mod.checkpoints.isEmpty() ? mod.lowerMapCorner.getX() + 2.5 : mod.checkpoints.getLast().getLeft().x;
-            mod.checkpoints.add(new Pair(new Vec3d(lastLadderX, y, corridorZ), new Pair("sprint", null)));       // exit north on the final column
-            mod.checkpoints.add(new Pair(new Vec3d(doneChest.getRight().x, y, corridorZ), new Pair("sprint", null)));   // corridor to the chest
-            mod.checkpoints.add(new Pair(doneChest.getRight(), new Pair("depositBuilding", doneChest.getLeft())));
-        }
-        Vec3d park = new Vec3d(mod.lowerMapCorner.getX() + 2.5, y, corridorZ);
-        mod.checkpoints.add(new Pair(park, new Pair("fullSweepDone", null)));
-    }
-
-    int resetZToSeg(int relZ) {
-        for (int seg = RESET_SEG_START.length - 1; seg >= 0; seg--) if (relZ >= RESET_SEG_START[seg]) return seg;
-        return 0;
-    }
-
-    void queueStepBuildPreparation(double stagingX) {
-        mod.restock.mod.restock.refillFromCurrentPlan();
-        boolean materialRestockQueued = !mod.restock.mod.restock.restockList.isEmpty();
-
-        // UNNEEDED-MATERIAL DUMP (user rule, 2026-10-20), inlined body-only (hotswap-
-        // safe): deposit carried building materials that NO remaining batch (or the
-        // closing) will ever place - leftovers from finished batches otherwise squat on
-        // slots for the rest of the run. Pre-fills mod.restock.mod.restock.depositBacklogSlots (the deposit
-        // handler treats a pre-filled backlog at chest-open as a filtered dump) and
-        // rides the SAME north-corridor trip, before the first refill checkpoint.
-        if (mod.lowerMapCorner != null && mod.stepLayers != null && mod.currentBatch >= 0) {
-            // QUANTITATIVE future need: per-item block counts over all remaining
-            // batches + closing (nothing stands yet for future batches, so full plan
-            // counts). Excess beyond that need is dead weight fragmenting slots - the
-            // live batch-1 stall: inventory full of prior-run drops, every item
-            // "needed" by SOME future batch, zero free slots at the chest withdrawal.
-            HashMap<Item, Integer> futureNeed = new HashMap<>();
-            for (int fb = mod.currentBatch; fb <= 62; fb++) {
-                for (Block fbBlock : mod.assembleBatch(fb).values()) {
-                    Item fbItem = fbBlock.asItem();
-                    futureNeed.put(fbItem, futureNeed.getOrDefault(fbItem, 0) + 1);
-                }
-            }
-            for (Block cb : mod.assembleClosing().values()) {
-                Item cbItem = cb.asItem();
-                futureNeed.put(cbItem, futureNeed.getOrDefault(cbItem, 0) + 1);
-            }
-            HashMap<Item, Integer> carried = new HashMap<>();
-            HashMap<Item, ArrayList<Integer>> itemSlots = new HashMap<>();
-            for (int dSlot = 0; dSlot < 36; dSlot++) {
-                ItemStack dStack = mc.player.getInventory().getStack(dSlot);
-                if (dStack.isEmpty() || ToolUtils.isTool(dStack) || dStack.contains(DataComponentTypes.FOOD)) continue;
-                if (!mod.materialDict.containsKey(dStack.getItem())) continue;
-                Item dItem = dStack.getItem();
-                carried.put(dItem, carried.getOrDefault(dItem, 0) + dStack.getCount());
-                ArrayList<Integer> listForItem = itemSlots.get(dItem);
-                if (listForItem == null) { listForItem = new ArrayList<>(); itemSlots.put(dItem, listForItem); }
-                listForItem.add(dSlot);
-            }
-            HashSet<Item> unneededItems = null;
-            ArrayList<Integer> dumpSlots = new ArrayList<>();
-            for (Map.Entry<Item, ArrayList<Integer>> ent : itemSlots.entrySet()) {
-                int need = futureNeed.getOrDefault(ent.getKey(), 0);
-                int have = carried.getOrDefault(ent.getKey(), 0);
-                if (have <= need) continue;   // fully used later - keep every stack
-                int toDump = have - need;     // deposit the excess, newest slots first
-                ArrayList<Integer> slotsOfItem = ent.getValue();
-                for (int si = slotsOfItem.size() - 1; si >= 0 && toDump > 0; si--) {
-                    int dSlot = slotsOfItem.get(si);
-                    dumpSlots.add(dSlot);
-                    toDump -= mc.player.getInventory().getStack(dSlot).getCount();
-                    if (unneededItems == null) unneededItems = new HashSet<>();
-                    if (!unneededItems.contains(ent.getKey())) { unneededItems.add(ent.getKey()); }
-                }
-            }
-            if (unneededItems != null) {
-                Pair<BlockPos, Vec3d> dumpChest = mod.restock.mod.restock.getBestDepositChest();
-                if (dumpChest != null) {
-                    mod.restock.mod.restock.depositBacklogSlots.clear();
-                    mod.restock.mod.restock.depositBacklogSlots.addAll(dumpSlots);
-                    StringBuilder dumpNames = new StringBuilder();
-                    for (Item dn : unneededItems) { if (dumpNames.length() > 0) dumpNames.append(", "); dumpNames.append(dn.getName().getString()); }
-                    mod.info("§7Prep dump: depositing materials no future batch uses (" + dumpNames + ").");
-                    int insertAt = 0;
-                    for (int ci = 0; ci < mod.checkpoints.size(); ci++) {
-                        String ca = mod.checkpoints.get(ci).getRight().getLeft();
-                        if ("refill".equals(ca) || "mod.foodChest".equals(ca)) { insertAt = ci; break; }
-                    }
-                    mod.checkpoints.add(insertAt, new Pair(new Vec3d(dumpChest.getRight().x, dumpChest.getRight().y, dumpChest.getRight().z), new Pair("depositUnneeded", dumpChest.getLeft())));
-                }
-            }
-        }
-        // PICKAXE (user rule, 2026-10-20): tools are exchanged ONLY here - at the
-        // pre-batch restock trip, when the best pickaxe has gone BELOW min-durability
-        // (strictly below, not at the touch). Never mid-run: a worn pickaxe keeps
-        // swinging until it breaks; the only mid-run trip left is fetching a
-        // replacement after a pickaxe is genuinely gone.
-        int pickSlot = mod.restock.mod.restock.findPickaxeSlot();
-        int pickRemaining = pickSlot >= 0 ? ToolUtils.getRemainingDamage(mc.player.getInventory().getStack(pickSlot)) : 0;
-        if (pickSlot < 0 || pickRemaining < mod.minDurability.get()) {
-            Item pickaxe = mod.restock.mod.restock.findRegisteredPickaxeItem();
-            if (pickaxe != null) {
-                mod.info("§7Pickaxe " + (pickSlot < 0 ? "missing" : "at " + pickRemaining + " durability")
-                    + " - exchanging at the batch-prep trip (min-durability " + mod.minDurability.get() + ").");
-                mod.restock.mod.restock.restockList.add(Triple.of(pickaxe, 1, 1));
-                // If materials already have a chest at the head, endRestocking() will promote
-                // this entry after them.  With no material restock, add its first chest now.
-                if (!materialRestockQueued) mod.restock.mod.restock.addClosestRestockCheckpoint();
-            }
-        } else if (mod.restock.mod.restock.countPickaxes() > 1) {
-            // ONE-PICKAXE INVARIANT (user rule 2026-10-20: exactly one pickaxe in the
-            // inventory): the best pickaxe survives the batch, but stale spares would ride
-            // along forever - queue a deposit-only pickaxe-chest visit (0 stacks = take
-            // nothing, park the spares at the chest).
-            Item pickaxe = mod.restock.mod.restock.findRegisteredPickaxeItem();
-            if (pickaxe != null) {
-                mod.info("§7" + (mod.restock.mod.restock.countPickaxes() - 1) + " spare pickaxe(s) carried - depositing them at the batch-prep trip.");
-                mod.restock.mod.restock.restockList.add(Triple.of(pickaxe, 0, 0));
-                if (!materialRestockQueued) mod.restock.mod.restock.addClosestRestockCheckpoint();
-            }
-        }
-        // BEST-TOOL PREP — AXE with the PICKAXE'S predictive rule (user rule, live
-        // 2026-10-21: "same stock restock as pickaxe - never exchange or withdraw
-        // until min-durability is reached"): only when the batch has axe-class blocks
-        // AND the best carried axe is missing or BELOW min-durability. A worn-but-present
-        // axe above threshold is KEPT (no withdrawal); below threshold it is exchanged.
-        if (mod.currentBuildPlan != null) {
-            boolean needsWoodTool = false;
-            for (Block b : mod.currentBuildPlan.values()) {
-                if (b.getDefaultState().isIn(BlockTags.AXE_MINEABLE)) { needsWoodTool = true; break; }
-            }
-            if (needsWoodTool) {
-                // ONE scan pass: best remaining durability + carried count (the one-axe
-                // invariant's evidence)
-                int bestAxeRemaining = -1;
-                int axeCarried = 0;
-                for (int aSlot = 0; aSlot < 36; aSlot++) {
-                    ItemStack aStack = mc.player.getInventory().getStack(aSlot);
-                    if (aStack.isEmpty() || !aStack.isIn(ItemTags.AXES)) continue;
-                    axeCarried++;
-                    bestAxeRemaining = Math.max(bestAxeRemaining, ToolUtils.getRemainingDamage(aStack));
-                }
-                if (bestAxeRemaining < mod.minDurability.get() && axeCarried == 0) {
-                    ItemStack axe = null;
-                    float axeSpeed = -1;
-                    for (ItemStack tool : mod.toolSet) {
-                        if (!tool.isIn(ItemTags.AXES)) continue;
-                        float sp = tool.getMiningSpeedMultiplier(net.minecraft.block.Blocks.OAK_PLANKS.getDefaultState());
-                        if (sp > axeSpeed) { axeSpeed = sp; axe = tool; }
-                    }
-                    if (axe != null) {
-                        mod.info("§7Axe missing - fetching one at the batch-prep trip.");
-                        mod.restock.mod.restock.restockList.add(Triple.of(axe.getItem(), 1, 1));
-                    }
-                } else if (axeCarried > 1) {
-                    // ONE-AXE INVARIANT (mirrors the pickaxe's): the best axe survives;
-                    // spares ride forever otherwise. Deposit-only visit (0 stacks = take
-                    // nothing) parks the spares at the chest. NEVER withdraws a new axe
-                    // while any axe above min-durability is carried.
-                    Item spareAxe = null;
-                    float spareSpeed = -1;
-                    for (ItemStack tool : mod.toolSet) {
-                        if (!tool.isIn(ItemTags.AXES)) continue;
-                        float sp = tool.getMiningSpeedMultiplier(net.minecraft.block.Blocks.OAK_PLANKS.getDefaultState());
-                        if (sp > spareSpeed) { spareSpeed = sp; spareAxe = tool.getItem(); }
-                    }
-                    if (spareAxe != null && bestAxeRemaining >= mod.minDurability.get()) {
-                        mod.info("§7" + (axeCarried - 1) + " spare axe(s) carried (best at " + bestAxeRemaining
-                            + " durability, above min " + mod.minDurability.get() + ") - depositing spares, NO new axe fetched.");
-                        mod.restock.mod.restock.restockList.add(Triple.of(spareAxe, 0, 0));
-                        if (!materialRestockQueued) mod.restock.mod.restock.addClosestRestockCheckpoint();
-                    }
-                }
-            }
-        }
-        // FOOD (user rule): fetch ONLY when the OFFHAND stack is below 10 pieces, and
-        // take only what fits in the offhand (never a second full stack on top of one).
-        if (mod.foodChest != null && mod.restock.mod.restock.offhandFoodCount() < 10) {
-            mod.checkpoints.add(new Pair(mod.foodChest.getRight(), new Pair("mod.foodChest", mod.foodChest.getLeft())));
-        }
-        double northZ = mod.lowerMapCorner.getZ() - 2;
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), northZ), new Pair("swapOffhand", null)));
-    }
 
     void processPendingStepCommands() {
         String command;
@@ -1378,7 +707,7 @@ final class SlaveEngine {
                     removePendingStepCommand();
                 } else if (mod.state == State.StandBy || mod.currentBuildPlan == null) {
                     removePendingStepCommand();
-                    beginPriming();
+                    routes.beginPriming();
                 }
             }
             case "buildhalf" -> {
@@ -1405,7 +734,7 @@ final class SlaveEngine {
                 mod.currentBatch = batch;
                 batchPassRetries = 0;
                 mod.engine.placementAttempts.clear();
-                collectSkips.clear();
+                mod.slave.scan.collectSkips.clear();
                 mod.clearResetPending();
                 sweepReArmSig = null;
                 sweepWaitRounds = 0;
@@ -1425,13 +754,13 @@ final class SlaveEngine {
                     // which the master needs to start W2. The breakall handler's batch-0
                     // split path then picks the slave up from AwaitBreakPermission2.
                     mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), farZ), new Pair("awaitBreak2", null)));
-                    prependLaneCentering(walkX);
+                    routes.prependLaneCentering(walkX);
                     mod.state = State.Walking;
                     Utils.setForwardPressed(false);
                     mod.info("§aBatch 0 split TOPS: §b" + half.size() + "§7 blocks (direct pass, no resupply).");
                 } else {
                     // FLOOR half: normal batch start (supply + full print route)
-                    beginBatch(batch);
+                    routes.beginBatch(batch);
                     mod.currentBuildPlan = half;
                     mod.info("§aBatch 0 split FLOOR: §b" + half.size() + "§7 blocks.");
                 }
@@ -1454,14 +783,14 @@ final class SlaveEngine {
                     // command while the master waited for a ready:k that never re-fired.
                     removePendingStepCommand();
                     mod.checkpoints.clear();
-                    resumeBatchRoute(0);
-                    insertNorthReEntry(0);
-                    prependNorthCorridor(currentWalkLaneX());
+                    routes.resumeBatchRoute(0);
+                    routes.insertNorthReEntry(0);
+                    routes.prependNorthCorridor(routes.currentWalkLaneX());
                     mod.state = State.Walking;
                     mod.info("§eBatch " + batch + " re-armed by repeated build command (master resync).");
                 } else if (mod.state == State.StandBy || mod.currentBuildPlan == null) {
                     removePendingStepCommand();
-                    beginBatch(batch);
+                    routes.beginBatch(batch);
                 } else if (mod.currentBatch != batch) {
                     removePendingStepCommand();
                     mod.info("§7Stale build:" + batch + " dropped (working batch " + mod.currentBatch + ").");
@@ -1479,9 +808,9 @@ final class SlaveEngine {
                     mod.restock.mod.restock.ensurePickaxeSlot8();
                     mod.breakStage = 2;
                     mod.state = State.Mining;
-                    resumeBatchRoute(2);
-                    insertNorthReEntry(0);
-                    prependNorthCorridor(currentWalkLaneX());
+                    routes.resumeBatchRoute(2);
+                    routes.insertNorthReEntry(0);
+                    routes.prependNorthCorridor(routes.currentWalkLaneX());
                     mod.info("§eBatch " + mod.currentBatch + " break(2) armed by command (master resync).");
                 }
             }
@@ -1492,7 +821,7 @@ final class SlaveEngine {
                     removePendingStepCommand();
                     mod.breakAllPermitted = true;
                     mod.checkpoints.clear();
-                    mod.slave.startBreakAll();
+                    mod.slave.routes.startBreakAll();
                     return;
                 }
                 if (mod.state == State.AwaitBreakPermissionAll) {
@@ -1502,25 +831,25 @@ final class SlaveEngine {
                     // MASTER-CRASH RESYNC: break-all is un-numbered - arm directly.
                     removePendingStepCommand();
                     mod.checkpoints.clear();
-                    mod.slave.startBreakAll();
+                    mod.slave.routes.startBreakAll();
                     mod.info("§eBatch " + mod.currentBatch + " break-all armed by command (master resync).");
                 }
             }
             case "close" -> {
                 if (mod.state == State.StandBy || mod.currentBuildPlan == null) {
                     removePendingStepCommand();
-                    beginClosing();
+                    routes.beginClosing();
                 }
             }
             case "closebreak" -> {
                 if (mod.state == State.AwaitClosingBreak) {
                     removePendingStepCommand();
-                    startClosingBreak();
+                    routes.startClosingBreak();
                 }
             }
             case "abort" -> {
                 removePendingStepCommand();
-                stepAbort();
+                reset.stepAbort();
             }
             default -> removePendingStepCommand();
         }
@@ -1540,170 +869,15 @@ final class SlaveEngine {
         }
     }
 
-    void resumeBatchRoute(int stage) {
-        double northZ = mod.lowerMapCorner.getZ() - 2;
-        double southZ = mod.lowerMapCorner.getZ() + 128.7;
-        if (mod.currentBatch == 63) {
-            if (stage == 4) {
-                double sweepX = mod.lowerMapCorner.getX() + 253.5;
-                mod.checkpoints.add(new Pair(new Vec3d(sweepX, mod.lowerMapCorner.getY(), northZ), new Pair("breakAllBegin", null)));
-                mod.checkpoints.add(new Pair(new Vec3d(sweepX, mod.lowerMapCorner.getY(), southZ), new Pair("breakAllDone", null)));
-                mod.checkpoints.add(new Pair(new Vec3d(sweepX, mod.lowerMapCorner.getY(), northZ), new Pair("stepClosingDone", null)));
-            } else {
-                double stagingX = mod.lowerMapCorner.getX() + 127.5;
-                mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), northZ), new Pair("batchBegin", null)));
-                mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), southZ), new Pair("stepClosingReady", null)));
-                mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), northZ), new Pair("stepClosingWait", null)));
-            }
-            return;
-        }
-        // FIXED CYCLE on resume too: the same directions as a fresh batch, so an
-        // emergency interrupt can never flip the parity into dead NS walks.
-        double walkX = mod.lowerMapCorner.getX() + 2.0 * mod.currentBatch + 2.5;
-        switch (stage) {
-            case 0 -> {
-                mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), southZ), new Pair("printDone", null)));
-                mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), southZ), new Pair("awaitBreak2", null)));
-                mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), northZ), new Pair("break2Done", null)));
-                mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), northZ), new Pair("awaitBreakAll", null)));
-            }
-            case 2 -> {
-                mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), northZ), new Pair("break2Done", null)));
-                mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), northZ), new Pair("awaitBreakAll", null)));
-            }
-            default -> {
-                // break-all: N->S (forced); the batchExit queued here is stale by
-                // design - the collection run replaces it with an in-place exit.
-                mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), northZ), new Pair("breakAllBegin", null)));
-                mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), southZ), new Pair("breakAllDone", null)));
-                mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), southZ), new Pair("batchExit", null)));
-            }
-        }
-    }
 
-    void pauseForRestockTrip(boolean needPickaxe) {
-        // Cooldown: prevent the supply-run trigger from re-firing every tick while the
-        // bot is still Walking toward the chest (mod.engine.tryPlacingBlock sees no materials →
-        // calls this again → clears the route → loops forever without moving)
-        if (restockCooldown > 0) return;
-        restockCooldown = 100;   // 5 seconds before another supply run can trigger
 
-        mod.info("§eMid-batch supply run via the north checkpoint.");
-        int savedStage = mod.breakStage;
-        mod.breakStage = 0;
-        mod.checkpoints.clear();
 
-        if (savedStage == 0) {
-            mod.restock.mod.restock.refillFromCurrentPlan();
-        }
-        if (needPickaxe && !mod.restock.mod.restock.hasAnyPickaxe() && !mod.toolSet.isEmpty()) {
-            for (ItemStack tool : mod.toolSet) {
-                if (tool.isIn(ItemTags.PICKAXES)) {
-                    mod.restock.mod.restock.restockList.add(Triple.of(tool.getItem(), 1, 1));
-                    // Without a chest at the head of the queue the trip never visits one:
-                    // the emergency "restock" walked the corridor, resumed breaking with
-                    // the same worn pickaxe and re-triggered every cooldown (observed loop)
-                    if (mod.restock.mod.restock.restockList.size() == 1) mod.restock.mod.restock.addClosestRestockCheckpoint();
-                    break;
-                }
-            }
-        }
-        if (mod.fullSweepActive) {
-            // RESET interrupted by the emergency: resume the LADDER at the current
-            // station - never a batch route
-            mod.checkpoints.clear();
-            if (resetLadderCol < 32) {
-                queueResetLadder(resetLadderCol, resetLadderSeg);
-            } else {
-                queueVerifyWalk();
-            }
-        } else {
-            int chestSectionSize = mod.checkpoints.size();   // chest trip queued above
-            resumeBatchRoute(savedStage);                // route appended at the tail
-            // Re-entry BETWEEN chest and route: corridor back to the batch lane's
-            // north staging, then south along the lane (head-insertion landed it
-            // BEFORE the chest visit and the return leg stayed a diagonal beeline -
-            // live 2026-10-20 mid-print emergency restock).
-            insertNorthReEntry(chestSectionSize);
-        }
-        // Exit north via the corridor (head legs)
-        prependNorthCorridor(mod.checkpoints.isEmpty() ? mod.lowerMapCorner.getX() + 2.5 : mod.checkpoints.getFirst().getLeft().x);
-        mod.state = State.Walking;
-        Utils.setForwardPressed(false);
-    }
 
-    void pauseBreakAllForDeposit() {
-        mod.info("§eInventory full - depositing building blocks before continuing the break.");
-        mod.breakStage = 0;
-        mod.checkpoints.clear();
-        // Explicit order: chest visit -> north re-entry on the batch lane -> resumed
-        // route; exit legs prepended last (north on the lane, then the corridor).
-        Pair<BlockPos, Vec3d> chest = mod.restock.mod.restock.getBestDepositChest();
-        if (chest != null) {
-            mod.checkpoints.add(new Pair(chest.getRight(), new Pair("depositBuilding", chest.getLeft())));
-        }
-        insertNorthReEntry(mod.checkpoints.size());
-        resumeBatchRoute(4);
-        prependNorthCorridor(chest != null ? chest.getRight().x : currentWalkLaneX());
-        mod.state = State.Walking;
-    }
 
-    void insertNorthReEntry(int index) {
-        mod.checkpoints.add(Math.max(0, Math.min(index, mod.checkpoints.size())), new Pair(
-            new Vec3d(currentWalkLaneX(), mod.lowerMapCorner.getY(), mod.lowerMapCorner.getZ() - 2), new Pair("sprint", null)));
-    }
 
-    void prependNorthCorridor(double targetX) {
-        double corridorZ = mod.lowerMapCorner.getZ() - 2;
-        // When a lane-centering leg was just queued, the exit must run north on the
-        // lane-2 centerline (its x) - not from the bot's current off-lane x
-        double exitX = mc.player.getX();
-        if (!mod.checkpoints.isEmpty() && "centerLane".equals(mod.checkpoints.getFirst().getRight().getLeft())) {
-            exitX = mod.checkpoints.getFirst().getLeft().x;
-        }
-        mod.checkpoints.addFirst(new Pair(new Vec3d(targetX, mod.lowerMapCorner.getY(), corridorZ), new Pair("sprint", null)));
-        if (Math.abs(mc.player.getZ() - corridorZ) > 1.5) {
-            mod.checkpoints.addFirst(new Pair(new Vec3d(exitX, mod.lowerMapCorner.getY(), corridorZ), new Pair("sprint", null)));
-        }
-    }
-
-    void prependLaneCentering(double laneX) {
-        if (Math.abs(mc.player.getX() - laneX) > 0.3) {
-            mod.checkpoints.addFirst(new Pair(new Vec3d(laneX, mod.lowerMapCorner.getY(), mc.player.getZ()), new Pair("centerLane", null)));
-        }
-    }
-
-    double currentWalkLaneX() {
-        if (mod.currentBatch == -1) return mod.lowerMapCorner.getX() + 2.5;
-        if (mod.currentBatch == 63) return mod.lowerMapCorner.getX() + 127.5;
-        return mod.lowerMapCorner.getX() + 2.0 * mod.currentBatch + 2.5;
-    }
-    void startBreakAll() {
-        mod.breakStage = 4;
-        mod.checkpoints.clear();
-        double walkX = mod.lowerMapCorner.getX() + 2.0 * mod.currentBatch + 2.5;
-        // ALWAYS north -> south: the pass must END at the south end so the single
-        // south-to-north collection run starts exactly where the bot stands.
-        double startZ = mod.lowerMapCorner.getZ() - 2;
-        double farZ = mod.lowerMapCorner.getZ() + 128.7;
-
-        Pair<BlockPos, Vec3d> chest = mod.restock.mod.restock.getBestDepositChest();
-        mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), startZ), new Pair("breakAllBegin", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), farZ), new Pair("breakAllDone", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), farZ), new Pair("batchExit", null)));
-        if (chest != null) {
-            mod.checkpoints.addFirst(new Pair(chest.getRight(), new Pair("depositBuilding", chest.getLeft())));
-            prependNorthCorridor(chest.getRight().x);
-        } else {
-            prependNorthCorridor(walkX);
-        }
-        mod.state = State.Walking;
-        Utils.setForwardPressed(false);
-        mod.info("§aBreak-all: depositing building blocks first, then recycling batch " + mod.currentBatch + ".");
-    }
 
     void verifyPrintPass() {
-        int[] defects = planDefects();
+        int[] defects = scan.planDefects();
         if (defects[0] == 0 && defects[1] == 0) {
             mod.info("§aBatch " + mod.currentBatch + " printed: §b" + mod.currentBuildPlan.size() + "§7 blocks placed (world-verified).");
             return;
@@ -1718,7 +892,7 @@ final class SlaveEngine {
             mod.state = State.StandBy;
             return false;
         }
-        int[] defects = planDefects();
+        int[] defects = scan.planDefects();
         if (defects[0] == 0 && defects[1] == 0) return true;
         mod.error(label + " placement incomplete: " + defects[0] + " missing, " + defects[1] + " wrong. Stopped.");
         mod.state = State.StandBy;
@@ -1727,7 +901,7 @@ final class SlaveEngine {
     }
 
     boolean verifyPrintPass2() {
-        int[] defects = planDefects();
+        int[] defects = scan.planDefects();
         if (defects[0] == 0 && defects[1] == 0) {
             mod.info("§aBatch " + mod.currentBatch + " repair complete - plan fully placed.");
             return true;
@@ -1764,194 +938,22 @@ final class SlaveEngine {
         return false;
     }
 
-    int[] planDefects() {
-        int missing = 0;
-        int wrong = 0;
-        for (Map.Entry<BlockPos, Block> entry : mod.currentBuildPlan.entrySet()) {
-            BlockState worldState = mod.miningBlockState(entry.getKey());
-            if (worldState.isAir()) missing++;
-            else if (!worldState.getBlock().equals(entry.getValue())) wrong++;
-        }
-        return new int[]{missing, wrong};
-    }
 
-    int batchWindowWestX() {
-        return mod.lowerMapCorner.getX() + 2 * Math.max(mod.currentBatch, 0);
-    }
 
-    int[] itemCensusInBatchWindow() {
-        int westX = batchWindowWestX();
-        return itemCensusInArea(westX - 4, westX + 6, mod.lowerMapCorner.getZ() - 3, mod.lowerMapCorner.getZ() + 129);
-    }
 
-    int[] itemCensusInArea(int x0, int x1, int z0, int z1) {
-        int[] census = new int[4];   // {ready, falling, pickupDelay, owned}
-        if (mc.world == null) return census;
-        for (Entity entity : mc.world.getEntities()) {
-            if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (itemEntity.getX() < x0 || itemEntity.getX() > x1 + 1) continue;
-            if (itemEntity.getZ() < z0 || itemEntity.getZ() > z1 + 1) continue;
-            if (itemEntity.getY() < mod.lowerMapCorner.getY() - 3 || itemEntity.getY() > mod.lowerMapCorner.getY() + 5) continue;
-            if (itemEntity.getOwner() != null) census[3]++;
-            else if (!itemEntity.groundCollision) census[1]++;
-            else if (itemEntity.cannotPickup()) census[2]++;
-            else census[0]++;
-        }
-        return census;
-    }
 
-    int countPendingInRange(int x0, int x1, int z0, int z1) {
-        int n = 0;
-        for (BlockPos pos : mod.engine.mod.engine.breakPending.keySet()) {
-            if (pos.getX() >= x0 && pos.getX() <= x1 && pos.getZ() >= z0 && pos.getZ() <= z1) n++;
-        }
-        return n;
-    }
 
-    int countVanillaInRange(int x0, int x1, int z0, int z1) {
-        int n = 0;
-        for (BlockPos pos : mod.engine.mod.engine.needsVanillaBreak) {
-            if (pos.getX() >= x0 && pos.getX() <= x1 && pos.getZ() >= z0 && pos.getZ() <= z1) n++;
-        }
-        return n;
-    }
 
-    int countBlocksInArea(int x0, int x1, int z0, int z1) {
-        if (mc.world == null || mod.lowerMapCorner == null) return -1;
-        int n = 0;
-        for (int x = x0; x <= x1; x++) {
-            for (int z = z0; z <= z1; z++) {
-                for (int y = mod.lowerMapCorner.getY(); y <= mod.lowerMapCorner.getY() + 3; y++) {
-                    if (!mod.miningBlockState(new BlockPos(x, y, z)).isAir()) n++;
-                }
-            }
-        }
-        return n;
-    }
 
-    BlockPos findNearestBlockInArea(int x0, int x1, int z0, int z1) {
-        if (mc.world == null || mc.player == null) return null;
-        BlockPos best = null;
-        double bestDist = Double.MAX_VALUE;
-        Vec3d eye = mc.player.getEyePos();
-        for (int x = x0; x <= x1; x++) {
-            for (int z = z0; z <= z1; z++) {
-                for (int y = mod.lowerMapCorner.getY(); y <= mod.lowerMapCorner.getY() + 3; y++) {
-                    BlockPos pos = new BlockPos(x, y, z);
-                    if (mod.miningBlockState(pos).isAir()) continue;
-                    double dist = eye.distanceTo(pos.toCenterPos());
-                    if (dist < bestDist) { bestDist = dist; best = pos; }
-                }
-            }
-        }
-        return best;
-    }
 
-    ItemEntity findNearestItemInArea(int x0, int x1, int z0, int z1) {
-        if (mc.world == null || mc.player == null) return null;
-        ItemEntity nearest = null;
-        double nearestDist = Double.MAX_VALUE;
-        for (Entity entity : mc.world.getEntities()) {
-            if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!isPickupable(itemEntity)) continue;
-            if (itemEntity.getX() < x0 || itemEntity.getX() > x1 + 1) continue;
-            if (itemEntity.getZ() < z0 || itemEntity.getZ() > z1 + 1) continue;
-            if (itemEntity.getY() < mod.lowerMapCorner.getY() - 3 || itemEntity.getY() > mod.lowerMapCorner.getY() + 5) continue;
-            double dist = mc.player.getEyePos().distanceTo(itemEntity.getEntityPos());
-            if (dist < nearestDist) { nearestDist = dist; nearest = itemEntity; }
-        }
-        return nearest;
-    }
 
-    boolean isPickupable(ItemEntity itemEntity) {
-        return itemEntity.groundCollision && !itemEntity.cannotPickup() && itemEntity.getOwner() == null;
-    }
 
-    BlockPos findNearestPrintBoxBlock() {
-        return findNearestPrintBoxBlock(Collections.emptySet());
-    }
 
-    ItemEntity nearestCollectTarget() {
-        if (mc.world == null || mc.player == null) return null;
-        int westX = batchWindowWestX();
-        ItemEntity best = null, bestAny = null;
-        double bestDist = Double.MAX_VALUE, bestAnyDist = Double.MAX_VALUE;
-        for (Entity entity : mc.world.getEntities()) {
-            if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!isPickupable(itemEntity)) continue;
-            if (itemEntity.getX() < westX - 4 || itemEntity.getX() > westX + 7) continue;
-            if (itemEntity.getZ() < mod.lowerMapCorner.getZ() - 3 || itemEntity.getZ() > mod.lowerMapCorner.getZ() + 129) continue;
-            if (itemEntity.getY() < mod.lowerMapCorner.getY() - 3 || itemEntity.getY() > mod.lowerMapCorner.getY() + 5) continue;
-            BlockPos key = BlockPos.ofFloored(itemEntity.getX(), itemEntity.getY(), itemEntity.getZ());
-            if (collectSkips.getOrDefault(key, 0) >= 10) continue;   // blacklisted this batch
-            double dist = mc.player.getEyePos().distanceTo(itemEntity.getEntityPos());
-            if (dist < bestAnyDist) { bestAnyDist = dist; bestAny = itemEntity; }
-            if (itemEntity.getZ() >= mc.player.getZ() - 1.5 && dist < bestDist) { bestDist = dist; best = itemEntity; }
-        }
-        if (best != null) {
-            BlockPos key = BlockPos.ofFloored(best.getX(), best.getY(), best.getZ());
-            collectSkips.merge(key, 1, Integer::sum);
-        }
-        return best != null ? best : bestAny;
-    }
 
-    BlockPos nearestRemainingPlanBlock() {
-        if (mod.currentBuildPlan == null || mc.player == null) return null;
-        BlockPos best = null;
-        double bestDist = Double.MAX_VALUE;
-        for (BlockPos pos : mod.currentBuildPlan.keySet()) {
-            if (mod.miningBlockState(pos).isAir()) continue;
-            double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
-            if (dist < bestDist) { bestDist = dist; best = pos; }
-        }
-        return best;
-    }
 
-    int countRemainingPlanBlocks() {
-        if (mod.currentBuildPlan == null) return 0;
-        int count = 0;
-        for (BlockPos pos : mod.currentBuildPlan.keySet()) {
-            if (!mod.miningBlockState(pos).isAir()) count++;
-        }
-        return count;
-    }
 
-    int countGroundItemsInWindow() {
-        if (mc.world == null || mc.player == null) return 0;
-        int westX = batchWindowWestX();
-        int count = 0;
-        for (Entity entity : mc.world.getEntities()) {
-            if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!isPickupable(itemEntity)) continue;
-            if (itemEntity.getX() < westX - 4 || itemEntity.getX() > westX + 7) continue;
-            if (itemEntity.getZ() < mod.lowerMapCorner.getZ() - 3 || itemEntity.getZ() > mod.lowerMapCorner.getZ() + 130) continue;
-            if (itemEntity.getY() < mod.lowerMapCorner.getY() - 2 || itemEntity.getY() > mod.lowerMapCorner.getY() + 5) continue;
-            count++;
-        }
-        return count;
-    }
 
-    ItemEntity findNearestGroundItem(int margin) {
-        if (mc.world == null || mc.player == null) return null;
-        ItemEntity nearest = null;
-        double nearestDist = Double.MAX_VALUE;
-        for (Entity entity : mc.world.getEntities()) {
-            if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!isPickupable(itemEntity)) continue;
-            if (itemEntity.getX() < mod.lowerMapCorner.getX() - margin || itemEntity.getX() > mod.lowerMapCorner.getX() + 128 + margin) continue;
-            if (itemEntity.getZ() < mod.lowerMapCorner.getZ() - margin || itemEntity.getZ() > mod.lowerMapCorner.getZ() + 128 + margin) continue;
-            if (itemEntity.getY() < mod.lowerMapCorner.getY() - 3 || itemEntity.getY() > mod.lowerMapCorner.getY() + 5) continue;
-            double dist = mc.player.getEyePos().distanceTo(itemEntity.getEntityPos());
-            if (dist < nearestDist) { nearestDist = dist; nearest = itemEntity; }
-        }
-        return nearest;
-    }
 
-    void targetGroundItem(ItemEntity item, String reEvalAction) {
-        mod.checkpoints.clear();
-        mod.checkpoints.add(new Pair(new Vec3d(item.getX(), item.getY(), item.getZ()), new Pair(reEvalAction, null)));
-        mod.state = State.Walking;
-    }
 
     void updateTransitSpeed() {
         if (mod.sprinting.get() != StepCheckered.SprintMode.Dynamic) {
@@ -2003,41 +1005,6 @@ final class SlaveEngine {
         return true;
     }
 
-    BlockPos findNearestPrintBoxBlock(Set<BlockPos> exclude) {
-        if (mc.world == null || mc.player == null || mod.lowerMapCorner == null) return null;
-        BlockPos best = null;
-        double bestDist = Double.MAX_VALUE;
-        Vec3d eye = mc.player.getEyePos();
-        int y0 = mod.lowerMapCorner.getY();
-        int y1 = mod.lowerMapCorner.getY() + 3;
-
-        // Scan in expanding rings from the player's position for efficiency
-        int centerZ = mc.player.getBlockZ();
-        int centerX = mc.player.getBlockX();
-        for (int radius = 0; radius <= 64; radius++) {
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;  // ring only
-                    int x = centerX + dx;
-                    int z = centerZ + dz;
-                    // Only check blocks inside the print box (+ the noobline column one
-                    // block north — it is printed and recycled with its batch, and a
-                    // leftover noobline block walls the north corridor entry)
-                    if (x < mod.lowerMapCorner.getX() || x >= mod.lowerMapCorner.getX() + 128) continue;
-                    if (z < mod.lowerMapCorner.getZ() - 1 || z >= mod.lowerMapCorner.getZ() + 128) continue;
-                    for (int y = y0; y <= y1; y++) {
-                        BlockPos pos = new BlockPos(x, y, z);
-                        if (!mod.miningBlockState(pos).isAir() && !exclude.contains(pos)) {
-                            double dist = eye.distanceTo(pos.toCenterPos());
-                            if (dist < bestDist) { bestDist = dist; best = pos; }
-                        }
-                    }
-                }
-            }
-            if (best != null) return best;   // nearest found in this ring
-        }
-        return best;   // null = nothing in range
-    }
 
     void tick(TickEvent.Pre event) {
         mod.master.serviceControlHold();
@@ -2074,7 +1041,7 @@ final class SlaveEngine {
         // Inventory truly out of space mid-break-all (partial-stack headroom included):
         // deposit the building blocks, then resume
         if (mod.breakStage == 4 && mod.state.equals(State.Mining) && mod.restock.freeInventoryCapacity() == 0) {
-            pauseBreakAllForDeposit();
+            routes.pauseBreakAllForDeposit();
             return;
         }
 
@@ -2099,7 +1066,7 @@ final class SlaveEngine {
 
         if (mod.restock.drainDepositBacklog()) return;
 
-        armResetFeedTarget();
+        reset.armResetFeedTarget();
 
         mod.engine.tickBreakConfirmations();
 
