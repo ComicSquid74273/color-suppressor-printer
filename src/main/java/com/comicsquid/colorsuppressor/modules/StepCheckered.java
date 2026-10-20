@@ -580,6 +580,7 @@ public class StepCheckered extends Module implements MapPrinter {
     BlockPos jamWatchTarget;                                        // feed-jam detector: armed target held out of range
     int jamWatchTicks;
     boolean breakSweepActedThisTick;                                // the Mining-state break loop already sent packets this tick
+    java.util.HashSet<Item> depositUnneededOnly;                    // when set, the deposit handler drops ONLY these items (prep-trip cleanup)
     String lastMasterCpLog;                                         // dedup for the always-on master checkpoint log
     int stepSavedProgressMapId = -1;                                // map id persisted with the progress file (crash/restart resume)
     long stepBatchStartMs, stepPhaseStartMs;                        // per-batch phase timing (logged at completion)
@@ -1384,10 +1385,12 @@ public class StepCheckered extends Module implements MapPrinter {
                 for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
                     ItemStack stack = packet.contents().get(slot);
                     if (stack.isEmpty() || ToolUtils.isTool(stack) || stack.contains(DataComponentTypes.FOOD)) continue;
+                    if (depositUnneededOnly != null && !depositUnneededOnly.contains(stack.getItem())) continue;
                     ArrayList<Pair<BlockPos, Vec3d>> stocking = materialDict.get(stack.getItem());
                     if (stocking == null || !containsChest(stocking, lastInteractedChest)) continue;
                     depositBacklogSlots.add(slot);
                 }
+                depositUnneededOnly = null;   // one-shot: normal (deposit-all-matching) resumes
                 if (depositBacklogSlots.isEmpty()) {
                     // Nothing belongs in THIS chest: hop to the next correct one or continue
                     Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
@@ -4484,6 +4487,11 @@ public class StepCheckered extends Module implements MapPrinter {
         refillBuildingInventory(invInfo.getRight());
         boolean materialRestockQueued = !restockList.isEmpty();
 
+        // UNNEEDED-MATERIAL DUMP (user rule, 2026-10-20): at the batch-prep trip,
+        // deposit carried building materials that NO remaining batch (or the closing)
+        // will ever place - leftovers from finished batches otherwise squat on slots
+        // for the rest of the run. The dump rides the SAME chest trip as the restock.
+        queueUnneededDeposit(stagingBatchIndex());
         // PICKAXE (user rule, 2026-10-20): tools are exchanged ONLY here - at the
         // pre-batch restock trip, when the best pickaxe has gone BELOW min-durability
         // (strictly below, not at the touch). Never mid-run: a worn pickaxe keeps
@@ -5790,6 +5798,48 @@ public class StepCheckered extends Module implements MapPrinter {
         ItemStack off = mc.player.getOffHandStack();
         if (off.isEmpty() || !off.contains(DataComponentTypes.FOOD)) return 0;
         return off.getCount();
+    }
+
+    /** The batch a queueStepBuildPreparation call is preparing for (currentBatch is
+     *  already set by beginBatch/beginPriming before prep runs). */
+    private int stagingBatchIndex() {
+        return Math.max(0, currentBatch);
+    }
+
+    /** One-shot prep-trip dump of carried materials no remaining batch will use.
+     *  Future set = union of assembleBatch(k..62) + closing items; anything carried
+     *  and registered that is NOT in it gets deposited at the nearest stocking chest
+     *  via the depositBuilding flow with a filter (depositUnneededOnly). */
+    private void queueUnneededDeposit(int fromBatch) {
+        if (lowerMapCorner == null || stepRecLayers == null || fromBatch < 0) return;
+        java.util.HashSet<Item> future = new java.util.HashSet<>();
+        for (int k = fromBatch; k <= 62; k++) {
+            for (Block b : assembleBatch(k).values()) future.add(b.asItem());
+        }
+        for (Block b : assembleClosing().values()) future.add(b.asItem());
+        java.util.HashSet<Item> unneeded = null;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (stack.isEmpty() || ToolUtils.isTool(stack) || stack.contains(DataComponentTypes.FOOD)) continue;
+            Item item = stack.getItem();
+            if (!materialDict.containsKey(item)) continue;      // only registered building materials
+            if (future.contains(item)) continue;
+            if (unneeded == null) unneeded = new java.util.HashSet<>();
+            unneeded.add(item);
+        }
+        if (unneeded == null) return;
+        Pair<BlockPos, Vec3d> chest = getBestDepositChest();
+        if (chest == null) return;
+        depositUnneededOnly = unneeded;
+        StringBuilder names = new StringBuilder();
+        for (Item i : unneeded) { if (names.length() > 0) names.append(", "); names.append(i.getName().getString()); }
+        info("§7Prep dump: depositing materials no future batch uses (" + names + ").");
+        // Insert BEFORE the first refill so the dump rides the same north-corridor trip
+        int at = 0;
+        for (int i = 0; i < checkpoints.size(); i++) {
+            if ("refill".equals(checkpoints.get(i).getRight().getLeft()) || "foodChest".equals(checkpoints.get(i).getRight().getLeft())) { at = i; break; }
+        }
+        checkpoints.add(at, new Pair(new Vec3d(chest.getRight().x, chest.getRight().y, chest.getRight().z), new Pair("depositBuilding", chest.getLeft())));
     }
 
     /** Any axe with usable durability currently in the inventory? */
