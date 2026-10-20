@@ -79,7 +79,7 @@ public class StepCheckered extends Module {
     // Legacy (parked) engine line width - fixed at 2, not a setting anymore
     private static final int linesPerRun = 2;
 
-    private final Setting<Double> interactionRange = sgGeneral.add(new DoubleSetting.Builder()
+    final Setting<Double> interactionRange = sgGeneral.add(new DoubleSetting.Builder()
         .name("interaction-range")
         .description("The maximum range you can place blocks around yourself.")
         .defaultValue(5)
@@ -88,7 +88,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Integer> blocksPerTick = sgGeneral.add(new IntSetting.Builder()
+    final Setting<Integer> blocksPerTick = sgGeneral.add(new IntSetting.Builder()
         .name("blocks-per-tick")
         .description("How many blocks to place per game tick (default 4, some servers allow more).")
         .defaultValue(4)
@@ -97,7 +97,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Integer> breaksPerTick = sgGeneral.add(new IntSetting.Builder()
+    final Setting<Integer> breaksPerTick = sgGeneral.add(new IntSetting.Builder()
         .name("breaks-per-tick")
         .description("How many blocks to break per game tick (default 4, some servers allow more).")
         .defaultValue(4)
@@ -106,7 +106,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<List<Block>> startBlocks = sgGeneral.add(new BlockListSetting.Builder()
+    final Setting<List<Block>> startBlocks = sgGeneral.add(new BlockListSetting.Builder()
         .name("start-blocks")
         .description("Which block to interact with to start the printing process.")
         .defaultValue(Blocks.STONE_BUTTON, Blocks.ACACIA_BUTTON, Blocks.BAMBOO_BUTTON, Blocks.BIRCH_BUTTON,
@@ -115,7 +115,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Block> fillerBlock = sgGeneral.add(new BlockSetting.Builder()
+    final Setting<Block> fillerBlock = sgGeneral.add(new BlockSetting.Builder()
         .name("filler-block")
         .description("The block to use as a filler.")
         .defaultValue(Blocks.RESIN_BLOCK)
@@ -123,14 +123,14 @@ public class StepCheckered extends Module {
     );
 
 
-    private final Setting<SprintMode> sprinting = sgGeneral.add(new EnumSetting.Builder<SprintMode>()
+    final Setting<SprintMode> sprinting = sgGeneral.add(new EnumSetting.Builder<SprintMode>()
         .name("sprint-mode")
         .description("How to sprint.")
         .defaultValue(SprintMode.Always)
         .build()
     );
 
-    private final Setting<Boolean> activationReset = sgGeneral.add(new BoolSetting.Builder()
+    final Setting<Boolean> activationReset = sgGeneral.add(new BoolSetting.Builder()
         .name("activation-reset")
         .description("Disable if the bot should continue after reconnecting to the server.")
         .defaultValue(true)
@@ -140,7 +140,7 @@ public class StepCheckered extends Module {
     // rotate-place setting removed: 6b6t anticheat is soft, allows placing/breaking
     // without rotation. All placement and breaking goes forward without rotating.
 
-    private final Setting<Boolean> customFolderPath = sgGeneral.add(new BoolSetting.Builder()
+    final Setting<Boolean> customFolderPath = sgGeneral.add(new BoolSetting.Builder()
         .name("custom-folder-path")
         .description("Allows to set a custom path to the nbt folder.")
         .defaultValue(false)
@@ -159,7 +159,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Boolean> useDefaultConfigFile = sgGeneral.add(new BoolSetting.Builder()
+    final Setting<Boolean> useDefaultConfigFile = sgGeneral.add(new BoolSetting.Builder()
         .name("use-default-config-file")
         .description("Automatically load the config file below when the module is enabled.")
         .defaultValue(true)
@@ -178,7 +178,7 @@ public class StepCheckered extends Module {
 
     // Mining & Collecting
 
-    private final Setting<Integer> minDurability = sgMining.add(new IntSetting.Builder()
+    final Setting<Integer> minDurability = sgMining.add(new IntSetting.Builder()
         .name("min-durability")
         .description("Remaining durability tools are exchanged at once they have gone BELOW it. The "
             + "exchange happens ONLY at the next batch-prep restock trip (old tool deposited into "
@@ -193,7 +193,7 @@ public class StepCheckered extends Module {
 
     // Advanced
 
-    private final Setting<Integer> preRestockDelay = sgAdvanced.add(new IntSetting.Builder()
+    final Setting<Integer> preRestockDelay = sgAdvanced.add(new IntSetting.Builder()
         .name("pre-restock-delay")
         .description("How many ticks to wait to take items after opening the chest.")
         .defaultValue(10)
@@ -202,7 +202,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Integer> invActionDelay = sgAdvanced.add(new IntSetting.Builder()
+    final Setting<Integer> invActionDelay = sgAdvanced.add(new IntSetting.Builder()
         .name("inventory-action-delay")
         .description("How many ticks to wait between each inventory action (moving a stack).")
         .defaultValue(2)
@@ -211,7 +211,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Integer> postRestockDelay = sgAdvanced.add(new IntSetting.Builder()
+    final Setting<Integer> postRestockDelay = sgAdvanced.add(new IntSetting.Builder()
         .name("post-restock-delay")
         .description("How many ticks to wait after restocking.")
         .defaultValue(10)
@@ -220,7 +220,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Integer> preSwapDelay = sgAdvanced.add(new IntSetting.Builder()
+    final Setting<Integer> preSwapDelay = sgAdvanced.add(new IntSetting.Builder()
         .name("pre-swap-delay")
         .description("How many ticks to wait before swapping an item into the hotbar.")
         .defaultValue(5)
@@ -229,7 +229,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Integer> postSwapDelay = sgAdvanced.add(new IntSetting.Builder()
+    final Setting<Integer> postSwapDelay = sgAdvanced.add(new IntSetting.Builder()
         .name("post-swap-delay")
         .description("How many ticks to wait after swapping an item into the hotbar.")
         .defaultValue(5)
@@ -238,7 +238,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Integer> retryInteractTimer = sgAdvanced.add(new IntSetting.Builder()
+    final Setting<Integer> retryInteractTimer = sgAdvanced.add(new IntSetting.Builder()
         .name("retry-interact-timer")
         .description("How many ticks to wait for chest response before interacting with it again.")
         .defaultValue(80)
@@ -247,7 +247,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Integer> posResetTimeout = sgAdvanced.add(new IntSetting.Builder()
+    final Setting<Integer> posResetTimeout = sgAdvanced.add(new IntSetting.Builder()
         .name("pos-reset-timeout")
         .description("How many ticks to wait after the player position was reset by the server.")
         .defaultValue(10)
@@ -256,7 +256,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Double> checkpointBuffer = sgAdvanced.add(new DoubleSetting.Builder()
+    final Setting<Double> checkpointBuffer = sgAdvanced.add(new DoubleSetting.Builder()
         .name("checkpoint-buffer")
         .description("The buffer area of the checkpoints. Larger means less precise walking, but might be desired at higher speeds.")
         .defaultValue(0.2)
@@ -272,42 +272,42 @@ public class StepCheckered extends Module {
 //        .build()
 //    );
 
-    private final Setting<Boolean> snapToCheckpoints = sgAdvanced.add(new BoolSetting.Builder()
+    final Setting<Boolean> snapToCheckpoints = sgAdvanced.add(new BoolSetting.Builder()
         .name("snap-to-checkpoints")
         .description("Snap to checkpoints when getting close.")
         .defaultValue(false)
         .build()
     );
 
-    private final Setting<Boolean> moveToFinishedFolder = sgAdvanced.add(new BoolSetting.Builder()
+    final Setting<Boolean> moveToFinishedFolder = sgAdvanced.add(new BoolSetting.Builder()
         .name("move-to-finished-folder")
         .description("Moves finished NBT files into the finished-maps folder in the color-suppressor folder.")
         .defaultValue(true)
         .build()
     );
 
-    private final Setting<Boolean> disableOnFinished = sgAdvanced.add(new BoolSetting.Builder()
+    final Setting<Boolean> disableOnFinished = sgAdvanced.add(new BoolSetting.Builder()
         .name("disable-on-finished")
         .description("Disables the printer when all nbt files are finished.")
         .defaultValue(true)
         .build()
     );
 
-    private final Setting<Boolean> debugPrints = sgAdvanced.add(new BoolSetting.Builder()
+    final Setting<Boolean> debugPrints = sgAdvanced.add(new BoolSetting.Builder()
         .name("debug-prints")
         .description("Prints additional information.")
         .defaultValue(false)
         .build()
     );
 
-    private final Setting<Boolean> batch0SplitBuild = sgAdvanced.add(new BoolSetting.Builder()
+    final Setting<Boolean> batch0SplitBuild = sgAdvanced.add(new BoolSetting.Builder()
         .name("batch0-split-build")
         .description("Split batch 0 into floor/tops halves around W1 (the proven fix for pair 0's floor recording). OFF = batch 0 runs the STANDARD flow exactly like every other batch: build(4) -> W1 -> break(2) -> W2 -> break-all, no pre-build phase.")
         .defaultValue(false)
         .build()
     );
 
-    private final Setting<Integer> startBatch = sgAdvanced.add(new IntSetting.Builder()
+    final Setting<Integer> startBatch = sgAdvanced.add(new IntSetting.Builder()
         .name("start-batch")
         .description("First batch to build in a fresh run - all batches before it are SKIPPED (nothing built, no walks). 0 = start at batch 0; set 1 to test the pipeline from batch 1 onward.")
         .defaultValue(1)
@@ -317,7 +317,7 @@ public class StepCheckered extends Module {
 
     // Multi User
 
-    private final Setting<String> tcpIp = sgMultiUser.add(new StringSetting.Builder()
+    final Setting<String> tcpIp = sgMultiUser.add(new StringSetting.Builder()
         .name("TCP-IP")
         .description("The loopback IP used by bot-to-bot TCP communication.")
         .defaultValue("127.0.0.1")
@@ -325,7 +325,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Integer> tcpPort = sgMultiUser.add(new IntSetting.Builder()
+    final Setting<Integer> tcpPort = sgMultiUser.add(new IntSetting.Builder()
         .name("TCP-port")
         .description("The loopback TCP port used by bot-to-bot communication.")
         .defaultValue(42069)
@@ -342,14 +342,14 @@ public class StepCheckered extends Module {
         slave
     }
 
-    private final Setting<BotRole> botRole = sgMultiUser.add(new EnumSetting.Builder<BotRole>()
+    final Setting<BotRole> botRole = sgMultiUser.add(new EnumSetting.Builder<BotRole>()
         .name("bot-role")
         .description("master: this bot hosts the TCP server and walks the checkpoints. slave: this bot builds/breaks. Must be set on both instances before starting.")
         .defaultValue(BotRole.empty)
         .build()
     );
 
-    private final Setting<String> masterUsername = sgMultiUser.add(new StringSetting.Builder()
+    final Setting<String> masterUsername = sgMultiUser.add(new StringSetting.Builder()
         .name("master-username")
         .description("Username of the account that acts as MASTER. Each bot self-identifies by its username - set this on both instances. Overrides bot-role.")
         .defaultValue("")
@@ -357,7 +357,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<String> slaveUsername = sgMultiUser.add(new StringSetting.Builder()
+    final Setting<String> slaveUsername = sgMultiUser.add(new StringSetting.Builder()
         .name("slave-username")
         .description("Username of the account that acts as SLAVE. Each bot self-identifies by its username - set this on both instances. Overrides bot-role.")
         .defaultValue("")
@@ -367,14 +367,14 @@ public class StepCheckered extends Module {
 
     //Render
 
-    private final Setting<Boolean> render = sgRender.add(new BoolSetting.Builder()
+    final Setting<Boolean> render = sgRender.add(new BoolSetting.Builder()
         .name("render")
         .description("Highlights the selected areas.")
         .defaultValue(true)
         .build()
     );
 
-    private final Setting<Boolean> renderMap = sgRender.add(new BoolSetting.Builder()
+    final Setting<Boolean> renderMap = sgRender.add(new BoolSetting.Builder()
         .name("render-map")
         .description("Highlights the placement plan of the selected batch (what the slave will build).")
         .defaultValue(false)
@@ -382,7 +382,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Integer> renderBatch = sgRender.add(new IntSetting.Builder()
+    final Setting<Integer> renderBatch = sgRender.add(new IntSetting.Builder()
         .name("render-batch")
         .description("The batch index (0-62) whose placement plan render-map highlights. Follows the engine's current batch once runs start.")
         .defaultValue(0)
@@ -393,7 +393,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Boolean> renderNextBlockPos = sgRender.add(new BoolSetting.Builder()
+    final Setting<Boolean> renderNextBlockPos = sgRender.add(new BoolSetting.Builder()
         .name("render-next-block-pos")
         .description("Highlights the block position of the current place/mining action.")
         .defaultValue(true)
@@ -401,7 +401,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Boolean> renderChestPositions = sgRender.add(new BoolSetting.Builder()
+    final Setting<Boolean> renderChestPositions = sgRender.add(new BoolSetting.Builder()
         .name("render-chest-positions")
         .description("Highlights the selected chests.")
         .defaultValue(true)
@@ -409,7 +409,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Boolean> renderOpenPositions = sgRender.add(new BoolSetting.Builder()
+    final Setting<Boolean> renderOpenPositions = sgRender.add(new BoolSetting.Builder()
         .name("render-open-positions")
         .description("Indicate the position the bot will go to in order to interact with the chest.")
         .defaultValue(true)
@@ -417,7 +417,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Boolean> renderCheckpoints = sgRender.add(new BoolSetting.Builder()
+    final Setting<Boolean> renderCheckpoints = sgRender.add(new BoolSetting.Builder()
         .name("render-checkpoints")
         .description("Indicate the checkpoints the bot will traverse.")
         .defaultValue(true)
@@ -425,7 +425,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Boolean> renderCheckpointGrid = sgRender.add(new BoolSetting.Builder()
+    final Setting<Boolean> renderCheckpointGrid = sgRender.add(new BoolSetting.Builder()
         .name("render-checkpoint-grid")
         .description("Highlights ALL 325 master platform checkpoints (x=125+2j, z=14/40/64/88/112). The 5 checkpoints of the rendered batch's sweep lane use the next-checkpoints color; the fill spot and cartography lock position use the special-checkpoints color.")
         .defaultValue(true)
@@ -433,7 +433,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Boolean> renderMasterArea = sgRender.add(new BoolSetting.Builder()
+    final Setting<Boolean> renderMasterArea = sgRender.add(new BoolSetting.Builder()
         .name("render-master-area")
         .description("Draws the MASTER AREA bounding box (x 124..255, z 12..117 around the platform lattice) and the single ENTRY/EXIT GATE (north-west platform 125,14) in the special-checkpoints color. Inside the box the master moves only along lattice lines; it enters/exits only through the gate.")
         .defaultValue(true)
@@ -441,7 +441,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<SettingColor> nextCheckpointsColor = sgRender.add(new ColorSetting.Builder()
+    final Setting<SettingColor> nextCheckpointsColor = sgRender.add(new ColorSetting.Builder()
         .name("next-checkpoints-color")
         .description("Color for the 5 checkpoints of the rendered batch's sweep lane (follows render-batch).")
         .defaultValue(new SettingColor(255, 165, 0, 190))
@@ -449,7 +449,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<SettingColor> specialCheckpointsColor = sgRender.add(new ColorSetting.Builder()
+    final Setting<SettingColor> specialCheckpointsColor = sgRender.add(new ColorSetting.Builder()
         .name("special-checkpoints-color")
         .description("Color for the master's special points: the map fill spot (entry) and the cartography lock position.")
         .defaultValue(new SettingColor(255, 70, 70, 190))
@@ -457,7 +457,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Boolean> renderSpecialInteractions = sgRender.add(new BoolSetting.Builder()
+    final Setting<Boolean> renderSpecialInteractions = sgRender.add(new BoolSetting.Builder()
         .name("render-special-interactions")
         .description("Indicate the position where the reset button and cartography table will be used.")
         .defaultValue(true)
@@ -465,7 +465,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<Double> indicatorSize = sgRender.add(new DoubleSetting.Builder()
+    final Setting<Double> indicatorSize = sgRender.add(new DoubleSetting.Builder()
         .name("indicator-size")
         .description("How big the rendered indicator will be.")
         .defaultValue(0.13)
@@ -475,7 +475,7 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    private final Setting<SettingColor> color = sgRender.add(new ColorSetting.Builder()
+    final Setting<SettingColor> color = sgRender.add(new ColorSetting.Builder()
         .name("color")
         .description("The render color.")
         .defaultValue(new SettingColor(22, 230, 206, 155))
@@ -489,8 +489,6 @@ public class StepCheckered extends Module {
     int heartbeatTicks;
     boolean pendingDisable;                                          // deferred toggle (see requestDisable)
     StepCheckerLayers stepLayers;                                    // converted per-pair rec/dom layers (StepCheckerLayers.empty() until the NBT loads)
-    HashMap<BlockPos, Block> renderedBatchPlan;                      // cached render-map plan
-    String renderedBatchKey;
     int currentBatch = -1;                                           // batch being built (slave)
     int batchPassRetries;
     int breakStage;                                                  // 0 = printing, 2 = break(2), 4 = break-all
@@ -577,7 +575,7 @@ public class StepCheckered extends Module {
     private volatile int stepSlaveDoneBatch = -1;
     private volatile boolean stepSlaveReadyClosing;
     private volatile boolean stepSlaveClosingDone;
-    private volatile StepMasterStage stepMasterStage = StepMasterStage.IDLE;
+    volatile StepMasterStage stepMasterStage = StepMasterStage.IDLE;
     private int stepMasterBatch = -1;
     private int stepMasterDwellTicks;
     private int stepMasterWaitTicks;
@@ -622,8 +620,10 @@ public class StepCheckered extends Module {
      *  at the gate too. Inside it the master moves ONLY along lattice lines; the area
      *  is entered and exited ONLY through the north-west GATE (platform 125,14) -
      *  never from anywhere else. Violations are logged by the lattice watchdog. */
-    private static final int MASTER_AREA_X0 = 124, MASTER_AREA_X1 = 255;
-    private static final int MASTER_AREA_Z0 = 12, MASTER_AREA_Z1 = 114;
+    static final int MASTER_AREA_X0 = 124, MASTER_AREA_X1 = 255;
+    static final int MASTER_AREA_Z0 = 12, MASTER_AREA_Z1 = 114;
+
+    private final StepRenderer renderer = new StepRenderer(this);
 
     public StepCheckered() {
         super(Addon.CATEGORY, "step-checkered", "Uses the step-checker method to build colour-suppression maps.");
@@ -2771,7 +2771,7 @@ public class StepCheckered extends Module {
      * The cache can go stale-air over a region (then nothing targets, nothing breaks, and the
      * bot silently walks into the un-mined wall); the world is always the truth for breaking.
      */
-    private BlockState miningBlockState(BlockPos pos) {
+    BlockState miningBlockState(BlockPos pos) {
         return mc.world.getBlockState(pos);
     }
 
@@ -2925,7 +2925,7 @@ public class StepCheckered extends Module {
         }
     }
 
-    private int loadStepProgress() {
+    int loadStepProgress() {
         int[] progress = StepFiles.loadProgress(mapFolder);
         stepSavedProgressMapId = progress[1];
         return progress[0];
@@ -5305,24 +5305,7 @@ public class StepCheckered extends Module {
         return lowerMapCorner.getX() + 2 * Math.max(currentBatch, 0);
     }
 
-    /** The batch the renderer shows: the ACTIVE batch while a run is in progress,
-     *  otherwise the manually selected render-batch setting (preview mode). */
-    private long resumeCacheReadAt;
 
-    private int effectiveRenderBatch() {
-        if (currentBatch >= 0) return currentBatch;
-        // No active run: render the SAVED PROGRESS batch (where the run actually is /
-        // will resume). Lazily re-read the shared file while idle (bounded to one
-        // read per 2s) so a crash-restart or the OTHER bot's progress shows without
-        // needing START ALL (live complaint 2026-10-20, twice).
-        long now = System.currentTimeMillis();
-        if (now - resumeCacheReadAt > 2000) {
-            resumeCacheReadAt = now;
-            cachedResumeBatch = loadStepProgress();
-        }
-        if (cachedResumeBatch > 0) return Math.min(62, cachedResumeBatch);
-        return renderBatch.get();
-    }
             /** Shared: nearest ground-collided pickup-able ItemEntity near the player, within the
      *  print box plus a margin (items bounce outside the exact box when blocks break).
      *  Used by both the batch SWEEP and the full-area RESET — one function, no duplicates. */
@@ -6056,115 +6039,7 @@ public class StepCheckered extends Module {
 
     @EventHandler
     private void onRender(Render3DEvent event) {
-        if (lowerMapCorner == null || !render.get()) return;
-        event.renderer.box(lowerMapCorner.getX(), lowerMapCorner.getY(), lowerMapCorner.getZ(), lowerMapCorner.getX() + 128, lowerMapCorner.getY(), lowerMapCorner.getZ() + 129, color.get(), color.get(), ShapeMode.Lines, 0);
-        if (upperMapCorner == null) return;
-        event.renderer.box(upperMapCorner.getX(), upperMapCorner.getY(), upperMapCorner.getZ(), upperMapCorner.getX() + 128, upperMapCorner.getY(), upperMapCorner.getZ() + 129, color.get(), color.get(), ShapeMode.Lines, 0);
-
-        if (renderNextBlockPos.get() && nextBlockPos != null) {
-            event.renderer.box(nextBlockPos, color.get(), color.get(), ShapeMode.Lines, 0);
-        }
-
-        if (renderMap.get() && lowerMapCorner != null && stepLayers != null) {
-            // The batch placement plan (assembleBatch) is the render source; cache it and only
-            // rebuild when the batch index, art file or corner changes
-            String planKey = effectiveRenderBatch() + "|" + (mapFile == null ? "?" : mapFile.getName())
-                + "|" + lowerMapCorner.getX() + "," + lowerMapCorner.getY() + "," + lowerMapCorner.getZ()
-                + "|" + currentBatch;   // currentBatch in the key so the plan shifts when the batch advances
-            if (!planKey.equals(renderedBatchKey)) {
-                renderedBatchKey = planKey;
-                renderedBatchPlan = assembleBatch(effectiveRenderBatch());
-            }
-            if (renderedBatchPlan != null) {
-                for (Map.Entry<BlockPos, Block> entry : renderedBatchPlan.entrySet()) {
-                    if (!miningBlockState(entry.getKey()).isAir()) continue;   // already built
-                    Color renderColor = color.get();
-                    if (entry.getValue().equals(fillerBlock.get())) renderColor = Color.BLUE;
-                    event.renderer.box(entry.getKey(), renderColor, renderColor, ShapeMode.Lines, 0);
-                }
-            }
-        }
-
-        if (renderMasterArea.get() && lowerMapCorner != null) {
-            // MASTER AREA bounding box only - the GATE platform (125,14) renders as a
-            // NORMAL checkpoint via the platform grid (user rule), no special pillar.
-            double ax0 = lowerMapCorner.getX() + MASTER_AREA_X0, ax1 = lowerMapCorner.getX() + MASTER_AREA_X1;
-            double az0 = lowerMapCorner.getZ() + MASTER_AREA_Z0, az1 = lowerMapCorner.getZ() + MASTER_AREA_Z1;
-            double ay = lowerMapCorner.getY();
-            event.renderer.box(ax0, ay - 1, az0, ax1, ay, az1, specialCheckpointsColor.get(), specialCheckpointsColor.get(), ShapeMode.Lines, 0);
-        }
-
-        if (renderCheckpointGrid.get() && lowerMapCorner != null) {
-            // The full 325-platform master grid; the rendered batch's sweep lane (x=2k+127)
-            // is highlighted so the next 5 checkpoints stand out from the rest
-            int[] spotZ = {14, 40, 64, 88, 112};
-            int nextLaneX = 2 * effectiveRenderBatch() + 127;
-            for (int j = 0; j <= 64; j++) {
-                int x = 125 + 2 * j;
-                boolean isNextLane = x == nextLaneX;
-                for (int z : spotZ) {
-                    BlockPos platform = new BlockPos(lowerMapCorner.getX() + x, lowerMapCorner.getY() - 1, lowerMapCorner.getZ() + z);
-                    Color gridColor = isNextLane ? nextCheckpointsColor.get() : color.get();
-                    event.renderer.box(platform, gridColor, gridColor, isNextLane ? ShapeMode.Both : ShapeMode.Lines, 0);
-                }
-            }
-            // Special master points, distinct from the lane grid - rendered ONLY while
-            // their phase is relevant: the fill spot before the first build, the
-            // cartography lock position from the closing phase onward. (Both used to
-            // render every frame - the lock marker at rel x~98 showed up during every
-            // batch and looked like a stray checkpoint.)
-            ArrayList<Vec3d> specialPoints = new ArrayList<>();
-            if (cartographyTable != null
-                && (stepMasterStage == StepMasterStage.CLOSING_WALK
-                    || stepMasterStage == StepMasterStage.WAIT_CLOSING_BREAK
-                    || stepMasterStage == StepMasterStage.READY_TO_LOCK
-                    || stepMasterStage == StepMasterStage.LOCK_WALK
-                    || stepMasterStage == StepMasterStage.LOCKING)) {
-                specialPoints.add(cartographyTable.getRight());
-            }
-            for (Vec3d point : specialPoints) {
-                double s = indicatorSize.get() + 0.15;
-                event.renderer.box(point.x - s, point.y - s, point.z - s, point.x + s, point.y + s, point.z + s,
-                    specialCheckpointsColor.get(), specialCheckpointsColor.get(), ShapeMode.Both, 0);
-            }
-        }
-
-        ArrayList<Pair<BlockPos, Vec3d>> renderedPairs = new ArrayList<>();
-        for (ArrayList<Pair<BlockPos, Vec3d>> list : materialDict.values()) {
-            renderedPairs.addAll(list);
-        }
-        renderedPairs.addAll(mapMaterialChests);
-        for (Pair<BlockPos, Vec3d> pair : renderedPairs) {
-            if (renderChestPositions.get())
-                event.renderer.box(pair.getLeft(), color.get(), color.get(), ShapeMode.Lines, 0);
-            if (renderOpenPositions.get()) {
-                Vec3d openPos = pair.getRight();
-                event.renderer.box(openPos.x - indicatorSize.get(), openPos.y - indicatorSize.get(), openPos.z - indicatorSize.get(), openPos.x + indicatorSize.get(), openPos.y + indicatorSize.get(), openPos.z + indicatorSize.get(), color.get(), color.get(), ShapeMode.Both, 0);
-            }
-        }
-
-        if (renderCheckpoints.get()) {
-            for (Pair<Vec3d, Pair<String, BlockPos>> pair : checkpoints) {
-                Vec3d cp = pair.getLeft();
-                event.renderer.box(cp.x - indicatorSize.get(), cp.y - indicatorSize.get(), cp.z - indicatorSize.get(), cp.x + indicatorSize.get(), cp.y + indicatorSize.get(), cp.z + indicatorSize.get(), color.get(), color.get(), ShapeMode.Both, 0);
-            }
-        }
-
-        if (renderSpecialInteractions.get()) {
-            if (cartographyTable != null) {
-                event.renderer.box(cartographyTable.getLeft(), color.get(), color.get(), ShapeMode.Lines, 0);
-                event.renderer.box(cartographyTable.getRight().x - indicatorSize.get(), cartographyTable.getRight().y - indicatorSize.get(), cartographyTable.getRight().z - indicatorSize.get(), cartographyTable.getRight().x + indicatorSize.get(), cartographyTable.getRight().y + indicatorSize.get(), cartographyTable.getRight().z + indicatorSize.get(), color.get(), color.get(), ShapeMode.Both, 0);
-            }
-            if (finishedMapChest != null) {
-                event.renderer.box(finishedMapChest.getLeft(), color.get(), color.get(), ShapeMode.Lines, 0);
-                event.renderer.box(finishedMapChest.getRight().x - indicatorSize.get(), finishedMapChest.getRight().y - indicatorSize.get(), finishedMapChest.getRight().z - indicatorSize.get(), finishedMapChest.getRight().getX() + indicatorSize.get(), finishedMapChest.getRight().getY() + indicatorSize.get(), finishedMapChest.getRight().getZ() + indicatorSize.get(), color.get(), color.get(), ShapeMode.Both, 0);
-            }
-            for (Pair<BlockPos, Vec3d> pair : Arrays.asList(anvil, foodChest, xpBottleChest)) {
-                if (pair == null) continue;
-                event.renderer.box(pair.getLeft(), color.get(), color.get(), ShapeMode.Lines, 0);
-                event.renderer.box(pair.getRight().x - indicatorSize.get(), pair.getRight().y - indicatorSize.get(), pair.getRight().z - indicatorSize.get(), pair.getRight().x + indicatorSize.get(), pair.getRight().y + indicatorSize.get(), pair.getRight().z + indicatorSize.get(), color.get(), color.get(), ShapeMode.Both, 0);
-            }
-        }
+        renderer.render(event);
     }
 
     /** Walks the map area's coordinate domain (working interval, 129 rows, y 0-1) in
@@ -6220,7 +6095,7 @@ public class StepCheckered extends Module {
      * states above.  The legacy states still drive registration, restocking, and the original
      * one-bot engine; this state machine owns only the measured two-bot W->E lifecycle.
      */
-    private enum StepMasterStage {
+    enum StepMasterStage {
         IDLE,
         FETCH_MAP,
         FILL_MAP,
