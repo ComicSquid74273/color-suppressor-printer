@@ -9,7 +9,6 @@ import meteordevelopment.orbit.EventHandler;
 import meteordevelopment.orbit.EventPriority;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.Block;
-import net.minecraft.block.BlockState;
 import net.minecraft.item.Item;
 import net.minecraft.item.FilledMapItem;
 import net.minecraft.item.ItemStack;
@@ -29,7 +28,6 @@ import net.minecraft.util.math.Vec3d;
 
 import java.io.File;
 import java.util.*;
-import java.util.function.BiConsumer;
 
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
@@ -50,16 +48,6 @@ public final class Utils {
         }
         list.add(new Pair(blockPos, openPos));
         return list;
-    }
-
-    public static boolean hasTool(ArrayList<Integer> availableSlots) {
-        for (int slot : availableSlots) {
-            if (mc.player.getInventory().getStack(slot) != null
-                && ToolUtils.isTool(mc.player.getInventory().getStack(slot))) {
-                return true;
-            }
-        }
-        return false;
     }
 
     public static int stacksRequired(Collection<Integer> amounts) {
@@ -165,25 +153,9 @@ public final class Utils {
         return FilledMapItem.getMapState(stack, mc.world);
     }
 
-    /** Map color id recorded at a pixel, or -1 when the pixel lies outside the 128x128 area. */
-    public static int readMapColorId(MapState state, int px, int pz) {
-        if (px < 0 || px > 127 || pz < 0 || pz > 127) return -1;
-        return (state.colors[px + pz * 128] & 0xFF) >> 2;
-    }
-
     public static void setForwardPressed(boolean pressed) {
         mc.options.forwardKey.setPressed(pressed);
         Input.setKeyState(mc.options.forwardKey, pressed);
-    }
-
-    public static void setBackwardPressed(boolean pressed) {
-        mc.options.backKey.setPressed(pressed);
-        Input.setKeyState(mc.options.backKey, pressed);
-    }
-
-    public static void setJumpPressed(boolean pressed) {
-        mc.options.jumpKey.setPressed(pressed);
-        Input.setKeyState(mc.options.jumpKey, pressed);
     }
 
     public static void setSneakPressed(boolean pressed) {
@@ -201,7 +173,15 @@ public final class Utils {
         return -1;
     }
 
+    /** Swaps a main-inventory stack (fromSlot 9-35) INTO hotbar slot toSlot (0-8).
+     *  Contract: toSlot MUST be a hotbar index - setSelectedSlot throws for anything
+     *  else (live 2026-10-21 02:27 crash: a beginBatch tool move-out passed a
+     *  main-inventory index here). Guarded no-op instead of a client crash. */
     public static void performSwap(int fromSlot, int toSlot) {
+        if (toSlot < 0 || toSlot > 8) {
+            System.err.println("[color-suppressor] performSwap blocked: toSlot " + toSlot + " is not a hotbar slot (0-8)");
+            return;
+        }
         mc.player.getInventory().setSelectedSlot(toSlot);
 
         IClientPlayerInteractionManager cim =
@@ -216,26 +196,25 @@ public final class Utils {
         );
     }
 
-    public static void iterateBlocks(BlockPos startingPos, int horizontalRadius, int verticalRadius, BiConsumer<BlockPos, BlockState> function) {
-        int px = startingPos.getX();
-        int py = startingPos.getY();
-        int pz = startingPos.getZ();
-
-        BlockPos.Mutable blockPos = new BlockPos.Mutable();
-
-        int hRadius = Math.max(0, horizontalRadius);
-        int vRadius = Math.max(0, verticalRadius);
-
-        for (int x = px - hRadius; x <= px + hRadius; x++) {
-            for (int z = pz - hRadius; z <= pz + hRadius; z++) {
-                for (int y = py - vRadius; y <= py + vRadius; y++) {
-                    blockPos.set(x, y, z);
-                    BlockState blockState = mc.world.getBlockState(blockPos);
-                    function.accept(blockPos, blockState);
-                }
-            }
+    /** Reverse direction: park a hotbar stack (0-8) into a free main-inventory slot
+     *  (9-35) WITHOUT touching the selected slot. SWAP's button IS the hotbar index,
+     *  so this must NOT setSelectedSlot - that call only accepts hotbar indices and
+     *  the destination here is main inventory by design. */
+    public static void swapHotbarToInventory(int hotbarSlot, int invSlot) {
+        if (hotbarSlot < 0 || hotbarSlot > 8 || invSlot < 9 || invSlot > 35) {
+            System.err.println("[color-suppressor] swapHotbarToInventory blocked: " + hotbarSlot + " -> " + invSlot);
+            return;
         }
+        IClientPlayerInteractionManager cim =
+            (IClientPlayerInteractionManager) mc.interactionManager;
 
+        cim.clickSlot(
+            mc.player.currentScreenHandler.syncId,
+            invSlot,
+            hotbarSlot,
+            SlotActionType.SWAP,
+            mc.player
+        );
     }
 
     public static HashMap<Integer, Pair<Block, Integer>> getBlockPalette(NbtList paletteList) {
@@ -250,103 +229,6 @@ public final class Utils {
             blockPaletteDict.put(i, new Pair(Registries.BLOCK.get(Identifier.of(blockName.get())), 0));
         }
         return blockPaletteDict;
-    }
-
-    public static Block[][] generateMapArray(NbtList blockList, HashMap<Integer, Pair<Block, Integer>> blockPalette) {
-        //Calculating the map offset
-        int maxHeight = Integer.MIN_VALUE;
-        int minX = Integer.MAX_VALUE;
-        int maxZ = Integer.MIN_VALUE;
-        for (int i = 0; i < blockList.size(); i++) {
-            Optional<NbtCompound> blockOpt = blockList.getCompound(i);
-            if (blockOpt.isEmpty()) continue;
-
-            NbtCompound block = blockOpt.get();
-
-            Optional<Integer> blockIdOpt = block.getInt("state");
-            if (blockIdOpt.isEmpty() || !blockPalette.containsKey(blockIdOpt.get())) continue;
-
-            Optional<NbtList> posOpt = block.getList("pos");
-            if (posOpt.isEmpty()) continue;
-
-            NbtList pos = posOpt.get();
-            if (pos.size() < 3) continue;
-
-            Optional<Integer> xOpt = pos.getInt(0);
-            Optional<Integer> yOpt = pos.getInt(1);
-            Optional<Integer> zOpt = pos.getInt(2);
-            if (xOpt.isEmpty() || yOpt.isEmpty() || zOpt.isEmpty()) {
-                continue;
-            }
-
-            if (yOpt.get() > maxHeight) maxHeight = yOpt.get();
-            if (xOpt.get() < minX) minX = xOpt.get();
-            if (zOpt.get() > maxZ) maxZ = zOpt.get();
-        }
-        maxZ -= 127;
-
-        //Extracting the map block positions
-        Block[][] map = new Block[128][128];
-        for (int i = 0; i < blockList.size(); i++) {
-            Optional<NbtCompound> blockOpt = blockList.getCompound(i);
-            if (blockOpt.isEmpty()) continue;
-            NbtCompound block = blockOpt.get();
-
-            Optional<Integer> blockIdOpt = block.getInt("state");
-            if (blockIdOpt.isEmpty() || !blockPalette.containsKey(blockIdOpt.get())) continue;
-
-            Optional<NbtList> posOpt = block.getList("pos");
-            if (posOpt.isEmpty()) continue;
-
-            NbtList pos = posOpt.get();
-            if (pos.size() < 3) continue;
-
-            Optional<Integer> xOpt = pos.getInt(0);
-            Optional<Integer> yOpt = pos.getInt(1);
-            Optional<Integer> zOpt = pos.getInt(2);
-
-            if (xOpt.isEmpty() || yOpt.isEmpty() || zOpt.isEmpty()) {
-                continue;
-            }
-
-            // Center the nbt
-            int x = xOpt.get() - minX;
-            int y = yOpt.get();
-            int z = zOpt.get() - maxZ;
-
-            // If block is within map area, increase counter for the block ID
-            if (y == maxHeight && x < map.length && z < map.length & x >= 0 && z >= 0) {
-                int blockId = blockIdOpt.get();
-                map[x][z] = blockPalette.get(blockId).getLeft();
-                blockPalette.put(blockId, new Pair(blockPalette.get(blockId).getLeft(), blockPalette.get(blockId).getRight() + 1));
-            }
-        }
-
-        //Remove unused blocks from the blockPalette
-        ArrayList<Integer> toBeRemoved = new ArrayList<>();
-        for (int key : blockPalette.keySet()) {
-            if (blockPalette.get(key).getRight() == 0) toBeRemoved.add(key);
-        }
-        for (int key : toBeRemoved) blockPalette.remove(key);
-
-        return map;
-    }
-
-    public static ArrayList<BlockPos> getInvalidPlacements(BlockPos mapCorner, Pair<Integer, Integer> interval, Block[][] map, ArrayList<BlockPos> knownErrors) {
-        ArrayList<BlockPos> invalidPlacements = new ArrayList<>();
-        for (int x = interval.getRight(); x >= interval.getLeft(); x--) {
-            for (int z = 127; z >= 0; z--) {
-                BlockPos relativePos = new BlockPos(x, 0, z);
-                BlockPos absolutePos = mapCorner.add(relativePos);
-                if (knownErrors.contains(absolutePos)) continue;
-                BlockState blockState = mc.world.getBlockState(absolutePos);
-                Block block = blockState.getBlock();
-                if (!blockState.isAir()) {
-                    if (map[x][z] != block) invalidPlacements.add(absolutePos);
-                }
-            }
-        }
-        return invalidPlacements;
     }
 
     public static void getOneItem(int sourceSlot, boolean avoidFirstHotBar, ArrayList<Integer> availableSlots,

@@ -1,6 +1,7 @@
 package com.comicsquid.colorsuppressor.modules;
 
 import com.comicsquid.colorsuppressor.Addon;
+import com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager;
 import com.comicsquid.colorsuppressor.interfaces.MapPrinter;
 import com.comicsquid.colorsuppressor.utils.*;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
@@ -43,7 +44,9 @@ import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
 import net.minecraft.item.map.MapState;
 import net.minecraft.registry.RegistryKeys;
 import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.screen.CartographyTableScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.ClickEvent;
 import net.minecraft.text.HoverEvent;
@@ -61,6 +64,9 @@ import org.lwjgl.util.tinyfd.TinyFileDialogs;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.FileWriter;
+import java.nio.file.Files;
+import java.util.function.Predicate;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -531,7 +537,6 @@ public class StepCheckered extends Module implements MapPrinter {
     int interactTimeout;
     int toBeSwappedSlot;
     int lastPlacedLine;
-    int minedLines;
     int suppressedLines;
     int lastReportedZ;
     int awaitSuppressionZ;
@@ -545,7 +550,6 @@ public class StepCheckered extends Module implements MapPrinter {
     int batchPassRetries;
     int breakStage;                                                  // 0 = printing, 2 = break(2), 4 = break-all
     boolean printRepairPending;                                      // print pass ended with missing blocks
-    boolean collectingStragglers;                                    // exit-verification item sweep active
     int sweepBudget;                                                 // tick budget for the straggler sweep
     volatile boolean startBuildingRequested;                         // START ALL deferred trigger
     boolean fullSweepActive;                                         // full-area RESET sweep in progress
@@ -553,8 +557,6 @@ public class StepCheckered extends Module implements MapPrinter {
     boolean controlSwapPending;                                      // empty-map swap into the hotbar in progress
     int stepMapSwapAge;                                              // retry countdown for the filled-map hotbar swap
     int controlUseCooldown;                                          // one-shot gate for the empty-map auto-use
-    int fullSweepBudget;                                             // tick budget for the full-area sweep
-    boolean fullSweepCenterChecked;                                  // center vantage already scanned
     // RESET ladder (checkpoint batches): 32 four-lane columns x 5 z-segments; each
     // segment is broken + picked to 100% and CONFIRMED by a bounded scan before the
     // ladder advances. Columns snake (N->S, S->N) so station moves stay short.
@@ -569,13 +571,13 @@ public class StepCheckered extends Module implements MapPrinter {
     BlockPos vanillaStickyTarget;                                    // ONE multi-tick vanilla target at a time (progress must accumulate)
     int rateTick;                                                   // 20-tick rate-report cycle
     int breakSentPerSec, breakConfirmedPerSec, placeSentPerSec;      // [RATE] verification counters
-    java.util.HashMap<BlockPos, Integer> collectSkips;               // collection run: picks per drop (10 = blacklisted)
+    HashMap<BlockPos, Integer> collectSkips;               // collection run: picks per drop (10 = blacklisted)
     int breakHoldSuppression;                                        // ticks to skip break-pace holding after a watchdog release
     // BREAK CONFIRMATION: fastBreak sends packets but the server's block-update
     // arrives 1-2 ticks later. These track recently-broken positions and retry
     // any that the server didn't process — BEFORE the bot walks past them.
     HashMap<BlockPos, Integer> breakPending;                        // pos -> ticks until silently confirmed
-    java.util.HashSet<BlockPos> needsVanillaBreak;                  // fastBreak failed → use vanilla mining
+    HashSet<BlockPos> needsVanillaBreak;                  // fastBreak failed → use vanilla mining
     HashMap<BlockPos, Integer> vanillaBreakRetries;                 // pos -> times expired into vanilla fallback (server-rejection evidence)
     BlockPos jamWatchTarget;                                        // feed-jam detector: armed target held out of range
     int jamWatchTicks;
@@ -736,11 +738,11 @@ public class StepCheckered extends Module implements MapPrinter {
             if (ms != null) {
                 byte[] cols = new byte[ms.colors.length];
                 for (int i = 0; i < ms.colors.length; i++) cols[i] = ms.colors[i];
-                sb.append(",\"mapPixels\":\"").append(java.util.Base64.getEncoder().encodeToString(cols)).append('"');
+                sb.append(",\"mapPixels\":\"").append(Base64.getEncoder().encodeToString(cols)).append('"');
             }
         }
         String pos = mc != null && mc.player != null
-            ? String.format(java.util.Locale.ROOT, "\"x\":%.1f,\"y\":%.1f,\"z\":%.1f",
+            ? String.format(Locale.ROOT, "\"x\":%.1f,\"y\":%.1f,\"z\":%.1f",
                 mc.player.getX(), mc.player.getY(), mc.player.getZ())
             : "\"x\":null,\"y\":null,\"z\":null";
         sb.append(',').append(pos);
@@ -928,19 +930,18 @@ public class StepCheckered extends Module implements MapPrinter {
         timeoutTicks = 0;
         interactTimeout = 0;
         toBeSwappedSlot = -1;
-        minedLines = 128;
         suppressedLines = -1;
         lastReportedZ = -1;
         heartbeatTicks = 0;
         pendingDisable = false;
         placementCooldowns = new HashMap<>();
         placementAttempts = new HashMap<>();
-        collectSkips = new java.util.HashMap<>();
+        collectSkips = new HashMap<>();
         placeHoldTicks = 0;
         breakHoldTicks = 0;
         breakHoldSuppression = 0;
         breakPending = new HashMap<>();
-        needsVanillaBreak = new java.util.HashSet<>();
+        needsVanillaBreak = new HashSet<>();
         vanillaBreakRetries = new HashMap<>();
         jamWatchTarget = null;
         jamWatchTicks = 0;
@@ -1402,9 +1403,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 if (depositBacklogSlots.isEmpty()) {
                     // Nothing belongs in THIS chest: hop to the next correct one or continue
                     Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
-                    if (nextDepositChest != null) {
-                        checkpoints.add(0, new Pair(nextDepositChest.getRight(), new Pair("depositBuilding", nextDepositChest.getLeft())));
-                    }
+                    if (nextDepositChest != null) queueDepositChestAtHead(nextDepositChest);
                     timeoutTicks = postRestockDelay.get();
                     state = State.Walking;
                 } else {
@@ -1491,7 +1490,6 @@ public class StepCheckered extends Module implements MapPrinter {
                 resetLadderCol = 0;
                 resetLadderSeg = mc.player.getBlockZ() - lowerMapCorner.getZ() > 64 ? 4
                     : (mc.player.getBlockZ() - lowerMapCorner.getZ() > 26 ? 2 : 0);
-                fullSweepBudget = 600;
                 queueResetLadder(resetLadderCol, 0);
                 prependNorthCorridor(checkpoints.getFirst().getLeft().x);
                 state = State.Mining;
@@ -1509,19 +1507,27 @@ public class StepCheckered extends Module implements MapPrinter {
         if (state == State.AwaitBreakPermission2 && break2Permitted) {
             break2Permitted = false;
             // PHASE TOOL SLOTS: breaking needs the tools - pickaxe to 8, carried axe
-            // to 9; both leave the staging set until the next print pass.
+            // to hotbar 7 (hotbar is 0-8; the old 'axe to 9' addressed main
+            // inventory and crashed performSwap's setSelectedSlot). Both leave the
+            // staging set until the next print pass. Best-first like the pickaxe.
             ensurePickaxeSlot8();
             availableHotBarSlots.remove(Integer.valueOf(8));
             {
                 int axeSlot = -1;
-                for (int as2 = 0; as2 < 36 && axeSlot == -1; as2++) {
+                int axeLife = -1;
+                for (int as2 = 0; as2 < 36; as2++) {
                     ItemStack a3 = mc.player.getInventory().getStack(as2);
-                    if (!a3.isEmpty() && a3.isIn(ItemTags.AXES) && ToolUtils.getRemainingDamage(a3) >= minDurability.get()) axeSlot = as2;
+                    if (a3.isEmpty() || !a3.isIn(ItemTags.AXES)) continue;
+                    int life = ToolUtils.getRemainingDamage(a3);
+                    if (life >= minDurability.get() && life > axeLife) { axeLife = life; axeSlot = as2; }
                 }
-                if (axeSlot != -1 && axeSlot != 9) {
-                    Utils.performSwap(axeSlot, 9);
+                if (axeSlot >= 9) {
+                    Utils.performSwap(axeSlot, 7);
+                    availableHotBarSlots.remove(Integer.valueOf(7));
+                } else if (axeSlot >= 0) {
+                    // already in the hotbar - reserve it in place so staging never evicts it
+                    availableHotBarSlots.remove(Integer.valueOf(axeSlot));
                 }
-                availableHotBarSlots.remove(Integer.valueOf(9));
             }
             breakStage = 2;
             state = State.Mining;
@@ -1669,9 +1675,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 info("§eChest " + lastInteractedChest.toShortString() + " is full - depositing in another registered chest.");
                 Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
                 depositBacklogSlots.clear();
-                if (nextDepositChest != null) {
-                    checkpoints.add(0, new Pair(nextDepositChest.getRight(), new Pair("depositBuilding", nextDepositChest.getLeft())));
-                }
+                if (nextDepositChest != null) queueDepositChestAtHead(nextDepositChest);
                 timeoutTicks = postRestockDelay.get();
                 state = State.Walking;
                 return;
@@ -1679,9 +1683,7 @@ public class StepCheckered extends Module implements MapPrinter {
             mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, slot, 0, SlotActionType.QUICK_MOVE, mc.player);
             if (depositBacklogSlots.isEmpty()) {
                 Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
-                if (nextDepositChest != null) {
-                    checkpoints.add(0, new Pair(nextDepositChest.getRight(), new Pair("depositBuilding", nextDepositChest.getLeft())));
-                }
+                if (nextDepositChest != null) queueDepositChestAtHead(nextDepositChest);
                 timeoutTicks = postRestockDelay.get();
                 state = State.Walking;
             } else {
@@ -1711,11 +1713,9 @@ public class StepCheckered extends Module implements MapPrinter {
                 if (minedZ > -1 && minedZ < 129 && Math.abs(minedZ - lastReportedZ) > 0) {
                     lastReportedZ = minedZ;
                     if (northToSouth) {
-                        SlaveSystem.sendMessageToMaster("placeStatus:" + workingInterval.getLeft() + ":"
-                            + workingInterval.getRight() + ":" + 0 + ":" + minedZ + ":" + false + ":" + true);
+                        sendPlaceStatus(workingInterval.getLeft(), workingInterval.getRight(), 0, minedZ, false, true);
                     } else {
-                        SlaveSystem.sendMessageToMaster("placeStatus:" + workingInterval.getLeft() + ":"
-                            + workingInterval.getRight() + ":" + minedZ + ":" + 128 + ":" + false + ":" + true);
+                        sendPlaceStatus(workingInterval.getLeft(), workingInterval.getRight(), minedZ, 128, false, true);
                     }
                 }
             }
@@ -1825,7 +1825,7 @@ public class StepCheckered extends Module implements MapPrinter {
         }
         if (!breakPending.isEmpty()) {
             int confirmedThisTick = 0, expiredThisTick = 0;
-            java.util.Iterator<BlockPos> pendingIt = breakPending.keySet().iterator();
+            Iterator<BlockPos> pendingIt = breakPending.keySet().iterator();
             while (pendingIt.hasNext()) {
                 BlockPos pending = pendingIt.next();
                 int ticksLeft = breakPending.get(pending) - 1;
@@ -1868,7 +1868,7 @@ public class StepCheckered extends Module implements MapPrinter {
             needsVanillaBreak.removeIf(pos -> miningBlockState(pos).isAir());
         }
 
-        if ((state.equals(State.Mining) || state.equals(State.AwaitBlockBreak)) && nextBlockPos != null) {
+        if (state.equals(State.Mining) && nextBlockPos != null) {
             // Break block if miningPos is not null
             if (miningBlockState(nextBlockPos).isAir()) {
                 nextBlockPos = null;
@@ -1879,11 +1879,6 @@ public class StepCheckered extends Module implements MapPrinter {
                 // one pacing was the rate cap - the client cannot see confirmations
                 // within the same tick. See sendDistinctBreaks.
                 sendDistinctBreaks(breaksPerTick.get(), fullSweepActive);
-
-                if (state.equals(State.AwaitBlockBreak)) {
-                    Utils.setForwardPressed(false);
-                    return;
-                }
             }
         }
 
@@ -2064,9 +2059,7 @@ public class StepCheckered extends Module implements MapPrinter {
                     refillMiningInventory(true);
                     return;
                 case "calculateRefill":
-                    HashMap<Item, Integer> requiredItems = getRequiredItems();
-                    Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInformation = Utils.getInvInformation(requiredItems, availableSlots);
-                    refillBuildingInventory(invInformation.getRight());
+                    refillFromCurrentPlan();
                     return;
                 case "refill":
                     state = State.AwaitRestockResponse;
@@ -2166,7 +2159,7 @@ public class StepCheckered extends Module implements MapPrinter {
                     state = State.Mining;
                     int remainingBlocks = countRemainingPlanBlocks();
                     int[] census = itemCensusInBatchWindow();
-                    int bwx0 = lowerMapCorner.getX() + 2 * Math.max(currentBatch, 0) - 2;
+                    int bwx0 = batchWindowWestX() - 2;
                     int pendBrk = countPendingInRange(bwx0, bwx0 + 7, lowerMapCorner.getZ() - 3, lowerMapCorner.getZ() + 129);
                     int vanillaQ = countVanillaInRange(bwx0, bwx0 + 7, lowerMapCorner.getZ() - 3, lowerMapCorner.getZ() + 129);
                     // STALL DETECTOR (same signature discipline as resetPass): blocks +
@@ -2316,7 +2309,6 @@ public class StepCheckered extends Module implements MapPrinter {
                             + " with " + (nearestBlock != null ? "blocks " : "") + (nearestItem != null ? "+ items " : "")
                             + "still visible - exit gate will re-verify.");
                     }
-                    collectingStragglers = false;
                     checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("batchExit", null)));
                     state = State.Walking;
                     return;
@@ -2567,7 +2559,7 @@ public class StepCheckered extends Module implements MapPrinter {
             // and record each material's FIRST-USE z. Bring in the missing material with
             // the SMALLEST first-use z; evict the hotbar resident whose first-use z is
             // the LARGEST (absent from the window = infinity). Optimal single-swap policy.
-            java.util.HashMap<Item, Integer> firstUseZ = new java.util.HashMap<>();
+            HashMap<Item, Integer> firstUseZ = new HashMap<>();
             int botZNow = mc.player.getBlockZ();
             for (Map.Entry<BlockPos, Block> ue : currentBuildPlan.entrySet()) {
                 BlockPos up = ue.getKey();
@@ -2578,33 +2570,16 @@ public class StepCheckered extends Module implements MapPrinter {
                 Integer prev = firstUseZ.get(uItem);
                 if (prev == null || uz < prev) firstUseZ.put(uItem, uz);
             }
-            // pick the missing upcoming material with the smallest first-use z
-            Item bringIn = null;
-            int bringInZ = Integer.MAX_VALUE;
-            for (java.util.Map.Entry<Item, Integer> fe : firstUseZ.entrySet()) {
-                boolean inHotbar = false;
-                for (int hs : availableHotBarSlots) {
-                    ItemStack hStack = mc.player.getInventory().getStack(hs);
-                    if (!hStack.isEmpty() && hStack.getItem().equals(fe.getKey())) { inHotbar = true; break; }
-                }
-                if (inHotbar) continue;
-                if (fe.getValue() < bringInZ) { bringInZ = fe.getValue(); bringIn = fe.getKey(); }
-            }
             // BELADY MULTI-SWAP (v4, live 2026-10-21: v3's one-swap-per-second + the
             // never-evict-sooner-resident guard left soon-used materials missing while
             // far ones rode the hotbar). Eviction = farthest-next-use (true Belady),
             // and ALL missing window materials are staged this check - a swap cascade
             // every second, each evicting the farthest-future resident.
             int swapsDone = 0;
-            java.util.ArrayList<Item> bringOrder = new java.util.ArrayList<>();
-            java.util.ArrayList<Integer> bringZs = new java.util.ArrayList<>();
-            for (java.util.Map.Entry<Item, Integer> fe : firstUseZ.entrySet()) {
-                boolean inHotbar = false;
-                for (int hs : availableHotBarSlots) {
-                    ItemStack hStack = mc.player.getInventory().getStack(hs);
-                    if (!hStack.isEmpty() && hStack.getItem().equals(fe.getKey())) { inHotbar = true; break; }
-                }
-                if (!inHotbar) { bringOrder.add(fe.getKey()); bringZs.add(fe.getValue()); }
+            ArrayList<Item> bringOrder = new ArrayList<>();
+            ArrayList<Integer> bringZs = new ArrayList<>();
+            for (Map.Entry<Item, Integer> fe : firstUseZ.entrySet()) {
+                if (!isItemInHotbar(fe.getKey())) { bringOrder.add(fe.getKey()); bringZs.add(fe.getValue()); }
             }
             for (int a = 0; a < bringOrder.size(); a++) {
                 for (int b = a + 1; b < bringOrder.size(); b++) {
@@ -2656,7 +2631,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 // broke the loop (~10-12/s cap). Now: send up to blocksPerTick
                 // DIFFERENT positions per tick (each on a 4-tick cooldown), stop only
                 // on a swap/restock need.
-                java.util.HashSet<BlockPos> attempted = new java.util.HashSet<>();
+                HashSet<BlockPos> attempted = new HashSet<>();
                 int placed = 0;
                 for (int pick = 0; pick < blocksPerTick.get() * 3 && placed < blocksPerTick.get(); pick++) {
                     BlockPos target = getNextBatchPlacementPos(attempted);
@@ -2795,6 +2770,16 @@ public class StepCheckered extends Module implements MapPrinter {
             restockList.add(0, Triple.of(item, stacks, requiredItems.get(item)));
         }
         addClosestRestockCheckpoint();
+    }
+
+    /** Compute what the current plan still needs, drop what is in the way, and queue the
+     *  refill trip - the ONE entry point shared by the calculateRefill checkpoint, batch
+     *  prep, and the mid-print supply run. */
+    private void refillFromCurrentPlan() {
+        HashMap<Item, Integer> requiredItems = getRequiredItems();
+        Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInfo =
+            Utils.getInvInformation(requiredItems, availableSlots);
+        refillBuildingInventory(invInfo.getRight());
     }
 
     private void refillMiningInventory(boolean includeFutureBlocks) {
@@ -2966,7 +2951,7 @@ public class StepCheckered extends Module implements MapPrinter {
      *  in-range targets per tick, skipping pending ones via the exclusion set.
      *  @return number of break actions sent this tick */
     private int sendDistinctBreaks(int maxSends, boolean fullSweep) {
-        java.util.HashSet<BlockPos> attempted = new java.util.HashSet<>();
+        HashSet<BlockPos> attempted = new HashSet<>();
         // INSTA-BREAK REQUIRES THE PICKAXE IN HAND: the server computes break time
         // from the HELD item at packet time. With a building material selected
         // (left over from the print pass), same-tick START+STOP is rejected and
@@ -3075,7 +3060,7 @@ public class StepCheckered extends Module implements MapPrinter {
             mc.player.getInventory().setSelectedSlot(8);
             BlockUtils.breakBlock(target, true);
         } else {
-            ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(target);
+            ((IClientPlayerInteractionManager) mc.interactionManager).fastBreak(target);
             mc.player.swingHand(Hand.MAIN_HAND);
             breakPending.put(target, 6);   // 4-tick window: Folia's block-update echo can lag 2-3 ticks
         }
@@ -3086,6 +3071,15 @@ public class StepCheckered extends Module implements MapPrinter {
         for (int slot : availableSlots) {
             if (!mc.player.getInventory().getStack(slot).isEmpty()
                 && mc.player.getInventory().getStack(slot).getItem().equals(needed)) return true;
+        }
+        return false;
+    }
+
+    /** Is this item currently held in one of the staging hotbar slots? */
+    private boolean isItemInHotbar(Item item) {
+        for (int slot : availableHotBarSlots) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (!stack.isEmpty() && stack.getItem().equals(item)) return true;
         }
         return false;
     }
@@ -3498,7 +3492,7 @@ public class StepCheckered extends Module implements MapPrinter {
     private void saveResetPending(int scopeCol) {
         try {
             stepResetPendingFile().getParentFile().mkdirs();
-            java.io.FileWriter writer = new java.io.FileWriter(stepResetPendingFile());
+            FileWriter writer = new FileWriter(stepResetPendingFile());
             writer.write("{\"scope\":" + scopeCol + "}\n");
             writer.close();
         } catch (Exception ignored) {
@@ -3509,7 +3503,7 @@ public class StepCheckered extends Module implements MapPrinter {
         try {
             File file = stepResetPendingFile();
             if (!file.exists() || mapFolder == null) return -1;
-            String json = new String(java.nio.file.Files.readAllBytes(file.toPath()));
+            String json = new String(Files.readAllBytes(file.toPath()));
             int start = json.indexOf("\"scope\":") + 9;
             int end = json.indexOf("}", start);
             return Integer.parseInt(json.substring(start, end).trim());
@@ -3536,7 +3530,7 @@ public class StepCheckered extends Module implements MapPrinter {
         try {
             File file = stepProgressFile();
             file.getParentFile().mkdirs();
-            java.io.FileWriter writer = new java.io.FileWriter(file);
+            FileWriter writer = new FileWriter(file);
             writer.write("{\"batch\":" + batch + ",\"mapId\":" + stepWorkingMapId + "}\n");
             writer.close();
             cachedResumeBatch = batch;
@@ -3551,7 +3545,7 @@ public class StepCheckered extends Module implements MapPrinter {
         try {
             File file = stepProgressFile();
             if (!file.exists()) return 0;
-            String json = new String(java.nio.file.Files.readAllBytes(file.toPath()));
+            String json = new String(Files.readAllBytes(file.toPath()));
             int batchStart = json.indexOf("\"batch\":") + 8;
             int batchEnd = json.indexOf(",", batchStart);
             if (batchEnd < 0) batchEnd = json.indexOf("}", batchStart);
@@ -4327,7 +4321,7 @@ public class StepCheckered extends Module implements MapPrinter {
             stepLockDelay--;
             return;
         }
-        if (!(mc.player.currentScreenHandler instanceof net.minecraft.screen.CartographyTableScreenHandler table)) {
+        if (!(mc.player.currentScreenHandler instanceof CartographyTableScreenHandler table)) {
             abortStepMaster("cartography table screen did not open");
             return;
         }
@@ -4371,9 +4365,9 @@ public class StepCheckered extends Module implements MapPrinter {
         }
     }
 
-    private boolean moveIntoStepTableSlot(net.minecraft.screen.CartographyTableScreenHandler table,
+    private boolean moveIntoStepTableSlot(CartographyTableScreenHandler table,
                                           int targetSlot,
-                                          java.util.function.Predicate<ItemStack> predicate) {
+                                          Predicate<ItemStack> predicate) {
         for (int slot = 3; slot < table.slots.size(); slot++) {
             ItemStack stack = table.getSlot(slot).getStack();
             if (stack.isEmpty() || !predicate.test(stack)) continue;
@@ -4569,10 +4563,12 @@ public class StepCheckered extends Module implements MapPrinter {
         queueStepBuildPreparation(walkX);
 
         // PHASE TOOL SLOTS (user rule, live 2026-10-21): printing needs NO tools -
-        // slots 8-9 join the staging set during the print pass. The pickaxe/axe move
-        // to the main inventory here; break(2)/break(4) moves them back into 8/9.
+        // the tool slots join the staging set during the print pass. The hotbar is
+        // 0-8 ONLY (slot 9 is main inventory - passing it as performSwap's hotbar
+        // argument crashed the client at batch 3, 02:27): tools park in hotbar
+        // 7 (axe) + 8 (pickaxe); break(2)/break(4) moves them back in.
         {
-            for (int ts = 8; ts <= 9; ts++) {
+            for (int ts = 7; ts <= 8; ts++) {
                 ItemStack tStack = mc.player.getInventory().getStack(ts);
                 if (!tStack.isEmpty() && (tStack.isIn(ItemTags.PICKAXES) || tStack.isIn(ItemTags.AXES))) {
                     int freeSlot = -1;
@@ -4580,9 +4576,13 @@ public class StepCheckered extends Module implements MapPrinter {
                         if (mc.player.getInventory().getStack(fs).isEmpty()) freeSlot = fs;
                     }
                     if (freeSlot != -1) {
-                        Utils.performSwap(ts, freeSlot);
+                        // hotbar -> main inventory: SWAP's button IS the hotbar index,
+                        // and NO setSelectedSlot may run (it only accepts 0-8).
+                        Utils.swapHotbarToInventory(ts, freeSlot);
                         if (!availableHotBarSlots.contains(ts)) availableHotBarSlots.add(ts);
                         info("§7Print phase: " + tStack.getItem().getName().getString() + " moved out of slot " + ts + " - staging slot freed.");
+                    } else {
+                        info("§7Print phase: slot " + ts + " tool stays put - inventory full, no free main slot.");
                     }
                 }
             }
@@ -4592,7 +4592,7 @@ public class StepCheckered extends Module implements MapPrinter {
         // print pass rarely stalls on mid-run swaps - the old on-demand one-slot
         // swapping was the print delay. Runs before the route; one swap per material.
         {
-            java.util.LinkedHashSet<Item> coming = new java.util.LinkedHashSet<>();
+            LinkedHashSet<Item> coming = new LinkedHashSet<>();
             for (Map.Entry<BlockPos, Block> le : currentBuildPlan.entrySet()) {
                 if (coming.size() >= availableHotBarSlots.size()) break;
                 coming.add(le.getValue().asItem());
@@ -4600,12 +4600,7 @@ public class StepCheckered extends Module implements MapPrinter {
             int preSwapped = 0;
             int slotCursor = 0;
             for (Item comingItem : coming) {
-                boolean alreadyHotbar = false;
-                for (int hs : availableHotBarSlots) {
-                    ItemStack hsStack = mc.player.getInventory().getStack(hs);
-                    if (!hsStack.isEmpty() && hsStack.getItem().equals(comingItem)) { alreadyHotbar = true; break; }
-                }
-                if (alreadyHotbar) continue;
+                if (isItemInHotbar(comingItem)) continue;
                 int srcSlot = -1;
                 for (int is = 9; is < 36 && srcSlot == -1; is++) {
                     ItemStack isStack = mc.player.getInventory().getStack(is);
@@ -4653,10 +4648,7 @@ public class StepCheckered extends Module implements MapPrinter {
      * then append their print route.  Every trip remains on the north corridor.
      */
     private void queueStepBuildPreparation(double stagingX) {
-        HashMap<Item, Integer> requiredItems = getRequiredItems();
-        Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInfo =
-            Utils.getInvInformation(requiredItems, availableSlots);
-        refillBuildingInventory(invInfo.getRight());
+        refillFromCurrentPlan();
         boolean materialRestockQueued = !restockList.isEmpty();
 
         // UNNEEDED-MATERIAL DUMP (user rule, 2026-10-20), inlined body-only (hotswap-
@@ -4671,7 +4663,7 @@ public class StepCheckered extends Module implements MapPrinter {
             // counts). Excess beyond that need is dead weight fragmenting slots - the
             // live batch-1 stall: inventory full of prior-run drops, every item
             // "needed" by SOME future batch, zero free slots at the chest withdrawal.
-            java.util.HashMap<Item, Integer> futureNeed = new java.util.HashMap<>();
+            HashMap<Item, Integer> futureNeed = new HashMap<>();
             for (int fb = currentBatch; fb <= 62; fb++) {
                 for (Block fbBlock : assembleBatch(fb).values()) {
                     Item fbItem = fbBlock.asItem();
@@ -4682,31 +4674,31 @@ public class StepCheckered extends Module implements MapPrinter {
                 Item cbItem = cb.asItem();
                 futureNeed.put(cbItem, futureNeed.getOrDefault(cbItem, 0) + 1);
             }
-            java.util.HashMap<Item, Integer> carried = new java.util.HashMap<>();
-            java.util.HashMap<Item, java.util.ArrayList<Integer>> itemSlots = new java.util.HashMap<>();
+            HashMap<Item, Integer> carried = new HashMap<>();
+            HashMap<Item, ArrayList<Integer>> itemSlots = new HashMap<>();
             for (int dSlot = 0; dSlot < 36; dSlot++) {
                 ItemStack dStack = mc.player.getInventory().getStack(dSlot);
                 if (dStack.isEmpty() || ToolUtils.isTool(dStack) || dStack.contains(DataComponentTypes.FOOD)) continue;
                 if (!materialDict.containsKey(dStack.getItem())) continue;
                 Item dItem = dStack.getItem();
                 carried.put(dItem, carried.getOrDefault(dItem, 0) + dStack.getCount());
-                java.util.ArrayList<Integer> listForItem = itemSlots.get(dItem);
-                if (listForItem == null) { listForItem = new java.util.ArrayList<>(); itemSlots.put(dItem, listForItem); }
+                ArrayList<Integer> listForItem = itemSlots.get(dItem);
+                if (listForItem == null) { listForItem = new ArrayList<>(); itemSlots.put(dItem, listForItem); }
                 listForItem.add(dSlot);
             }
-            java.util.HashSet<Item> unneededItems = null;
-            java.util.ArrayList<Integer> dumpSlots = new java.util.ArrayList<>();
-            for (java.util.Map.Entry<Item, java.util.ArrayList<Integer>> ent : itemSlots.entrySet()) {
+            HashSet<Item> unneededItems = null;
+            ArrayList<Integer> dumpSlots = new ArrayList<>();
+            for (Map.Entry<Item, ArrayList<Integer>> ent : itemSlots.entrySet()) {
                 int need = futureNeed.getOrDefault(ent.getKey(), 0);
                 int have = carried.getOrDefault(ent.getKey(), 0);
                 if (have <= need) continue;   // fully used later - keep every stack
                 int toDump = have - need;     // deposit the excess, newest slots first
-                java.util.ArrayList<Integer> slotsOfItem = ent.getValue();
+                ArrayList<Integer> slotsOfItem = ent.getValue();
                 for (int si = slotsOfItem.size() - 1; si >= 0 && toDump > 0; si--) {
                     int dSlot = slotsOfItem.get(si);
                     dumpSlots.add(dSlot);
                     toDump -= mc.player.getInventory().getStack(dSlot).getCount();
-                    if (unneededItems == null) unneededItems = new java.util.HashSet<>();
+                    if (unneededItems == null) unneededItems = new HashSet<>();
                     if (!unneededItems.contains(ent.getKey())) { unneededItems.add(ent.getKey()); }
                 }
             }
@@ -4764,25 +4756,18 @@ public class StepCheckered extends Module implements MapPrinter {
         if (currentBuildPlan != null) {
             boolean needsWoodTool = false;
             for (Block b : currentBuildPlan.values()) {
-                if (b.getDefaultState().isIn(net.minecraft.registry.tag.BlockTags.AXE_MINEABLE)) { needsWoodTool = true; break; }
+                if (b.getDefaultState().isIn(BlockTags.AXE_MINEABLE)) { needsWoodTool = true; break; }
             }
             if (needsWoodTool) {
+                // ONE scan pass: best remaining durability + carried count (the one-axe
+                // invariant's evidence)
                 int bestAxeRemaining = -1;
+                int axeCarried = 0;
                 for (int aSlot = 0; aSlot < 36; aSlot++) {
                     ItemStack aStack = mc.player.getInventory().getStack(aSlot);
-                    if (!aStack.isEmpty() && aStack.isIn(ItemTags.AXES)) {
-                        bestAxeRemaining = Math.max(bestAxeRemaining, ToolUtils.getRemainingDamage(aStack));
-                    }
-                }
-                // count carried axes in the same scan pass (one-axe invariant evidence)
-                int axeCarried = 0;
-                ItemStack bestAxe = null;
-                for (int aSlot2 = 0; aSlot2 < 36; aSlot2++) {
-                    ItemStack a2 = mc.player.getInventory().getStack(aSlot2);
-                    if (!a2.isEmpty() && a2.isIn(ItemTags.AXES)) {
-                        axeCarried++;
-                        if (bestAxe == null || ToolUtils.getRemainingDamage(a2) > ToolUtils.getRemainingDamage(bestAxe)) bestAxe = a2;
-                    }
+                    if (aStack.isEmpty() || !aStack.isIn(ItemTags.AXES)) continue;
+                    axeCarried++;
+                    bestAxeRemaining = Math.max(bestAxeRemaining, ToolUtils.getRemainingDamage(aStack));
                 }
                 if (bestAxeRemaining < minDurability.get() && axeCarried == 0) {
                     ItemStack axe = null;
@@ -5129,7 +5114,7 @@ public class StepCheckered extends Module implements MapPrinter {
         double nearestDist = Double.MAX_VALUE;
         for (Entity entity : mc.world.getEntities()) {
             if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!itemEntity.groundCollision || itemEntity.cannotPickup() || itemEntity.getOwner() != null) continue;
+            if (!isPickupable(itemEntity)) continue;
             if (itemEntity.getX() < x0 || itemEntity.getX() > x1 + 1) continue;
             if (itemEntity.getZ() < z0 || itemEntity.getZ() > z1 + 1) continue;
             if (itemEntity.getY() < lowerMapCorner.getY() - 3 || itemEntity.getY() > lowerMapCorner.getY() + 5) continue;
@@ -5137,6 +5122,12 @@ public class StepCheckered extends Module implements MapPrinter {
             if (dist < nearestDist) { nearestDist = dist; nearest = itemEntity; }
         }
         return nearest;
+    }
+
+    /** Ground-collided, pickup-able, unowned drop - the ONE filter every item scanner
+     *  shares. (itemCensusInArea deliberately splits these states for its census.) */
+    private boolean isPickupable(ItemEntity itemEntity) {
+        return itemEntity.groundCollision && !itemEntity.cannotPickup() && itemEntity.getOwner() == null;
     }
 
     /** RESET verification logging: counts EVERY ItemEntity in a bounded area, split by
@@ -5205,7 +5196,6 @@ public class StepCheckered extends Module implements MapPrinter {
         batchPassRetries = 0;
         currentBuildPlan = null;
         breakStage = 0;
-        collectingStragglers = false;
         nextBlockPos = null;
         vanillaBreakRetries.clear();
         jamWatchTarget = null;
@@ -5252,7 +5242,6 @@ public class StepCheckered extends Module implements MapPrinter {
         // (north) wastes transit time. Snake direction adapts per column anyway.
         int botRelZ = mc.player != null ? mc.player.getBlockZ() - lowerMapCorner.getZ() : 0;
         resetLadderSeg = botRelZ > 64 ? 4 : (botRelZ > 26 ? 2 : 0);   // nearest of {0, 2, 4}
-        fullSweepBudget = 600;
         queueResetLadder(resetLadderCol, 0);
 
         // Route via the north corridor (never cross the map area diagonally)
@@ -5265,7 +5254,6 @@ public class StepCheckered extends Module implements MapPrinter {
         breakStage = 4;
         fullSweepActive = true;
         sweepBudget = 600;
-        fullSweepCenterChecked = false;
         info("§7RESET ladder (scoped to cols " + resetLadderCol + "-" + resetLadderEndCol
             + "): serpentine passes, each segment confirmed fully clean before the next.");
     }
@@ -5275,11 +5263,11 @@ public class StepCheckered extends Module implements MapPrinter {
      * from the bot's current position. Only checks loaded chunks (render distance).
      */
     private BlockPos findNearestPrintBoxBlock() {
-        return findNearestPrintBoxBlock(java.util.Collections.emptySet());
+        return findNearestPrintBoxBlock(Collections.emptySet());
     }
 
     /** Exclusion-set variant for the distinct-position multi-sender. */
-    private BlockPos findNearestPrintBoxBlock(java.util.Set<BlockPos> exclude) {
+    private BlockPos findNearestPrintBoxBlock(Set<BlockPos> exclude) {
         if (mc.world == null || mc.player == null || lowerMapCorner == null) return null;
         BlockPos best = null;
         double bestDist = Double.MAX_VALUE;
@@ -5315,11 +5303,7 @@ public class StepCheckered extends Module implements MapPrinter {
         return best;   // null = nothing in range
     }
 
-    /** Checks if the print box is completely empty (all air) within loaded chunks. */
-    private boolean printBoxEmptyInRange() {
-        return findNearestPrintBoxBlock() == null;
-    }
-
+    /** Count of plan blocks still standing (not air) in the live world. */
     private int countRemainingPlanBlocks() {
         if (currentBuildPlan == null) return 0;
         int count = 0;
@@ -5336,12 +5320,12 @@ public class StepCheckered extends Module implements MapPrinter {
      *  blacklisted for this batch (unreachable) and skipped. */
     private ItemEntity nearestCollectTarget() {
         if (mc.world == null || mc.player == null) return null;
-        int westX = lowerMapCorner.getX() + 2 * Math.max(currentBatch, 0);
+        int westX = batchWindowWestX();
         ItemEntity best = null, bestAny = null;
         double bestDist = Double.MAX_VALUE, bestAnyDist = Double.MAX_VALUE;
         for (Entity entity : mc.world.getEntities()) {
             if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!itemEntity.groundCollision || itemEntity.cannotPickup() || itemEntity.getOwner() != null) continue;
+            if (!isPickupable(itemEntity)) continue;
             if (itemEntity.getX() < westX - 4 || itemEntity.getX() > westX + 7) continue;
             if (itemEntity.getZ() < lowerMapCorner.getZ() - 3 || itemEntity.getZ() > lowerMapCorner.getZ() + 129) continue;
             if (itemEntity.getY() < lowerMapCorner.getY() - 3 || itemEntity.getY() > lowerMapCorner.getY() + 5) continue;
@@ -5517,19 +5501,13 @@ public class StepCheckered extends Module implements MapPrinter {
      *  here - the repair path places them from lane -1 while walking north (different
      *  vantage), then one more lane 2 pass, before the break(2) wait. */
     private void verifyPrintPass() {
-        int missing = 0;
-        int wrong = 0;
-        for (Map.Entry<BlockPos, Block> entry : currentBuildPlan.entrySet()) {
-            BlockState worldState = miningBlockState(entry.getKey());
-            if (worldState.isAir()) missing++;
-            else if (!worldState.getBlock().equals(entry.getValue())) wrong++;
-        }
-        if (missing == 0 && wrong == 0) {
+        int[] defects = planDefects();
+        if (defects[0] == 0 && defects[1] == 0) {
             info("§aBatch " + currentBatch + " printed: §b" + currentBuildPlan.size() + "§7 blocks placed (world-verified).");
             return;
         }
         printRepairPending = true;
-        info("§eBatch " + currentBatch + " print has §c" + missing + "§e missing / §c" + wrong + "§e wrong - repairing from lane -1 on the way north, then one more lane 2 pass.");
+        info("§eBatch " + currentBatch + " print has §c" + defects[0] + "§e missing / §c" + defects[1] + "§e wrong - repairing from lane -1 on the way north, then one more lane 2 pass.");
     }
 
     /** Strict world-truth gate used by priming and closing, where a repair route is undefined. */
@@ -5539,15 +5517,9 @@ public class StepCheckered extends Module implements MapPrinter {
             state = State.StandBy;
             return false;
         }
-        int missing = 0;
-        int wrong = 0;
-        for (Map.Entry<BlockPos, Block> entry : currentBuildPlan.entrySet()) {
-            BlockState worldState = miningBlockState(entry.getKey());
-            if (worldState.isAir()) missing++;
-            else if (!worldState.getBlock().equals(entry.getValue())) wrong++;
-        }
-        if (missing == 0 && wrong == 0) return true;
-        error(label + " placement incomplete: " + missing + " missing, " + wrong + " wrong. Stopped.");
+        int[] defects = planDefects();
+        if (defects[0] == 0 && defects[1] == 0) return true;
+        error(label + " placement incomplete: " + defects[0] + " missing, " + defects[1] + " wrong. Stopped.");
         state = State.StandBy;
         Utils.setForwardPressed(false);
         return false;
@@ -5555,6 +5527,21 @@ public class StepCheckered extends Module implements MapPrinter {
 
     /** Strict check after the repair passes: proceed or stop for diagnosis. */
     private boolean verifyPrintPass2() {
+        int[] defects = planDefects();
+        if (defects[0] == 0 && defects[1] == 0) {
+            info("§aBatch " + currentBatch + " repair complete - plan fully placed.");
+            return true;
+        }
+        error("Batch " + currentBatch + " print still incomplete after the repair passes: " + defects[0] + " missing, " + defects[1] + " wrong. Stopped for diagnosis.");
+        state = State.StandBy;
+        Utils.setForwardPressed(false);
+        return false;
+    }
+
+    /** {missing, wrong} counts of the active plan against the live world - the ONE
+     *  shared scan behind every placement-verification gate (pre-dedup copies drifted
+     *  and could disagree about the same pass). */
+    private int[] planDefects() {
         int missing = 0;
         int wrong = 0;
         for (Map.Entry<BlockPos, Block> entry : currentBuildPlan.entrySet()) {
@@ -5562,14 +5549,7 @@ public class StepCheckered extends Module implements MapPrinter {
             if (worldState.isAir()) missing++;
             else if (!worldState.getBlock().equals(entry.getValue())) wrong++;
         }
-        if (missing == 0 && wrong == 0) {
-            info("§aBatch " + currentBatch + " repair complete - plan fully placed.");
-            return true;
-        }
-        error("Batch " + currentBatch + " print still incomplete after the repair passes: " + missing + " missing, " + wrong + " wrong. Stopped for diagnosis.");
-        state = State.StandBy;
-        Utils.setForwardPressed(false);
-        return false;
+        return new int[]{missing, wrong};
     }
 
     /** break(2) completeness: Y2/Y3 of the window's west 2 lanes must be gone. */
@@ -5651,6 +5631,11 @@ public class StepCheckered extends Module implements MapPrinter {
             }
         }
         return best;
+    }
+
+    /** Queue the given chest at the HEAD of the route as the next deposit stop. */
+    private void queueDepositChestAtHead(Pair<BlockPos, Vec3d> chest) {
+        checkpoints.add(0, new Pair(chest.getRight(), new Pair("depositBuilding", chest.getLeft())));
     }
 
     private boolean containsChest(ArrayList<Pair<BlockPos, Vec3d>> chests, BlockPos pos) {
@@ -5737,9 +5722,7 @@ public class StepCheckered extends Module implements MapPrinter {
         checkpoints.clear();
 
         if (savedStage == 0) {
-            HashMap<Item, Integer> requiredItems = getRequiredItems();
-            Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInfo = Utils.getInvInformation(requiredItems, availableSlots);
-            refillBuildingInventory(invInfo.getRight());
+            refillFromCurrentPlan();
         }
         if (needPickaxe && !hasAnyPickaxe() && !toolSet.isEmpty()) {
             for (ItemStack tool : toolSet) {
@@ -5850,8 +5833,7 @@ public class StepCheckered extends Module implements MapPrinter {
         int remainingBlocks = countRemainingPlanBlocks();
         int groundItems = countGroundItemsInWindow();
         int[] census = itemCensusInBatchWindow();
-        int pendBrk = countPendingInRange(lowerMapCorner.getX() + 2 * Math.max(currentBatch, 0) - 2,
-            lowerMapCorner.getX() + 2 * Math.max(currentBatch, 0) + 5,
+        int pendBrk = countPendingInRange(batchWindowWestX() - 2, batchWindowWestX() + 5,
             lowerMapCorner.getZ() - 3, lowerMapCorner.getZ() + 129);
         int inFlight = census[1] + census[2];
         if (remainingBlocks == 0 && groundItems == 0 && census[0] == 0) {
@@ -5878,7 +5860,6 @@ public class StepCheckered extends Module implements MapPrinter {
             sweepWaitRounds = 0;
             sweepWaitLogged = false;
             sweepReArmSig = null;
-            collectingStragglers = false;
             info("§6[SWEEP-VERIFY]§7 batch " + currentBatch + " gate: blocks=0 items=0 census[ready="
                 + census[0] + " falling=" + census[1] + " pickupDelay=" + census[2] + " owned=" + census[3]
                 + "] pendBrk=" + pendBrk + " vanillaQ=" + needsVanillaBreak.size());
@@ -5918,7 +5899,6 @@ public class StepCheckered extends Module implements MapPrinter {
         else batchPassRetries = Math.max(0, batchPassRetries - 1);
         if (remainingBlocks > 0 || groundItems > 0 || inFlight > 0) {
             if (batchPassRetries < 8) {
-                collectingStragglers = true;
                 sweepBudget = 200;   // ~10 seconds of combined sweep
                 checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("sweepTick", null)));
                 state = State.Walking;
@@ -5936,7 +5916,6 @@ public class StepCheckered extends Module implements MapPrinter {
         sweepWaitRounds = 0;
         sweepWaitLogged = false;
         sweepReArmSig = null;
-        collectingStragglers = false;
         info("§aBatch " + currentBatch + " COMPLETE: printed and fully recycled.");
         int doneBatch = currentBatch;
         currentBuildPlan = null;
@@ -5949,8 +5928,13 @@ public class StepCheckered extends Module implements MapPrinter {
     /** Batch-window item census {ready, falling, pickupDelay, owned} — same states the
      *  RESET census uses, over the batch's recycling window incl. its item margin. */
     private int[] itemCensusInBatchWindow() {
-        int westX = lowerMapCorner.getX() + 2 * Math.max(currentBatch, 0);
+        int westX = batchWindowWestX();
         return itemCensusInArea(westX - 4, westX + 6, lowerMapCorner.getZ() - 3, lowerMapCorner.getZ() + 129);
+    }
+
+    /** West lane x of the current batch's 4-lane recycling window (world coords). */
+    private int batchWindowWestX() {
+        return lowerMapCorner.getX() + 2 * Math.max(currentBatch, 0);
     }
 
     /** The batch the renderer shows: the ACTIVE batch while a run is in progress,
@@ -5980,7 +5964,7 @@ public class StepCheckered extends Module implements MapPrinter {
         double nearestDist = Double.MAX_VALUE;
         for (Entity entity : mc.world.getEntities()) {
             if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!itemEntity.groundCollision || itemEntity.cannotPickup() || itemEntity.getOwner() != null) continue;
+            if (!isPickupable(itemEntity)) continue;
             if (itemEntity.getX() < lowerMapCorner.getX() - margin || itemEntity.getX() > lowerMapCorner.getX() + 128 + margin) continue;
             if (itemEntity.getZ() < lowerMapCorner.getZ() - margin || itemEntity.getZ() > lowerMapCorner.getZ() + 128 + margin) continue;
             if (itemEntity.getY() < lowerMapCorner.getY() - 3 || itemEntity.getY() > lowerMapCorner.getY() + 5) continue;
@@ -6000,11 +5984,11 @@ public class StepCheckered extends Module implements MapPrinter {
     /** Count ground-collided pickup-able item entities within the current batch window. */
     private int countGroundItemsInWindow() {
         if (mc.world == null || mc.player == null) return 0;
-        int westX = lowerMapCorner.getX() + 2 * Math.max(currentBatch, 0);
+        int westX = batchWindowWestX();
         int count = 0;
         for (Entity entity : mc.world.getEntities()) {
             if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!itemEntity.groundCollision || itemEntity.cannotPickup() || itemEntity.getOwner() != null) continue;
+            if (!isPickupable(itemEntity)) continue;
             if (itemEntity.getX() < westX - 4 || itemEntity.getX() > westX + 7) continue;
             if (itemEntity.getZ() < lowerMapCorner.getZ() - 3 || itemEntity.getZ() > lowerMapCorner.getZ() + 130) continue;
             if (itemEntity.getY() < lowerMapCorner.getY() - 2 || itemEntity.getY() > lowerMapCorner.getY() + 5) continue;
@@ -6015,11 +5999,11 @@ public class StepCheckered extends Module implements MapPrinter {
 
     /** Nearest unplaced plan block within reach that does not intersect the player's body. */
     private BlockPos getNextBatchPlacementPos() {
-        return getNextBatchPlacementPos(java.util.Collections.emptySet());
+        return getNextBatchPlacementPos(Collections.emptySet());
     }
 
     /** Exclusion-set variant: nearest eligible position NOT in `exclude` (multi-place). */
-    private BlockPos getNextBatchPlacementPos(java.util.Set<BlockPos> exclude) {
+    private BlockPos getNextBatchPlacementPos(Set<BlockPos> exclude) {
         if (currentBuildPlan == null) return null;
         // LANE GATE: no printing unless the bot stands centered on the phase's lane-2
         // centerline. Off-center (e.g. after a sweep left it straddling lanes), freshly
@@ -6050,12 +6034,12 @@ public class StepCheckered extends Module implements MapPrinter {
 
     /** break target: nearest still-standing plan block in reach (break(2) = west lanes' Y2/Y3 only). */
     private BlockPos getNextBatchBreakPos() {
-        return getNextBatchBreakPos(java.util.Collections.emptySet());
+        return getNextBatchBreakPos(Collections.emptySet());
     }
 
     /** Exclusion-set variant: returns the nearest eligible target NOT in `exclude` —
      *  lets sendDistinctBreaks pick several DIFFERENT positions per tick. */
-    private BlockPos getNextBatchBreakPos(java.util.Set<BlockPos> exclude) {
+    private BlockPos getNextBatchBreakPos(Set<BlockPos> exclude) {
         if (currentBuildPlan == null) return null;
         boolean break2Only = breakStage == 2;
         int westX = lowerMapCorner.getX() + 2 * currentBatch;
@@ -6078,23 +6062,6 @@ public class StepCheckered extends Module implements MapPrinter {
         ItemStack off = mc.player.getOffHandStack();
         if (off.isEmpty() || !off.contains(DataComponentTypes.FOOD)) return 0;
         return off.getCount();
-    }
-
-    /** Any axe with usable durability currently in the inventory? */
-    private boolean carriesAxe() {
-        for (int slot = 0; slot < 36; slot++) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (!stack.isEmpty() && stack.isIn(ItemTags.AXES) && ToolUtils.getRemainingDamage(stack) >= minDurability.get()) return true;
-        }
-        return false;
-    }
-
-    private boolean hasFoodInInventory() {
-        for (int slot = 0; slot < 36; slot++) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (!stack.isEmpty() && stack.contains(DataComponentTypes.FOOD)) return true;
-        }
-        return false;
     }
 
     /** Finds the pickaxe with the HIGHEST remaining durability in the inventory (no other
@@ -6212,8 +6179,7 @@ public class StepCheckered extends Module implements MapPrinter {
     }
 
     private void finishMineLine() {
-        SlaveSystem.sendMessageToMaster("placeStatus:" + workingInterval.getLeft() + ":"
-            + workingInterval.getRight() + ":" + false + ":" + workOnUpper);
+        sendPlaceStatus(workingInterval.getLeft(), workingInterval.getRight(), false, workOnUpper);
         setMiningFinished();
 
         if (!collectBlocks.get() || isInventoryFull()) return;
@@ -6251,7 +6217,19 @@ public class StepCheckered extends Module implements MapPrinter {
     private void setLineFinished(int xStart, int xEnd, boolean placed, boolean isUpper) {
         xEnd = Math.min(workingInterval.getRight(), xEnd);
         SlaveSystem.mapCompletionState.setInterval(xStart, xEnd, placed, isUpper);
-        SlaveSystem.sendMessageToMaster("placeStatus:" + xStart + ":" +xEnd + ":" + placed + ":" + isUpper);
+        sendPlaceStatus(xStart, xEnd, placed, isUpper);
+    }
+
+    /** Slave->master placement progress. The long variant carries the z progress window
+     *  [startZ, endZ]; the 4-field variant implies the whole line (both parsed by
+     *  SlaveSystem's placeStatus handler). */
+    private void sendPlaceStatus(int xStart, int xEnd, int startZ, int endZ, boolean placed, boolean isUpper) {
+        SlaveSystem.sendMessageToMaster("placeStatus:" + xStart + ":" + xEnd + ":"
+            + startZ + ":" + endZ + ":" + placed + ":" + isUpper);
+    }
+
+    private void sendPlaceStatus(int xStart, int xEnd, boolean placed, boolean isUpper) {
+        SlaveSystem.sendMessageToMaster("placeStatus:" + xStart + ":" + xEnd + ":" + placed + ":" + isUpper);
     }
 
     private void setMiningFinished() {
@@ -7149,15 +7127,11 @@ public class StepCheckered extends Module implements MapPrinter {
         AwaitDepositResponse,
         AwaitBreakPermission2,
         AwaitBreakPermissionAll,
-        MasterWaitBuild,
-        MasterDwell,
         AwaitClosingBreak,
         AwaitCartographyResponse,
         AwaitNBTFile,
-        AwaitBlockBreak,
         AwaitPlacedSuppression,
         AwaitMinedSuppression,
-        AwaitMasterAllCleared,
         AwaitSlaveContinue,
         StandBy,
         Walking,
