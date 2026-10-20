@@ -568,7 +568,8 @@ public class StepCheckered extends Module implements MapPrinter {
     String lastMasterCpLog;                                         // dedup for the always-on master checkpoint log
     int stepSavedProgressMapId = -1;                                // map id persisted with the progress file (crash/restart resume)
     long stepBatchStartMs, stepPhaseStartMs;                        // per-batch phase timing (logged at completion)
-    int cachedResumeBatch = -1;                                     // in-memory mirror of the progress file's batch (idle render + resume UI)
+    int cachedResumeBatch = -1;
+    int mapHoldWarnCooldown;                                        // throttle for the map-hold guard warning                                     // in-memory mirror of the progress file's batch (idle render + resume UI)
     long stepBuildMs, stepW1Ms, stepBreak2Ms, stepW2Ms, stepBreakAllMs;
     String resetStallSig;                                           // reset arrival stall detector: last arrival state signature
     int resetStallRounds;
@@ -3436,9 +3437,13 @@ public class StepCheckered extends Module implements MapPrinter {
 
     private void stepTryQueuePendingSweep() {
         if (!stepSweepQueuePending) return;
-        if (!stepEnsureMapHeld()) {
+        // PRESENCE only - the map must EXIST, never be HELD here. Holding happens at
+        // the first stepDwell arrival; the walk to the station is map-free (holding
+        // during transit re-records pixels - the resume-path bug, live 2026-10-20).
+        if (stepWorkingMapId < 0) stepPinWorkingMap();
+        if (stepWorkingMapId < 0 || stepFindWorkingMapSlot() < 0) {
             if (++stepMasterWaitTicks > 100) {
-                abortStepMaster("working map could not be held");
+                abortStepMaster("working map is missing from the inventory");
             }
             return;
         }
@@ -3520,6 +3525,7 @@ public class StepCheckered extends Module implements MapPrinter {
 
     /** Client-thread master scheduler.  This intentionally bypasses the legacy printer loop. */
     private void tickStepMaster() {
+        if (mapHoldWarnCooldown > 0) mapHoldWarnCooldown--;
         // Wait bookkeeping FIRST, before every pause gate: the requeue cycle keeps
         // timeoutTicks > 0 for ~20 of 21 ticks, so counting the wait further down
         // stretched a "30s" heartbeat to ~10 real minutes (observed live 2026-10-20:
@@ -3696,6 +3702,22 @@ public class StepCheckered extends Module implements MapPrinter {
                 }
             }
             default -> { }
+        }
+
+        // MAP-HOLD GUARD (user rule, 2026-10-20): while the module is enabled, the
+        // filled working map may ONLY be held during a sweep dwell - moving with it
+        // in hand re-records pixels and ruins progress. Any other hold (including the
+        // user selecting it manually) is cancelled and logged.
+        if (stepMasterDwellTicks <= 0 && !controlHoldActive) {
+            Integer heldId = mapIdOf(mc.player.getMainHandStack());
+            if (heldId != null && heldId == stepWorkingMapId) {
+                stepStowMap();
+                if (mapHoldWarnCooldown <= 0) {
+                    mapHoldWarnCooldown = 100;
+                    warning("§cHolding the filled map is NOT allowed while the module is enabled - "
+                        + "moving with it re-records pixels and ruins progress. Map stowed.");
+                }
+            }
         }
 
         if (stepMasterStage == StepMasterStage.WAIT_CLOSING_BREAK && stepSlaveClosingDone) {
