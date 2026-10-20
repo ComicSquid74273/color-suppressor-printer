@@ -566,6 +566,8 @@ public class StepCheckered extends Module implements MapPrinter {
     HashMap<BlockPos, Integer> placementAttempts;                    // per-position placement attempts (adaptive-pace cap)
     int placeHoldTicks;                                              // consecutive adaptive-pace hold ticks (watchdog)
     int breakHoldTicks;                                              // consecutive break-pace hold ticks (watchdog)
+    int rateTick;                                                   // 20-tick rate-report cycle
+    int breakSentPerSec, breakConfirmedPerSec, placeSentPerSec;      // [RATE] verification counters
     java.util.HashMap<BlockPos, Integer> collectSkips;               // collection run: picks per drop (10 = blacklisted)
     int breakHoldSuppression;                                        // ticks to skip break-pace holding after a watchdog release
     // BREAK CONFIRMATION: fastBreak sends packets but the server's block-update
@@ -1787,6 +1789,14 @@ public class StepCheckered extends Module implements MapPrinter {
         // those ticks — failed fastBreaks then NEVER reached the vanilla fallback.
         // Confirmed (now air) → remove. Expired + still solid → needsVanillaBreak.
         breakSweepActedThisTick = false;
+        if (++rateTick >= 20) {
+            rateTick = 0;
+            if (breakSentPerSec > 0 || breakConfirmedPerSec > 0 || placeSentPerSec > 0) {
+                info("§d[RATE]§7 break §f" + breakSentPerSec + "/s sent §a" + breakConfirmedPerSec
+                    + "/s confirmed§7 | place §f" + placeSentPerSec + "/s sent§7");
+            }
+            breakSentPerSec = 0; breakConfirmedPerSec = 0; placeSentPerSec = 0;
+        }
         if (!breakPending.isEmpty()) {
             int confirmedThisTick = 0, expiredThisTick = 0;
             java.util.Iterator<BlockPos> pendingIt = breakPending.keySet().iterator();
@@ -1815,6 +1825,7 @@ public class StepCheckered extends Module implements MapPrinter {
                     breakPending.put(pending, ticksLeft);
                 }
             }
+            breakConfirmedPerSec += confirmedThisTick;
             if (debugPrints.get() && (confirmedThisTick + expiredThisTick) > 0) {
                 info("§3[dbg] break-confirmation: §aserver-confirmed=" + confirmedThisTick
                     + "§3 expired-to-vanilla=§e" + expiredThisTick
@@ -1833,30 +1844,10 @@ public class StepCheckered extends Module implements MapPrinter {
                 state = State.Mining;
 
             } else {
-                // Break up to breaks-per-tick blocks per game tick. During the full-sweep
-                // (RESET), currentBuildPlan is null so subsequent targets come from the
-                // world scan instead of the plan.
-                for (int broken = 0; broken < breaksPerTick.get(); broken++) {
-                    BlockPos breakTarget;
-                    if (broken == 0) {
-                        breakTarget = nextBlockPos;
-                    } else if (fullSweepActive) {
-                        breakTarget = findNearestPrintBoxBlock();
-                    } else {
-                        breakTarget = getNextBatchBreakPos();
-                    }
-                    if (breakTarget == null) break;
-                    if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
-                    // Confirmation guard: a fastBreak already sent for this pos is still
-                    // awaiting the server's block-update. Re-sending START/STOP every tick
-                    // resets the server's elapsed-time validation — which is what starved
-                    // the vanilla fallback on multi-tick blocks before.
-                    if (breakPending.containsKey(breakTarget)) break;
-                    nextBlockPos = breakTarget;
-                    sendHybridBreak(breakTarget);
-                    breakSweepActedThisTick = true;
-                    if (!miningBlockState(breakTarget).isAir()) break;  // server didn't accept, stop
-                }
+                // Distinct-position multi-send (25-30/s target): the per-tick stop-after-
+                // one pacing was the rate cap - the client cannot see confirmations
+                // within the same tick. See sendDistinctBreaks.
+                sendDistinctBreaks(breaksPerTick.get(), fullSweepActive);
 
                 if (state.equals(State.AwaitBlockBreak)) {
                     Utils.setForwardPressed(false);
@@ -2533,20 +2524,24 @@ public class StepCheckered extends Module implements MapPrinter {
 
         if (state.equals(State.Walking)) {
             if (breakStage == 0 && currentBuildPlan != null) {
-                // Place up to blocks-per-tick blocks per game tick. Each iteration
-                // re-targets the nearest eligible block behind the bot. Adds a
-                // cooldown to each attempted position (litematica-style) so failed
-                // placements don't get hammered repeatedly in the same tick window.
-                for (int placed = 0; placed < blocksPerTick.get(); placed++) {
-                    BlockPos target = getNextBatchPlacementPos();
+                // DISTINCT-POSITION MULTI-PLACE (user target: 25-30 places/s). The old
+                // loop stopped after one place: the client cannot see the server's
+                // placement echo for 1-2 ticks, so the air-check always failed and
+                // broke the loop (~10-12/s cap). Now: send up to blocksPerTick
+                // DIFFERENT positions per tick (each on a 4-tick cooldown), stop only
+                // on a swap/restock need.
+                java.util.HashSet<BlockPos> attempted = new java.util.HashSet<>();
+                int placed = 0;
+                for (int pick = 0; pick < blocksPerTick.get() * 3 && placed < blocksPerTick.get(); pick++) {
+                    BlockPos target = getNextBatchPlacementPos(attempted);
                     if (target == null) break;
+                    attempted.add(target);
                     nextBlockPos = target;
                     placementCooldowns.put(target, 4);  // ~0.2s before retry
                     placementAttempts.merge(target, 1, Integer::sum);  // adaptive-pace cap
-                    tryPlacingBlock();
-                    // Stop if the block didn't land (swap/restock path triggered)
-                    if (!miningBlockState(target).isAir()) continue;  // placed, next
-                    break;  // not placed — stop and let the tick handle the swap/restock
+                    int code = tryPlacingBlock();
+                    if (code == 1) { placed++; placeSentPerSec++; }
+                    else break;  // swap pending or material missing — tick handles it
                 }
             } else if (breakStage == 0) {
                 tryPlacingBlock();  // legacy path (no batch plan)
@@ -2578,21 +2573,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 // this tick: both loops acting on the same target doubles the packets and
                 // re-resets server break-progress on vanilla targets.
                 if (breakSweepActedThisTick) return;
-                for (int broken = 0; broken < breaksPerTick.get(); broken++) {
-                    BlockPos breakTarget;
-                    if (broken == 0) {
-                        breakTarget = nextBlockPos;
-                    } else if (fullSweepActive && currentBuildPlan == null) {
-                        breakTarget = findNearestPrintBoxBlock();
-                    } else {
-                        breakTarget = getNextBatchBreakPos();
-                    }
-                    if (breakTarget == null) break;
-                    if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
-                    if (breakPending.containsKey(breakTarget)) break;
-                    nextBlockPos = breakTarget;
-                    sendHybridBreak(breakTarget);
-                }
+                sendDistinctBreaks(breaksPerTick.get(), fullSweepActive && currentBuildPlan == null);
                 return;
             }
             BlockState blockState = mc.world.getBlockState(nextBlockPos);
@@ -2867,6 +2848,38 @@ public class StepCheckered extends Module implements MapPrinter {
         return false;
     }
 
+    /** DISTINCT-POSITION MULTI-SEND (user target: 25-30 breaks/s). The old loop
+     *  stopped after ONE send because the client cannot see the server's confirmation
+     *  for 1-2 ticks - capping the rate at ~10-12/s. The pending-confirmation guard
+     *  is PER-POSITION: sending N DIFFERENT positions in the same tick is safe (no
+     *  re-send of a pending position ever happens). This sends up to maxSends distinct
+     *  in-range targets per tick, skipping pending ones via the exclusion set.
+     *  @return number of break actions sent this tick */
+    private int sendDistinctBreaks(int maxSends, boolean fullSweep) {
+        java.util.HashSet<BlockPos> attempted = new java.util.HashSet<>();
+        int sent = 0;
+        for (int pick = 0; pick < maxSends * 3 && sent < maxSends; pick++) {
+            BlockPos breakTarget;
+            if (pick == 0 && nextBlockPos != null && !attempted.contains(nextBlockPos)) {
+                breakTarget = nextBlockPos;
+            } else if (fullSweep) {
+                breakTarget = findNearestPrintBoxBlock(attempted);
+            } else {
+                breakTarget = getNextBatchBreakPos(attempted);
+            }
+            if (breakTarget == null) break;                       // no more distinct candidates
+            attempted.add(breakTarget);
+            if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
+            if (breakPending.containsKey(breakTarget)) continue;  // awaiting server confirm - next distinct
+            nextBlockPos = breakTarget;
+            sendHybridBreak(breakTarget);
+            sent++;
+            breakSentPerSec++;
+        }
+        if (sent > 0) breakSweepActedThisTick = true;
+        return sent;
+    }
+
     /** HYBRID BREAK SEND - the ONE copy of the break rules. One fastBreak per position
      *  per confirmation window (re-sending START/STOP every tick resets the server's
      *  elapsed-time validation); blocks fastBreak already failed on progress through
@@ -2894,11 +2907,15 @@ public class StepCheckered extends Module implements MapPrinter {
         return false;
     }
 
-    private void tryPlacingBlock() {
+    /** @return 1 = placement sent (hotbar hit), 0 = swap pending, -1 = material missing
+     *  (swap/restock already triggered). The multi-place loop uses the code to keep
+     *  sending distinct positions while material is in the hotbar and stop cleanly
+     *  on a swap. */
+    private int tryPlacingBlock() {
         Item material;
         if (currentBuildPlan != null) {
             Block planned = currentBuildPlan.get(nextBlockPos);
-            if (planned == null) return;
+            if (planned == null) return -1;
             material = planned.asItem();
             // PLACEMENT DIAGNOSTIC: log every batch placement with its lane (x), layer (y,
             // 99-102) and z relative to the bot — positive dz = AHEAD (south).
@@ -2929,7 +2946,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hitResult);
                 mc.player.swingHand(Hand.MAIN_HAND);
                 if (material == lastSwappedMaterial) lastSwappedMaterial = null;
-                return;
+                return 1;
             }
         }
         for (int slot : availableSlots) {
@@ -2940,14 +2957,14 @@ public class StepCheckered extends Module implements MapPrinter {
                 toBeSwappedSlot = slot;
                 Utils.setForwardPressed(false);
                 timeoutTicks = preSwapDelay.get();
-                return;
+                return 0;
             }
         }
-        if (lastSwappedMaterial == material) return;      //Wait for swapped material
+        if (lastSwappedMaterial == material) return 0;    //Wait for swapped material
         if (currentBuildPlan != null) {
             // Mid-print supply run: refill the missing material via the north checkpoint
             pauseForRestockTrip(false);
-            return;
+            return -1;
         }
         if (debugPrints.get()) info("No " + material.getName().getString() + " found in inventory. Resetting...");
         Vec3d pathCheckpoint = new Vec3d(mc.player.getX(), lowerMapCorner.getY(), lowerMapCorner.north().toCenterPos().getZ());
@@ -2963,6 +2980,7 @@ public class StepCheckered extends Module implements MapPrinter {
             buildPath(true, true);
         }
         checkpoints.addFirst(new Pair(pathCheckpoint, new Pair("calculateRefill", null)));
+        return -1;
     }
 
     private BlockPos getNextPlacementPos(boolean movingSouth) {
@@ -4881,6 +4899,11 @@ public class StepCheckered extends Module implements MapPrinter {
      * from the bot's current position. Only checks loaded chunks (render distance).
      */
     private BlockPos findNearestPrintBoxBlock() {
+        return findNearestPrintBoxBlock(java.util.Collections.emptySet());
+    }
+
+    /** Exclusion-set variant for the distinct-position multi-sender. */
+    private BlockPos findNearestPrintBoxBlock(java.util.Set<BlockPos> exclude) {
         if (mc.world == null || mc.player == null || lowerMapCorner == null) return null;
         BlockPos best = null;
         double bestDist = Double.MAX_VALUE;
@@ -4904,7 +4927,7 @@ public class StepCheckered extends Module implements MapPrinter {
                     if (z < lowerMapCorner.getZ() - 1 || z >= lowerMapCorner.getZ() + 128) continue;
                     for (int y = y0; y <= y1; y++) {
                         BlockPos pos = new BlockPos(x, y, z);
-                        if (!miningBlockState(pos).isAir()) {
+                        if (!miningBlockState(pos).isAir() && !exclude.contains(pos)) {
                             double dist = eye.distanceTo(pos.toCenterPos());
                             if (dist < bestDist) { bestDist = dist; best = pos; }
                         }
@@ -5611,6 +5634,11 @@ public class StepCheckered extends Module implements MapPrinter {
 
     /** Nearest unplaced plan block within reach that does not intersect the player's body. */
     private BlockPos getNextBatchPlacementPos() {
+        return getNextBatchPlacementPos(java.util.Collections.emptySet());
+    }
+
+    /** Exclusion-set variant: nearest eligible position NOT in `exclude` (multi-place). */
+    private BlockPos getNextBatchPlacementPos(java.util.Set<BlockPos> exclude) {
         if (currentBuildPlan == null) return null;
         // LANE GATE: no printing unless the bot stands centered on the phase's lane-2
         // centerline. Off-center (e.g. after a sweep left it straddling lanes), freshly
@@ -5624,6 +5652,7 @@ public class StepCheckered extends Module implements MapPrinter {
         double bestDist = Double.MAX_VALUE;
         for (BlockPos pos : currentBuildPlan.keySet()) {
             if (!miningBlockState(pos).isAir()) continue;
+            if (exclude.contains(pos)) continue;
             // Skip positions on placement cooldown (litematica-style: don't hammer the
             // same failed block — let the timeout expire, then retry)
             if (placementCooldowns.getOrDefault(pos, 0) > 0) continue;
@@ -5640,6 +5669,12 @@ public class StepCheckered extends Module implements MapPrinter {
 
     /** break target: nearest still-standing plan block in reach (break(2) = west lanes' Y2/Y3 only). */
     private BlockPos getNextBatchBreakPos() {
+        return getNextBatchBreakPos(java.util.Collections.emptySet());
+    }
+
+    /** Exclusion-set variant: returns the nearest eligible target NOT in `exclude` —
+     *  lets sendDistinctBreaks pick several DIFFERENT positions per tick. */
+    private BlockPos getNextBatchBreakPos(java.util.Set<BlockPos> exclude) {
         if (currentBuildPlan == null) return null;
         boolean break2Only = breakStage == 2;
         int westX = lowerMapCorner.getX() + 2 * currentBatch;
@@ -5647,6 +5682,7 @@ public class StepCheckered extends Module implements MapPrinter {
         double bestDist = Double.MAX_VALUE;
         for (BlockPos pos : currentBuildPlan.keySet()) {
             if (miningBlockState(pos).isAir()) continue;
+            if (exclude.contains(pos)) continue;
             if (break2Only && (pos.getX() >= westX + 2 || pos.getY() < lowerMapCorner.getY() + 2)) continue;
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist > interactionRange.get()) continue;
