@@ -37,6 +37,8 @@ import java.util.function.Predicate;
  */
 final class StepMaster {
     final StepCheckered mod;
+    final MapLifecycle maps;
+    final CartographyLock lock;
 
     // --- Master run state (moved from the module) ---
     volatile StepMasterStage stepMasterStage = StepMasterStage.IDLE;
@@ -56,14 +58,6 @@ final class StepMaster {
     volatile int stepSlaveDoneBatch = -1;
     volatile boolean stepSlaveReadyClosing;
     volatile boolean stepSlaveClosingDone;
-    int stepWorkingMapId = -1;
-    boolean stepMapSwapPending;
-    int stepMapSwapAge;
-    int stepLockStep = -1;
-    int stepLockDelay;
-    boolean controlHoldActive;
-    boolean controlSwapPending;
-    int controlUseCooldown;
     String lastMasterCpLog;
     int stepSavedProgressMapId = -1;
     long stepBatchStartMs, stepPhaseStartMs;
@@ -75,6 +69,8 @@ final class StepMaster {
 
     StepMaster(StepCheckered mod) {
         this.mod = mod;
+        maps = new MapLifecycle(mod);
+        lock = new CartographyLock(mod);
     }
 
     /** Full master-state reset (module onActivate path). */
@@ -96,14 +92,14 @@ final class StepMaster {
         stepMasterBreak2Sent = false;
         stepMasterBreakAllSent = false;
         stepMasterCloseBreakSent = false;
-        stepWorkingMapId = -1;
-        stepMapSwapPending = false;
-        stepMapSwapAge = 0;
-        stepLockStep = -1;
-        stepLockDelay = 0;
-        controlHoldActive = false;
-        controlSwapPending = false;
-        controlUseCooldown = 0;
+        maps.stepWorkingMapId = -1;
+        maps.stepMapSwapPending = false;
+        maps.stepMapSwapAge = 0;
+        lock.stepLockStep = -1;
+        lock.stepLockDelay = 0;
+        maps.controlHoldActive = false;
+        maps.controlSwapPending = false;
+        maps.controlUseCooldown = 0;
         lastMasterCpLog = null;
         stepSavedProgressMapId = -1;
         cachedResumeBatch = -1;
@@ -133,10 +129,10 @@ final class StepMaster {
         stepSlaveDoneBatch = -1;
         stepSlaveReadyClosing = false;
         stepSlaveClosingDone = false;
-        stepMapSwapPending = false;
-        stepStowMap();
+        maps.stepMapSwapPending = false;
+        maps.stepStowMap();
 
-        if (stepFindWorkingMapSlot() >= 0) {
+        if (maps.stepFindWorkingMapSlot() >= 0) {
             // CRASH/RESTART/DISABLE RECOVERY: the progress file carries the last
             // in-progress batch AND the working map's id. Resume re-pins the EXACT
             // saved map (never just any filled map - a wrong map would corrupt the
@@ -144,7 +140,7 @@ final class StepMaster {
             int resumeBatch = loadStepProgress();
             if (resumeBatch > 0) {
                 if (stepSavedProgressMapId >= 0) {
-                    int savedSlot = stepFindMapIdSlot(stepSavedProgressMapId);
+                    int savedSlot = maps.stepFindMapIdSlot(stepSavedProgressMapId);
                     if (savedSlot < 0) {
                         mod.error("§cProgress file says batch " + resumeBatch + " on map id " + stepSavedProgressMapId
                             + ", but that map is NOT in the inventory - the recorded pixels cannot be recovered. "
@@ -153,19 +149,19 @@ final class StepMaster {
                         beginStepPrimingRun();
                         return;
                     }
-                    stepWorkingMapId = stepSavedProgressMapId;
-                    mod.info("§aWorking map re-pinned by saved id=" + stepWorkingMapId + ".");
+                    maps.stepWorkingMapId = stepSavedProgressMapId;
+                    mod.info("§aWorking map re-pinned by saved id=" + maps.stepWorkingMapId + ".");
                 } else {
-                    stepPinWorkingMap();   // legacy progress file without map id
+                    maps.stepPinWorkingMap();   // legacy progress file without map id
                 }
                 mod.info("§aStep-checker: resuming from batch " + resumeBatch + " (progress file).");
                 stepMasterBatch = resumeBatch - 1;
                 beginStepBatch(resumeBatch);
             } else {
-                stepPinWorkingMap();
+                maps.stepPinWorkingMap();
                 beginStepPrimingRun();
             }
-        } else if (findEmptyMapSlot() >= 0) {
+        } else if (maps.findEmptyMapSlot() >= 0) {
             beginStepMapFill();
         } else {
             // No map in inventory: walk to the map chest and fetch one
@@ -200,8 +196,8 @@ final class StepMaster {
         stepMasterBatch = -1;
         mod.checkpoints.clear();
         mod.state = State.StandBy;
-        stepStowMap();
-        stepWorkingMapId = -1;
+        maps.stepStowMap();
+        maps.stepWorkingMapId = -1;
         Utils.setForwardPressed(false);
         mod.info("§aReset complete. Enable the module again to start a fresh run.");
     }
@@ -217,7 +213,7 @@ final class StepMaster {
         mod.checkpoints.add(new Pair<>(fillSpot, new Pair<>("stepFillMap", null)));
         prependLatticeTransit(fillSpot.x, fillSpot.z);
         mod.state = State.Walking;
-        stepStowMap();
+        maps.stepStowMap();
         mod.info("§aStep-checker: walking to the fill checkpoint for the working map.");
     }
 
@@ -253,7 +249,7 @@ final class StepMaster {
         stepMasterBreakAllSent = false;
         stepSendToSlave("prime");
         stepQueueWaitHere("stepBatchSafe");
-        stepStowMap();
+        maps.stepStowMap();
         mod.info("§aBatch 0 phase 1 (floor half): build requested; waiting in place.");
     }
 
@@ -283,7 +279,7 @@ final class StepMaster {
             // the priming walk merge): floor via the split flow if entered directly.
             stepSendToSlave("buildhalf:0:f");
             stepQueueWaitHere("stepBatchSafe");
-            stepStowMap();
+            maps.stepStowMap();
             mod.info("§aStep-checker batch 0: SPLIT build (floor half) requested; waiting in place.");
             return;
         }
@@ -291,7 +287,7 @@ final class StepMaster {
         // Build wait: IN PLACE at the nearest platform (the previous batch's W2 already
         // ended on this batch's W1 lane) - map stowed, no repositioning leg
         stepQueueWaitHere("stepBatchSafe");
-        stepStowMap();
+        maps.stepStowMap();
         mod.info("§aStep-checker batch " + batch + " build requested; waiting in place.");
     }
 
@@ -301,7 +297,7 @@ final class StepMaster {
         stepSlaveReadyClosing = false;
         stepSendToSlave("close");
         stepQueueWaitHere("stepClosingSafe");
-        stepStowMap();
+        maps.stepStowMap();
         mod.info("§aStep-checker closing pair 63 build requested; waiting in place.");
     }
 
@@ -396,8 +392,8 @@ final class StepMaster {
         // PRESENCE only - the map must EXIST, never be HELD here. Holding happens at
         // the first stepDwell arrival; the walk to the station is map-free (holding
         // during transit re-records pixels - the resume-path bug, live 2026-10-20).
-        if (stepWorkingMapId < 0) stepPinWorkingMap();
-        if (stepWorkingMapId < 0 || stepFindWorkingMapSlot() < 0) {
+        if (maps.stepWorkingMapId < 0) maps.stepPinWorkingMap();
+        if (maps.stepWorkingMapId < 0 || maps.stepFindWorkingMapSlot() < 0) {
             if (++stepMasterWaitTicks > 100) {
                 abortStepMaster("working map is missing from the inventory");
             }
@@ -417,7 +413,7 @@ final class StepMaster {
                     // so the build is split around W1): W1 recorded the floor+borrow clean.
                     // Request the TOPS half now; W2 (on 127) records them. No break(2) for
                     // batch 0 - W2 IS the tops' first and only record.
-                    stepStowMap();
+                    maps.stepStowMap();
                     stepMasterBreak2Sent = true;   // reuses the flag as "first half done"
                     stepSlaveReadyBatch = -1;
                     stepSendToSlave("buildhalf:0:t");
@@ -432,7 +428,7 @@ final class StepMaster {
                 // (user rule, live 2026-10-20): safe because W2 rides the EAST lane
                 // 2k+129 - 127.5+ blocks from the west tops, beyond dominant record
                 // range - so the already-recorded west pixels cannot be re-recorded.
-                stepStowMap();
+                maps.stepStowMap();
                 stepW1Ms = System.currentTimeMillis() - stepPhaseStartMs;
                 stepPhaseStartMs = System.currentTimeMillis();
                 stepMasterBreak2Sent = true;
@@ -447,7 +443,7 @@ final class StepMaster {
                 // Batch 0 split flow: NO break(2) exists - breakall directly.
                 // Standard flow: break2done has arrived (W2 was gated on it), so
                 // break-all is requested immediately.
-                stepStowMap();
+                maps.stepStowMap();
                 stepW2Ms = System.currentTimeMillis() - stepPhaseStartMs;
                 stepPhaseStartMs = System.currentTimeMillis();
                 stepMasterStage = StepMasterStage.WAIT_BREAK_ALL;
@@ -462,7 +458,7 @@ final class StepMaster {
                 }
             }
             case CLOSING_WALK -> {
-                stepStowMap();
+                maps.stepStowMap();
                 stepMasterStage = StepMasterStage.WAIT_CLOSING_BREAK;
                 stepMasterWaitTicks = 0;
                 stepCloseMapReady();
@@ -533,18 +529,18 @@ final class StepMaster {
         }
 
         if (stepMasterStage == StepMasterStage.LOCKING) {
-            tickStepLock();
+            lock.tickStepLock();
             return;
         }
 
         // FETCH_MAP: if the empty map was taken from the chest, chain to the fill flow
         if (stepMasterStage == StepMasterStage.FETCH_MAP && mod.state != State.AwaitMapChestResponse) {
-            if (findEmptyMapSlot() >= 0) {
+            if (maps.findEmptyMapSlot() >= 0) {
                 beginStepMapFill();
                 return;
             }
-            if (stepFindWorkingMapSlot() >= 0) {
-                stepPinWorkingMap();
+            if (maps.stepFindWorkingMapSlot() >= 0) {
+                maps.stepPinWorkingMap();
                 int resumeBatch = loadStepProgress();
                 // start-batch is a FLOOR: a stale saved progress file can never drag
                 // the run back before the configured starting batch.
@@ -563,8 +559,8 @@ final class StepMaster {
         if (stepMasterStage == StepMasterStage.WAIT_FILLED_MAP) {
             Utils.setForwardPressed(false);
             Utils.setSneakPressed(false);
-            stepStowMap();
-            if (stepPinWorkingMap()) {
+            maps.stepStowMap();
+            if (maps.stepPinWorkingMap()) {
                 beginStepPrimingRun();
             } else if (++stepMasterWaitTicks > 300) {
                 abortStepMaster("empty map did not produce a filled map within 15 seconds");
@@ -585,13 +581,13 @@ final class StepMaster {
             if (stepMasterStage == StepMasterStage.BATCH_WALK_A
                 || stepMasterStage == StepMasterStage.BATCH_WALK_B
                 || stepMasterStage == StepMasterStage.CLOSING_WALK) {
-                if (!stepEnsureMapHeld()) {
+                if (!maps.stepEnsureMapHeld()) {
                     abortStepMaster("working map disappeared during a sweep");
                     return;
                 }
                 // USER RULE: the map is held ONLY while dwelling at a checkpoint -
                 // the moment this dwell expires, stow before moving to the next one
-                if (stepMasterDwellTicks == 1) stepStowMap();
+                if (stepMasterDwellTicks == 1) maps.stepStowMap();
             }
             stepMasterDwellTicks--;
             if (stepMasterDwellTicks == 0 && stepMasterSweepCompletionPending) {
@@ -666,7 +662,7 @@ final class StepMaster {
         if (stepMasterStage == StepMasterStage.WAIT_CLOSING_BREAK && stepSlaveClosingDone) {
             stepSlaveClosingDone = false;
             stepMasterStage = StepMasterStage.READY_TO_LOCK;
-            stepStowMap();
+            maps.stepStowMap();
             mod.state = State.StandBy;
             mod.info("§aStep-checker print complete. Map is stowed and ready for cartography locking.");
             return;
@@ -696,7 +692,7 @@ final class StepMaster {
             if (++stepMasterWaitTicks > 100) {
                 abortStepMaster("could not select the empty map at the fill checkpoint");
             } else {
-                useEmptyMapAtFillSpot();
+                maps.useEmptyMapAtFillSpot();
             }
             return;
         }
@@ -704,7 +700,7 @@ final class StepMaster {
         if (stepMasterStage == StepMasterStage.READY_TO_LOCK || stepMasterStage == StepMasterStage.ABORTED) {
             Utils.setForwardPressed(false);
             Utils.setSneakPressed(false);
-            stepStowMap();
+            maps.stepStowMap();
             return;
         }
 
@@ -754,10 +750,10 @@ final class StepMaster {
     }
 
     void checkMapHoldGuard() {
-        if (stepMasterDwellTicks > 0 || controlHoldActive) return;
-        Integer heldId = mapIdOf(mc.player.getMainHandStack());
-        if (heldId != null && heldId == stepWorkingMapId) {
-            stepStowMap();
+        if (stepMasterDwellTicks > 0 || maps.controlHoldActive) return;
+        Integer heldId = maps.mapIdOf(mc.player.getMainHandStack());
+        if (heldId != null && heldId == maps.stepWorkingMapId) {
+            maps.stepStowMap();
             if (mapHoldWarnCooldown <= 0) {
                 mapHoldWarnCooldown = 100;
                 mod.warning("§cHolding the filled map is NOT allowed while the module is enabled - "
@@ -768,7 +764,7 @@ final class StepMaster {
 
     void handleStepMasterCheckpoint(String action) {
         switch (action) {
-            case "stepFillMap" -> useEmptyMapAtFillSpot();
+            case "stepFillMap" -> maps.useEmptyMapAtFillSpot();
             case "stepFetchMap" -> {
                 // Open the map chest; the AwaitMapChestResponse handler takes the map + pane.
                 // After the map is taken, tickStepMaster sees FETCH_MAP + an empty map and
@@ -836,8 +832,8 @@ final class StepMaster {
                 mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
                 mc.player.swingHand(Hand.MAIN_HAND);
                 stepMasterStage = StepMasterStage.LOCKING;
-                stepLockStep = 1;
-                stepLockDelay = 10;
+                lock.stepLockStep = 1;
+                lock.stepLockDelay = 10;
                 Utils.setForwardPressed(false);
                 Utils.setSneakPressed(false);
             }
@@ -848,7 +844,7 @@ final class StepMaster {
                 if (stepMasterStage != StepMasterStage.BATCH_WALK_A
                     && stepMasterStage != StepMasterStage.BATCH_WALK_B
                     && stepMasterStage != StepMasterStage.CLOSING_WALK) return;
-                if (!stepEnsureMapHeld()) {
+                if (!maps.stepEnsureMapHeld()) {
                     abortStepMaster("working map disappeared at a sweep checkpoint");
                     return;
                 }
@@ -901,196 +897,16 @@ final class StepMaster {
         }
     }
 
-    void tickStepLock() {
-        Utils.setForwardPressed(false);
-        Utils.setSneakPressed(false);
-        if (stepLockDelay > 0) {
-            stepLockDelay--;
-            return;
-        }
-        if (!(mc.player.currentScreenHandler instanceof CartographyTableScreenHandler table)) {
-            abortStepMaster("cartography table screen did not open");
-            return;
-        }
-        switch (stepLockStep) {
-            case 1 -> {
-                if (!moveIntoStepTableSlot(table, 0, stack -> {
-                    Integer id = mapIdOf(stack);
-                    return id != null && id == stepWorkingMapId
-                        && !stack.contains(DataComponentTypes.CUSTOM_NAME);
-                })) {
-                    abortStepMaster("pinned working map is not in the inventory");
-                    return;
-                }
-                stepLockStep = 2;
-                stepLockDelay = 6;
-            }
-            case 2 -> {
-                if (!moveIntoStepTableSlot(table, 1, stack -> stack.getItem() == Items.GLASS_PANE)) {
-                    abortStepMaster("no glass pane is available for the cartography lock");
-                    return;
-                }
-                stepLockStep = 3;
-                stepLockDelay = 10;
-            }
-            case 3 -> {
-                if (table.getSlot(2).getStack().isEmpty()) {
-                    abortStepMaster("cartography table produced no locked-map result");
-                    return;
-                }
-                mc.interactionManager.clickSlot(table.syncId, 2, 0, SlotActionType.QUICK_MOVE, mc.player);
-                stepLockStep = 4;
-                stepLockDelay = 8;
-            }
-            default -> {
-                mc.player.closeHandledScreen();
-                stepLockStep = -1;
-                stepMasterStage = StepMasterStage.READY_TO_LOCK;
-                mod.state = State.StandBy;
-                mod.info("§aCartography lock complete: the locked copy was taken from the table.");
-            }
-        }
-    }
 
-    boolean moveIntoStepTableSlot(CartographyTableScreenHandler table,
-                                          int targetSlot,
-                                          Predicate<ItemStack> predicate) {
-        for (int slot = 3; slot < table.slots.size(); slot++) {
-            ItemStack stack = table.getSlot(slot).getStack();
-            if (stack.isEmpty() || !predicate.test(stack)) continue;
-            mc.interactionManager.clickSlot(table.syncId, slot, 0, SlotActionType.PICKUP, mc.player);
-            mc.interactionManager.clickSlot(table.syncId, targetSlot, 0, SlotActionType.PICKUP, mc.player);
-            return true;
-        }
-        return false;
-    }
 
-    Integer mapIdOf(ItemStack stack) {
-        if (stack == null || stack.isEmpty() || !(stack.getItem() instanceof FilledMapItem)) return null;
-        var id = stack.get(DataComponentTypes.MAP_ID);
-        return id == null ? null : id.id();
-    }
 
-    int findEmptyMapSlot() {
-        for (int slot = 0; slot < 36; slot++) {
-            if (mc.player.getInventory().getStack(slot).getItem() == Items.MAP) return slot;
-        }
-        return -1;
-    }
 
-    int stepFindWorkingMapSlot() {
-        for (int slot = 0; slot < 36; slot++) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            Integer id = mapIdOf(stack);
-            if (id == null || stack.contains(DataComponentTypes.CUSTOM_NAME)) continue;
-            if (stepWorkingMapId < 0 || id == stepWorkingMapId) return slot;
-        }
-        return -1;
-    }
 
-    int stepFindMapIdSlot(int wantedId) {
-        for (int slot = 0; slot < 36; slot++) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            Integer id = mapIdOf(stack);
-            if (id != null && id == wantedId && !stack.contains(DataComponentTypes.CUSTOM_NAME)) return slot;
-        }
-        return -1;
-    }
 
-    boolean stepPinWorkingMap() {
-        if (stepWorkingMapId >= 0) return stepFindWorkingMapSlot() >= 0;
-        int slot = stepFindWorkingMapSlot();
-        if (slot < 0) return false;
-        Integer id = mapIdOf(mc.player.getInventory().getStack(slot));
-        if (id == null) return false;
-        stepWorkingMapId = id;
-        mod.info("§aWorking map pinned: id=" + id + ".");
-        return true;
-    }
 
-    boolean stepEnsureMapHeld() {
-        if (stepWorkingMapId < 0 && !stepPinWorkingMap()) return false;
-        Integer held = mapIdOf(mc.player.getMainHandStack());
-        if (held != null && held == stepWorkingMapId) return true;
 
-        int slot = stepFindWorkingMapSlot();
-        if (slot < 0) return false;
-        if (slot < 9) {
-            mc.player.getInventory().setSelectedSlot(slot);
-            stepMapSwapPending = false;
-            return mapIdOf(mc.player.getMainHandStack()) != null
-                && mapIdOf(mc.player.getMainHandStack()) == stepWorkingMapId;
-        }
-        if (!stepMapSwapPending) {
-            swapPlayerInventoryToHotbar(slot, mc.player.getInventory().getSelectedSlot());
-            stepMapSwapPending = true;
-            stepMapSwapAge = 5;   // ticks until a retry (the filled result can land late)
-        } else if (--stepMapSwapAge <= 0) {
-            stepMapSwapPending = false;   // stale latch - retry the swap next tick
-        }
-        return false;
-    }
 
-    void stepStowMap() {
-        if (mc.player == null) return;
-        if (mapIdOf(mc.player.getMainHandStack()) == null) {
-            stepMapSwapPending = false;   // nothing to holster - still clear a stale latch
-            return;
-        }
-        int selected = mc.player.getInventory().getSelectedSlot();
-        for (int slot = 0; slot < 9; slot++) {
-            if (mapIdOf(mc.player.getInventory().getStack(slot)) == null) {
-                mc.player.getInventory().setSelectedSlot(slot);
-                stepMapSwapPending = false;
-                return;
-            }
-        }
-        for (int slot = 9; slot < 36; slot++) {
-            if (mapIdOf(mc.player.getInventory().getStack(slot)) == null) {
-                swapPlayerInventoryToHotbar(slot, selected);
-                stepMapSwapPending = true;
-                return;
-            }
-        }
-        mod.warning("No non-map inventory slot is available to stow the working map.");
-    }
 
-    void swapPlayerInventoryToHotbar(int inventorySlot, int hotbarSlot) {
-        if (inventorySlot < 9 || inventorySlot >= 36 || hotbarSlot < 0 || hotbarSlot >= 9) return;
-        int handlerSlot = inventorySlot;
-        mc.interactionManager.clickSlot(
-            mc.player.currentScreenHandler.syncId,
-            handlerSlot,
-            hotbarSlot,
-            SlotActionType.SWAP,
-            mc.player);
-    }
-
-    void useEmptyMapAtFillSpot() {
-        int slot = findEmptyMapSlot();
-        if (slot < 0) {
-            abortStepMaster("the empty map disappeared before the fill checkpoint");
-            return;
-        }
-        if (slot >= 9) {
-            if (!stepMapSwapPending) {
-                swapPlayerInventoryToHotbar(slot, mc.player.getInventory().getSelectedSlot());
-                stepMapSwapPending = true;
-            }
-            return;
-        }
-        mc.player.getInventory().setSelectedSlot(slot);
-        mc.getNetworkHandler().sendPacket(new PlayerInteractItemC2SPacket(
-            Hand.MAIN_HAND,
-            Utils.getNextInteractID(),
-            mc.player.getYaw(),
-            mc.player.getPitch()));
-        stepMasterStage = StepMasterStage.WAIT_FILLED_MAP;
-        stepMasterWaitTicks = 0;
-        Utils.setForwardPressed(false);
-        Utils.setSneakPressed(false);
-        mod.info("§7Empty map used at the fill checkpoint; waiting for the filled result.");
-    }
 
     void abortStepMaster(String reason) {
         if (stepMasterStage == StepMasterStage.ABORTED) return;
@@ -1102,46 +918,13 @@ final class StepMaster {
         stepMasterSweepCompletionPending = false;
         Utils.setForwardPressed(false);
         Utils.setSneakPressed(false);
-        stepStowMap();
+        maps.stepStowMap();
         mod.error("Step-checker master stopped: " + reason + ".");
     }
 
-    void serviceControlHold() {
-        if (!controlHoldActive || SlaveSystem.isSlave || mc.player == null || mc.world == null) return;
-        if (stepMasterStage != StepMasterStage.IDLE) { controlHoldActive = false; return; }   // a real run takes over
-        if (stepWorkingMapId < 0) stepPinWorkingMap();
-        if (stepWorkingMapId >= 0) {
-            // A pinned id whose map left the inventory (RCON clear, drop) is stale -
-            // drop it so the empty-map auto-use branch can run again
-            if (stepFindWorkingMapSlot() < 0) {
-                mod.info("§7Pinned map " + stepWorkingMapId + " is gone - unpinning.");
-                stepWorkingMapId = -1;
-                return;
-            }
-            stepEnsureMapHeld();
-        } else {
-            // No filled map yet: use one EMPTY map at the current spot. The given map
-            // usually lands in the main inventory (hotbar full) - swap it in first.
-            int slot = findEmptyMapSlot();
-            if (slot >= 9) {
-                if (!controlSwapPending) {
-                    swapPlayerInventoryToHotbar(slot, mc.player.getInventory().getSelectedSlot());
-                    controlSwapPending = true;
-                }
-            } else if (slot >= 0 && controlUseCooldown <= 0) {
-                controlUseCooldown = 40;   // ~2s: one use attempt, then wait for the result
-                controlSwapPending = false;
-                mc.player.getInventory().setSelectedSlot(slot);
-                mc.getNetworkHandler().sendPacket(new PlayerInteractItemC2SPacket(
-                    Hand.MAIN_HAND, Utils.getNextInteractID(), mc.player.getYaw(), mc.player.getPitch()));
-                mod.info("§7No filled map - used one empty map at the current spot.");
-            }
-            if (controlUseCooldown > 0) controlUseCooldown--;
-        }
-    }
 
     void saveStepProgress(int batch) {
-        if (StepFiles.saveProgress(mod.mapFolder, batch, stepWorkingMapId)) {
+        if (StepFiles.saveProgress(mod.mapFolder, batch, maps.stepWorkingMapId)) {
             cachedResumeBatch = batch;
         } else if (mod.debugPrints.get()) {
             mod.warning("Could not save step progress.");

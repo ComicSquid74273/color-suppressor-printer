@@ -1007,7 +1007,7 @@ final class SlaveEngine {
 
 
     void tick(TickEvent.Pre event) {
-        mod.master.serviceControlHold();
+        mod.master.maps.serviceControlHold();
         // START ALL deferred trigger + deferred disable both run through the tick:
         // calling toggle() from inside onActivate/onTick handlers makes Meteor re-enter
         // the activation path recursively (StackOverflowError -> client death)

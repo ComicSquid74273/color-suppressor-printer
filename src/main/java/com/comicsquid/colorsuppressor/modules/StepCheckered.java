@@ -575,7 +575,7 @@ public class StepCheckered extends Module {
         sb.append("\"moduleActive\":").append(isActive()).append(',');
         sb.append("\"state\":\"").append(stateName).append("\",");
         sb.append("\"stepMasterStage\":\"").append(master.stepMasterStage).append("\",");
-        sb.append("\"workingMapId\":").append(master.stepWorkingMapId).append(',');
+        sb.append("\"workingMapId\":").append(master.maps.stepWorkingMapId).append(',');
         sb.append("\"batch\":").append(master.stepMasterBatch).append(',');
         sb.append("\"slaveConnected\":").append(!SlaveSystem.slaves.isEmpty()).append(',');
         sb.append("\"heartbeatAgeMs\":").append(hbAge);
@@ -638,8 +638,8 @@ public class StepCheckered extends Module {
      *  the current spot and pin the filled result once it lands (the old dry-run). */
     public void controlHoldMap(boolean on) {
         if (SlaveSystem.isSlave) return;
-        master.controlHoldActive = on;
-        if (!on) master.stepStowMap();
+        master.maps.controlHoldActive = on;
+        if (!on) master.maps.stepStowMap();
     }
 
     /**
@@ -655,14 +655,14 @@ public class StepCheckered extends Module {
             error("No cartography table is configured for the locked-map end flow.");
             return;
         }
-        master.stepLockStep = 0;
+        master.lock.stepLockStep = 0;
         master.resetForActivation();
         master.stepMasterStage = StepMasterStage.LOCK_WALK;
         checkpoints.clear();
         checkpoints.add(new Pair<>(cartographyTable.getRight(), new Pair<>("stepLockTable", null)));
         master.prependLatticeTransit(lowerMapCorner.getX() + 125.5, lowerMapCorner.getZ() + 14.5);   // exit via the GATE
         state = State.Walking;
-        master.stepStowMap();
+        master.maps.stepStowMap();
         info("§aWalking to the configured cartography table to lock the pinned map.");
     }
 
@@ -807,7 +807,7 @@ public class StepCheckered extends Module {
         Utils.setSneakPressed(false);
         slave.setTransitSpeed(false);
         if (!SlaveSystem.isSlave && master.stepMasterStage != StepMasterStage.IDLE) {
-            master.stepStowMap();
+            master.maps.stepStowMap();
             master.stepMasterStage = StepMasterStage.ABORTED;
             checkpoints.clear();
         }
