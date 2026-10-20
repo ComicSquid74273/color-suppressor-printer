@@ -64,8 +64,6 @@ import org.lwjgl.util.tinyfd.TinyFileDialogs;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.FileWriter;
-import java.nio.file.Files;
 import java.util.function.Predicate;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -542,8 +540,7 @@ public class StepCheckered extends Module implements MapPrinter {
     int awaitSuppressionZ;
     int heartbeatTicks;
     boolean pendingDisable;                                          // deferred toggle (see requestDisable)
-    ArrayList<HashMap<BlockPos, Block>> stepRecLayers;               // pair j -> (local pos (x, y0/y1, z -1..127)) -> block
-    ArrayList<HashMap<BlockPos, Block>> stepDomLayers;
+    StepCheckerLayers stepLayers;                                    // converted per-pair rec/dom layers (StepCheckerLayers.empty() until the NBT loads)
     HashMap<BlockPos, Block> renderedBatchPlan;                      // cached render-map plan
     String renderedBatchKey;
     int currentBatch = -1;                                           // batch being built (slave)
@@ -981,8 +978,7 @@ public class StepCheckered extends Module implements MapPrinter {
         printRepairPending = false;
         break2Permitted = false;
         breakAllPermitted = false;
-        stepRecLayers = new ArrayList<>();
-        stepDomLayers = new ArrayList<>();
+        stepLayers = StepCheckerLayers.empty();   // placeholder until the first NBT load
         oldState = null;
         debugPreviousState = null;
         lowerMapLayer = new Block[128][129][2];
@@ -3581,90 +3577,43 @@ public class StepCheckered extends Module implements MapPrinter {
         }
     }
 
-    // --- Progress persistence (crash/restart resume) ---
-
-    private File stepProgressFile() {
-        return new File(new File(mapFolder, "_configs"), "step_checkered_progress.json");
-    }
+    // --- Progress persistence (crash/restart resume; file IO lives in StepFiles) ---
 
     /** RESET-IN-FLIGHT persistence: a module disable/crash mid-RESET must RESUME the
      *  reset on re-enable (user rule, 2026-10-20: "disable+re-enable after RESET ALL
      *  skipped the reset instead of completing it"). The scope is written when the
      *  ladder arms and deleted when it completes (or a new run supersedes it). */
-    private File stepResetPendingFile() {
-        return new File(new File(mapFolder, "_configs"), "step_checkered_reset.json");
-    }
-
     private void saveResetPending(int scopeCol) {
-        try {
-            stepResetPendingFile().getParentFile().mkdirs();
-            FileWriter writer = new FileWriter(stepResetPendingFile());
-            writer.write("{\"scope\":" + scopeCol + "}\n");
-            writer.close();
-        } catch (Exception ignored) {
-        }
+        StepFiles.saveResetPending(mapFolder, scopeCol);
     }
 
     private int loadResetPending() {
-        try {
-            File file = stepResetPendingFile();
-            if (!file.exists() || mapFolder == null) return -1;
-            String json = new String(Files.readAllBytes(file.toPath()));
-            int start = json.indexOf("\"scope\":") + 9;
-            int end = json.indexOf("}", start);
-            return Integer.parseInt(json.substring(start, end).trim());
-        } catch (Exception e) {
-            return -1;
-        }
+        return StepFiles.loadResetPending(mapFolder);
     }
 
     private void clearResetPending() {
         resetPendingScope = -1;
-        try {
-            if (mapFolder != null) stepResetPendingFile().delete();
-        } catch (Exception ignored) {
-        }
+        StepFiles.clearResetPending(mapFolder);
     }
 
-    /** mmm? no - XmYYs style for the per-batch phase timing summary. */
+    /** Per-batch phase timing summary in mSS style (e.g. 5m10s). */
     private String fmtMs(long ms) {
         long sec = Math.max(0, ms / 1000);
         return (sec / 60) + "m" + String.format("%02ds", sec % 60);
     }
 
     private void saveStepProgress(int batch) {
-        try {
-            File file = stepProgressFile();
-            file.getParentFile().mkdirs();
-            FileWriter writer = new FileWriter(file);
-            writer.write("{\"batch\":" + batch + ",\"mapId\":" + stepWorkingMapId + "}\n");
-            writer.close();
+        if (StepFiles.saveProgress(mapFolder, batch, stepWorkingMapId)) {
             cachedResumeBatch = batch;
-        } catch (Exception e) {
-            if (debugPrints.get()) warning("Could not save step progress: " + e.getMessage());
+        } else if (debugPrints.get()) {
+            warning("Could not save step progress.");
         }
     }
 
     private int loadStepProgress() {
-        stepSavedProgressMapId = -1;
-        if (mapFolder == null) return 0;   // mapFolder is assigned mid-activation
-        try {
-            File file = stepProgressFile();
-            if (!file.exists()) return 0;
-            String json = new String(Files.readAllBytes(file.toPath()));
-            int batchStart = json.indexOf("\"batch\":") + 8;
-            int batchEnd = json.indexOf(",", batchStart);
-            if (batchEnd < 0) batchEnd = json.indexOf("}", batchStart);
-            int mapStart = json.indexOf("\"mapId\":");
-            if (mapStart >= 0) {
-                int mapEnd = json.indexOf(",", mapStart);
-                if (mapEnd < 0) mapEnd = json.indexOf("}", mapStart);
-                stepSavedProgressMapId = Integer.parseInt(json.substring(mapStart + 8, mapEnd).trim());
-            }
-            return Integer.parseInt(json.substring(batchStart, batchEnd).trim());
-        } catch (Exception e) {
-            return 0;
-        }
+        int[] progress = StepFiles.loadProgress(mapFolder);
+        stepSavedProgressMapId = progress[1];
+        return progress[0];
     }
 
     /** The inventory slot holding the EXACT persisted working map (unnamed), or -1. */
@@ -3679,10 +3628,7 @@ public class StepCheckered extends Module implements MapPrinter {
 
     private void clearStepProgress() {
         cachedResumeBatch = -1;
-        try {
-            stepProgressFile().delete();
-        } catch (Exception ignored) {
-        }
+        StepFiles.clearProgress(mapFolder);
     }
 
     /** RESET: abort the slave, clear progress, re-fetch a map, start from batch 0. */
@@ -4768,7 +4714,7 @@ public class StepCheckered extends Module implements MapPrinter {
         // slots for the rest of the run. Pre-fills depositBacklogSlots (the deposit
         // handler treats a pre-filled backlog at chest-open as a filtered dump) and
         // rides the SAME north-corridor trip, before the first refill checkpoint.
-        if (lowerMapCorner != null && stepRecLayers != null && currentBatch >= 0) {
+        if (lowerMapCorner != null && stepLayers != null && currentBatch >= 0) {
             // QUANTITATIVE future need: per-item block counts over all remaining
             // batches + closing (nothing stands yet for future batches, so full plan
             // counts). Excess beyond that need is dead weight fragmenting slots - the
@@ -4958,13 +4904,9 @@ public class StepCheckered extends Module implements MapPrinter {
                 break2Permitted = false;
                 breakAllPermitted = false;
                 fullSweepActive = false;
-                HashMap<BlockPos, Block> half = new HashMap<>();
-                if (tops) {
-                    addLayerAt(half, stepDomLayers.get(batch), 2);
-                } else {
-                    addLayerAt(half, stepRecLayers.get(batch), 0);
-                    addLayerAt(half, stepRecLayers.get(batch + 1), 2);
-                }
+                HashMap<BlockPos, Block> half = tops
+                    ? stepLayers.assembleTopsHalf(batch, lowerMapCorner)
+                    : stepLayers.assembleFloorHalf(batch, lowerMapCorner);
                 currentBuildPlan = half;
                 currentBatch = batch;
                 batchPassRetries = 0;
@@ -5124,8 +5066,8 @@ public class StepCheckered extends Module implements MapPrinter {
         double northZ = lowerMapCorner.getZ() - 2;
         double southZ = lowerMapCorner.getZ() + 128.7;
         HashMap<BlockPos, Block> floorPlan = assemblePriming();
-        if (stepDomLayers != null && stepDomLayers.get(0) != null) {
-            addLayerAt(floorPlan, stepDomLayers.get(0), 2);   // merged batch-0 supply basis
+        if (stepLayers != null) {
+            StepCheckerLayers.addLayerAt(floorPlan, stepLayers.domLayers.get(0), lowerMapCorner, 2);   // merged batch-0 supply basis
         }
         currentBuildPlan = floorPlan;
         queueStepBuildPreparation(stagingX);
@@ -6786,118 +6728,22 @@ public class StepCheckered extends Module implements MapPrinter {
     }
 
     /**
-     * Classic staircase NBT -> EvModder step-checker layers (W->E): a faithful Java port of the
-     * PROVEN tools/manualrun/convert_step.py oracle (verified block-identical against Ev's own
-     * step-checker export, 27,565 blocks / 65 phases). Per pair j (lanes 2j / 2j+1), pixel
-     * class = (px+pz)&1 (0 = recessive, 1 = dominant):
-     *   REC layer j - recessive colours at y0; Dark -> resin y1 on the north column; Flat ->
-     *                the north (dominant) pixel's own material at y0 (pre-placed "borrow"
-     *                shading the recessive Flat pixel south of it); resin when the north is
-     *                transparent or the noobline.
-     *   DOM layer j - dominant colours at y0 (idempotent over borrows); Dark -> resin y1
-     *                north; Flat -> the north (recessive) pixel's colour at y0 (shade provider
-     *                once its record is done); resin ditto.
-     * Local coordinates: x 0..127, y 0/1, z -1..127 (z = -1 is the noobline filler row).
-     */
-    /** @return false when the file is not a CLASSIC staircase export (e.g. a pre-encoded
+     * Classic staircase NBT -> step-checker layers, via the reusable converter (a
+     * faithful port of the PROVEN tools/manualrun/convert_step.py oracle - see
+     * StepCheckerLayers for the encoding rules).
+     * @return false when the file is not a CLASSIC staircase export (e.g. a pre-encoded
      *  step-checker/2-layer suppress export) — those stack phases vertically and would
-     *  silently produce wrong layers through the heightmap derivation below. */
+     *  silently produce wrong layers.
+     */
     private boolean generateStepCheckerLayers(NbtList blockList, HashMap<Integer, Pair<Block, Integer>> blockPaletteDict) {
-        // Center the schematic on the 128x129 footprint first (like the legacy printer's map
-        // loader) - schematics exported with a coordinate offset would index out of bounds
-        int minX = Integer.MAX_VALUE;
-        int maxX = Integer.MIN_VALUE;
-        int minY = Integer.MAX_VALUE;
-        int maxY = Integer.MIN_VALUE;
-        int maxZ = Integer.MIN_VALUE;
-        for (int i = 0; i < blockList.size(); i++) {
-            Optional<NbtCompound> blockOpt = blockList.getCompound(i);
-            if (blockOpt.isEmpty()) continue;
-            NbtList pos = blockOpt.get().getList("pos").orElse(null);
-            if (pos == null || pos.size() < 3) continue;
-            Optional<Integer> xOpt = pos.getInt(0);
-            Optional<Integer> yOpt = pos.getInt(1);
-            Optional<Integer> zOpt = pos.getInt(2);
-            if (xOpt.isEmpty() || zOpt.isEmpty()) continue;
-            minX = Math.min(minX, xOpt.get());
-            maxX = Math.max(maxX, xOpt.get());
-            maxZ = Math.max(maxZ, zOpt.get());
-            if (yOpt.isPresent()) {
-                minY = Math.min(minY, yOpt.get());
-                maxY = Math.max(maxY, yOpt.get());
-            }
-        }
-        if (minX != Integer.MAX_VALUE && (maxX - minX > 160 || maxY - minY > 100)) {
-            error("§c'" + mapFile.getName() + "' is not a CLASSIC staircase export (x-span " + (maxX - minX + 1)
-                + ", y-span " + (maxY - minY + 1) + "). Pre-encoded step-checker/suppress exports stack phases "
-                + "vertically and produce WRONG layers. Export the art in staircase mode (Z-129) and use that file.");
+        StepCheckerLayers converted = StepCheckerLayers.fromClassicStaircase(blockList, blockPaletteDict, fillerBlock.get());
+        if (converted.lastRejectReason != null) {
+            error("§c'" + mapFile.getName() + "' is not a CLASSIC staircase export (" + converted.lastRejectReason);
             return false;
         }
-        int xOffset = minX == Integer.MAX_VALUE ? 0 : minX;
-        int zOffset = maxZ == Integer.MIN_VALUE ? 0 : maxZ - 128;
-
-        // Classic heightmap: cell (x 0..127, z 0..128) -> (block, topmost y); z = 0 is the noobline
-        Pair<Block, Integer>[][] heightMap = new Pair[128][129];
-        for (int i = 0; i < blockList.size(); i++) {
-            Optional<NbtCompound> blockOpt = blockList.getCompound(i);
-            if (blockOpt.isEmpty()) continue;
-
-            NbtCompound block = blockOpt.get();
-
-            Optional<Integer> blockIdOpt = block.getInt("state");
-            if (blockIdOpt.isEmpty() || !blockPaletteDict.containsKey(blockIdOpt.get())) continue;
-
-            NbtList pos = block.getList("pos").orElse(null);
-            if (pos == null || pos.size() < 3) continue;
-
-            Optional<Integer> xOpt = pos.getInt(0);
-            Optional<Integer> yOpt = pos.getInt(1);
-            Optional<Integer> zOpt = pos.getInt(2);
-            if (xOpt.isEmpty() || yOpt.isEmpty() || zOpt.isEmpty()) continue;
-
-            int x = xOpt.get() - xOffset;
-            int z = zOpt.get() - zOffset;
-            if (x < 0 || x >= 128 || z < 0 || z >= 129) continue;
-            if (heightMap[x][z] == null || heightMap[x][z].getRight() < yOpt.get()) {
-                heightMap[x][z] = new Pair<>(blockPaletteDict.get(blockIdOpt.get()).getLeft(), yOpt.get());
-            }
-        }
-
-        stepRecLayers = new ArrayList<>();
-        stepDomLayers = new ArrayList<>();
-        for (int j = 0; j < 64; j++) {
-            stepRecLayers.add(new HashMap<>());
-            stepDomLayers.add(new HashMap<>());
-        }
-        Block filler = fillerBlock.get();
-
-        for (int px = 0; px < 128; px++) {
-            int pair = px / 2;
-            for (int pz = 0; pz < 128; pz++) {
-                Pair<Block, Integer> cell = heightMap[px][pz + 1];
-                if (cell == null) continue;
-                int y = cell.getRight();
-                // North neighbour height: a missing column counts as one lower (-> Light)
-                int northY = heightMap[px][pz] != null ? heightMap[px][pz].getRight() : y - 1;
-                HashMap<BlockPos, Block> layer = ((px + pz) & 1) == 0 ? stepRecLayers.get(pair) : stepDomLayers.get(pair);
-                layer.put(new BlockPos(px, 0, pz), cell.getLeft());
-                if (y == northY) {
-                    // Flat: shade with the north pixel's own colour (the "borrow"); resin when
-                    // the north pixel is absent (gap or the noobline row pz = 0)
-                    Block northMat = pz >= 1 && heightMap[px][pz] != null ? heightMap[px][pz].getLeft() : filler;
-                    layer.put(new BlockPos(px, 0, pz - 1), northMat);
-                } else if (y < northY) {
-                    // Dark: north is higher - resin on the north column
-                    layer.put(new BlockPos(px, 1, pz - 1), filler);
-                }
-                // Light: no filler
-            }
-        }
-
-        int recTotal = 0;
-        for (HashMap<BlockPos, Block> layer : stepRecLayers) recTotal += layer.size();
-        int domTotal = 0;
-        for (HashMap<BlockPos, Block> layer : stepDomLayers) domTotal += layer.size();
+        stepLayers = converted;
+        int recTotal = converted.recTotalBlocks();
+        int domTotal = converted.domTotalBlocks();
         info("Step-checker layers: §a64 pairs§7, rec §a" + recTotal + "§7, dom §a" + domTotal
             + "§7, grand §a" + (recTotal + domTotal) + "§7 blocks");
         return true;
@@ -6906,49 +6752,21 @@ public class StepCheckered extends Module implements MapPrinter {
     // --- Phase 1: batch assembly (the placement-plan source for the slave) ---
 
     /**
-     * World-coordinate placement plan for one regular batch k (0..62), per the authority
-     * doc §4: recessive pair k at corner+0 (y0-1) + dominant pair k at corner+2 (y2-3) +
-     * recessive pair k+1 at corner+2 (east lanes) - the 4x128x4 window over lanes 2k..2k+3,
-     * noobline fillers included (converter local z = -1 row). Overlapping entries between
-     * the two +2 layers cannot happen (different parity lanes).
+     * World-coordinate placement plan for one regular batch k (0..62) - see
+     * StepCheckerLayers.assembleBatch for the window layout.
      */
     public HashMap<BlockPos, Block> assembleBatch(int k) {
-        HashMap<BlockPos, Block> batch = new HashMap<>();
-        if (k < 0 || k > 62 || stepRecLayers == null) return batch;
-        addLayerAt(batch, stepRecLayers.get(k), 0);
-        addLayerAt(batch, stepDomLayers.get(k), 2);
-        addLayerAt(batch, stepRecLayers.get(k + 1), 2);
-        return batch;
+        return stepLayers == null ? new HashMap<>() : stepLayers.assembleBatch(k, lowerMapCorner);
     }
 
-    /** Priming build (doc §4): recessive-only - rec pair 0 at corner+0 + rec pair 1 at corner+2, NO dominants. */
+    /** Priming build: recessive-only floor (doc §4). */
     public HashMap<BlockPos, Block> assemblePriming() {
-        HashMap<BlockPos, Block> batch = new HashMap<>();
-        if (stepRecLayers == null) return batch;
-        addLayerAt(batch, stepRecLayers.get(0), 0);
-        addLayerAt(batch, stepRecLayers.get(1), 2);
-        return batch;
+        return stepLayers == null ? new HashMap<>() : stepLayers.assemblePriming(lowerMapCorner);
     }
 
-    /** Closing build (doc §4): dominant pair 63 at corner+2 (lanes 126-127) - built after batch 62, swept from x=253. */
+    /** Closing build: dominant pair 63 at corner+2 (doc §4). */
     public HashMap<BlockPos, Block> assembleClosing() {
-        HashMap<BlockPos, Block> batch = new HashMap<>();
-        if (stepDomLayers == null) return batch;
-        addLayerAt(batch, stepDomLayers.get(63), 2);
-        return batch;
-    }
-
-    /** Maps one converted layer (local x 0..127, y 0/1, z -1..127 with z=-1 = noobline) into the
-     *  world at the given y base; later puts win (idempotent re-placement is safe - same block). */
-    private void addLayerAt(HashMap<BlockPos, Block> batch, HashMap<BlockPos, Block> layer, int yBase) {
-        if (layer == null || lowerMapCorner == null) return;
-        for (Map.Entry<BlockPos, Block> entry : layer.entrySet()) {
-            BlockPos local = entry.getKey();
-            batch.put(new BlockPos(
-                lowerMapCorner.getX() + local.getX(),
-                lowerMapCorner.getY() + yBase + local.getY(),
-                lowerMapCorner.getZ() + local.getZ()), entry.getValue());
-        }
+        return stepLayers == null ? new HashMap<>() : stepLayers.assembleClosing(lowerMapCorner);
     }
 
     /**
@@ -6958,7 +6776,7 @@ public class StepCheckered extends Module implements MapPrinter {
      * engine's gate once it lands.
      */
     private void verifyBatchAssembly() {
-        if (stepRecLayers == null || lowerMapCorner == null) return;
+        if (stepLayers == null || lowerMapCorner == null) return;
         boolean inBox = true;
         int total = 0;
         for (int k = 0; k <= 62; k++) {
@@ -7087,7 +6905,7 @@ public class StepCheckered extends Module implements MapPrinter {
             event.renderer.box(nextBlockPos, color.get(), color.get(), ShapeMode.Lines, 0);
         }
 
-        if (renderMap.get() && lowerMapCorner != null && stepRecLayers != null) {
+        if (renderMap.get() && lowerMapCorner != null && stepLayers != null) {
             // The batch placement plan (assembleBatch) is the render source; cache it and only
             // rebuild when the batch index, art file or corner changes
             String planKey = effectiveRenderBatch() + "|" + (mapFile == null ? "?" : mapFile.getName())
