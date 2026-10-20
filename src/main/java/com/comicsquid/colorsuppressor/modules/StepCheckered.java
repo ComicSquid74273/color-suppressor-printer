@@ -865,7 +865,6 @@ public class StepCheckered extends Module implements MapPrinter {
     @Override
     public void onActivate() {
         lastTickTime = System.currentTimeMillis();
-        cachedResumeBatch = loadStepProgress();   // idle render + resume show where the run actually is
         if (!activationReset.get() && checkpoints != null) {
             return;
         }
@@ -981,6 +980,7 @@ public class StepCheckered extends Module implements MapPrinter {
             toggle();
             return;
         }
+        cachedResumeBatch = loadStepProgress();   // idle render + resume show where the run actually is
 
         if (!prepareNextMapFile()) return;
         info("§aBuilding: §b" + mapFile.getName());
@@ -3217,6 +3217,7 @@ public class StepCheckered extends Module implements MapPrinter {
 
     private int loadStepProgress() {
         stepSavedProgressMapId = -1;
+        if (mapFolder == null) return 0;   // mapFolder is assigned mid-activation
         try {
             File file = stepProgressFile();
             if (!file.exists()) return 0;
@@ -5297,11 +5298,19 @@ public class StepCheckered extends Module implements MapPrinter {
 
     /** The batch the renderer shows: the ACTIVE batch while a run is in progress,
      *  otherwise the manually selected render-batch setting (preview mode). */
+    private long resumeCacheReadAt;
+
     private int effectiveRenderBatch() {
         if (currentBatch >= 0) return currentBatch;
         // No active run: render the SAVED PROGRESS batch (where the run actually is /
-        // will resume), not the manual preview default - live complaint 2026-10-20:
-        // after re-enable the render showed batch 0 until START ALL armed the run.
+        // will resume). Lazily re-read the shared file while idle (bounded to one
+        // read per 2s) so a crash-restart or the OTHER bot's progress shows without
+        // needing START ALL (live complaint 2026-10-20, twice).
+        long now = System.currentTimeMillis();
+        if (now - resumeCacheReadAt > 2000) {
+            resumeCacheReadAt = now;
+            cachedResumeBatch = loadStepProgress();
+        }
         if (cachedResumeBatch > 0) return Math.min(62, cachedResumeBatch);
         return renderBatch.get();
     }
