@@ -189,10 +189,14 @@ public class StepCheckered extends Module implements MapPrinter {
 
     private final Setting<Integer> minDurability = sgMining.add(new IntSetting.Builder()
         .name("min-durability")
-        .description("The minimum absolute durability value allowed on a mining tools before exchanging.")
-        .defaultValue(5)
+        .description("Remaining durability tools are exchanged at once they have gone BELOW it. The "
+            + "exchange happens ONLY at the next batch-prep restock trip (old tool deposited into "
+            + "its chest, fresh one taken) - never mid-run, where a worn tool keeps working. Below "
+            + "~800 (one batch's worst-case breaking) a pickaxe can reach 0 and break mid-batch; "
+            + "set it to ~800 or more to guarantee tools never break.")
+        .defaultValue(20)
         .min(0)
-        .sliderRange(0, 50)
+        .sliderRange(0, 2031)
         .build()
     );
 
@@ -677,9 +681,6 @@ public class StepCheckered extends Module implements MapPrinter {
         "stepClosingDone", "batchExit", "sweepTick", "fullSweepStart", "fullSweepCenter", "fullSweepTick",
         "fullSweepDone", "resetStation", "resetPass");
     private static final int STEP_DWELL_TICKS = 80;
-    /** Pickaxe durability that must remain at batch start for the pickaxe to survive a
-     *  full batch's breaking (print repairs + break(2) + break-all + stragglers). */
-    private static final int PREP_PICKAXE_BUFFER = 800;
 
     /** MASTER AREA (user rule, 2026-10-20): the platform lattice is a BOUNDED area -
      *  lanes x_rel 125..253 (x = 125+2j), rows z_rel {14,40,64,88,112}, plus the fill
@@ -1195,12 +1196,36 @@ public class StepCheckered extends Module implements MapPrinter {
         switch (state) {
             case AwaitRestockResponse:
                 interactTimeout = 0;
-                // Fetching a pickaxe: park any worn (below min-durability) pickaxe into this
-                // chest FIRST - one deposit per sync, then the fresh pickaxe is taken below
-                if (!restockList.isEmpty() && new ItemStack(restockList.get(0).getLeft()).isIn(ItemTags.PICKAXES)) {
+                // TOOL RETURN (user rule 2026-10-20): used pickaxes go back to their OWN
+                // chest ONLY at this restock-phase visit, one deposit per sync - never
+                // mid-batch, never into a material chest. A pending take is a SWAP: the
+                // fetch only queues when the best carried pickaxe is below the buffer, so
+                // park ALL of them and take the fresh one below (the old deposit took only
+                // below-min-durability ones, letting replaced pickaxes ride along forever).
+                // With no take pending, keep exactly ONE pickaxe - the best - and return
+                // every spare (a sub-10-durability pickaxe is never the kept one: it is
+                // either a spare, or the sole pickaxe, in which case the 800-buffer fetch
+                // above has already queued its replacement).
+                if (isOpenChestAPickaxeChest()) {
+                    boolean swapTake = !restockList.isEmpty() && restockList.get(0).getMiddle() > 0
+                        && new ItemStack(restockList.get(0).getLeft()).isIn(ItemTags.PICKAXES);
+                    int keepSlot = -1;
+                    if (!swapTake) {
+                        // Keep-best scan in screen-handler slot space (last 36 slots are
+                        // the player inventory) - inventory indices don't map 1:1 here.
+                        int keepRemaining = -1;
+                        for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
+                            ItemStack invStack = packet.contents().get(slot);
+                            if (invStack.isIn(ItemTags.PICKAXES) && ToolUtils.getRemainingDamage(invStack) > keepRemaining) {
+                                keepSlot = slot;
+                                keepRemaining = ToolUtils.getRemainingDamage(invStack);
+                            }
+                        }
+                    }
                     for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
+                        if (slot == keepSlot) continue;
                         ItemStack invStack = packet.contents().get(slot);
-                        if (invStack.isIn(ItemTags.PICKAXES) && ToolUtils.getRemainingDamage(invStack) < minDurability.get()) {
+                        if (invStack.isIn(ItemTags.PICKAXES)) {
                             mc.interactionManager.clickSlot(packet.syncId(), slot, 0, SlotActionType.QUICK_MOVE, mc.player);
                             timeoutTicks = invActionDelay.get();
                             return;
@@ -1216,6 +1241,14 @@ public class StepCheckered extends Module implements MapPrinter {
                     ItemStack stack = packet.contents().get(slot);
 
                     if (restockList.get(0).getMiddle() == 0) {
+                        // Deposit-only pickaxe entry (0 stacks to take): spent once nothing
+                        // is left to park here. A pending TAKE also reaches middle==0 while
+                        // its backlog drains - the tick's drain ends that entry itself, so
+                        // only advance when no backlog is in flight.
+                        if (restockBacklogSlots.isEmpty()
+                            && new ItemStack(restockList.get(0).getLeft()).isIn(ItemTags.PICKAXES)) {
+                            endRestocking();
+                        }
                         foundMaterials = true;
                         break;
                     }
@@ -2292,9 +2325,14 @@ public class StepCheckered extends Module implements MapPrinter {
                         }
                     }
                     ItemStack ladderPick = mc.player.getInventory().getStack(8);
-                    if (!ladderPick.isIn(ItemTags.PICKAXES) || ToolUtils.getRemainingDamage(ladderPick) < minDurability.get()) {
-                        if (!hasGoodPickaxe()) { pauseForRestockTrip(true); return; }
+                    if (!ladderPick.isIn(ItemTags.PICKAXES)) {
+                        // Worn pickaxes keep working mid-run (exchange only at the pre-batch
+                        // restock) - fetch only when none is left at all
                         movePickaxeToSlot8();
+                        if (!mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) {
+                            pauseForRestockTrip(true);
+                            return;
+                        }
                     }
                     int lx0 = lowerMapCorner.getX() + 4 * resetLadderCol;
                     int lx1 = lx0 + 3;
@@ -2517,12 +2555,13 @@ public class StepCheckered extends Module implements MapPrinter {
             if (breakStage != 0) {
                 // Batch breaking always swings the reserved pickaxe slot (hotbar slot 8)
                 ItemStack reserved = mc.player.getInventory().getStack(8);
-                if (!reserved.isIn(ItemTags.PICKAXES) || ToolUtils.getRemainingDamage(reserved) < minDurability.get()) {
-                    if (!hasGoodPickaxe()) {
-                        // Pickaxe broke or went missing mid-break: supply run via the north checkpoint
+                if (!reserved.isIn(ItemTags.PICKAXES)) {
+                    // Mid-run a worn pickaxe keeps swinging (exchanges happen ONLY at the
+                    // pre-batch restock) - reaching here means it is GONE (broke). Arm any
+                    // carried one; with none left the fetch trip is the only recovery.
+                    movePickaxeToSlot8();
+                    if (!mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) {
                         pauseForRestockTrip(true);
-                    } else {
-                        movePickaxeToSlot8();
                     }
                     return;
                 }
@@ -4353,20 +4392,32 @@ public class StepCheckered extends Module implements MapPrinter {
         refillBuildingInventory(invInfo.getRight());
         boolean materialRestockQueued = !restockList.isEmpty();
 
-        // PICKAXE: replace PREDICTIVELY here - a pickaxe that cannot survive a full
-        // batch's breaking (~800 blocks worst case incl. stragglers) is swapped at this
-        // trip, so a mid-batch death never triggers an emergency run (user rule,
-        // 2026-10-20: "emergency restock is for emergency").
+        // PICKAXE (user rule, 2026-10-20): tools are exchanged ONLY here - at the
+        // pre-batch restock trip, when the best pickaxe has gone BELOW min-durability
+        // (strictly below, not at the touch). Never mid-run: a worn pickaxe keeps
+        // swinging until it breaks; the only mid-run trip left is fetching a
+        // replacement after a pickaxe is genuinely gone.
         int pickSlot = findPickaxeSlot();
         int pickRemaining = pickSlot >= 0 ? ToolUtils.getRemainingDamage(mc.player.getInventory().getStack(pickSlot)) : 0;
-        if (pickSlot < 0 || pickRemaining < Math.max(minDurability.get(), PREP_PICKAXE_BUFFER)) {
+        if (pickSlot < 0 || pickRemaining < minDurability.get()) {
             Item pickaxe = findRegisteredPickaxeItem();
             if (pickaxe != null) {
                 info("§7Pickaxe " + (pickSlot < 0 ? "missing" : "at " + pickRemaining + " durability")
-                    + " - replacing at the batch-prep trip (buffer " + PREP_PICKAXE_BUFFER + ").");
+                    + " - exchanging at the batch-prep trip (min-durability " + minDurability.get() + ").");
                 restockList.add(Triple.of(pickaxe, 1, 1));
                 // If materials already have a chest at the head, endRestocking() will promote
                 // this entry after them.  With no material restock, add its first chest now.
+                if (!materialRestockQueued) addClosestRestockCheckpoint();
+            }
+        } else if (countPickaxes() > 1) {
+            // ONE-PICKAXE INVARIANT (user rule 2026-10-20: exactly one pickaxe in the
+            // inventory): the best pickaxe survives the batch, but stale spares would ride
+            // along forever - queue a deposit-only pickaxe-chest visit (0 stacks = take
+            // nothing, park the spares at the chest).
+            Item pickaxe = findRegisteredPickaxeItem();
+            if (pickaxe != null) {
+                info("§7" + (countPickaxes() - 1) + " spare pickaxe(s) carried - depositing them at the batch-prep trip.");
+                restockList.add(Triple.of(pickaxe, 0, 0));
                 if (!materialRestockQueued) addClosestRestockCheckpoint();
             }
         }
@@ -5284,7 +5335,7 @@ public class StepCheckered extends Module implements MapPrinter {
             Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInfo = Utils.getInvInformation(requiredItems, availableSlots);
             refillBuildingInventory(invInfo.getRight());
         }
-        if (needPickaxe && !hasGoodPickaxe() && !toolSet.isEmpty()) {
+        if (needPickaxe && !hasAnyPickaxe() && !toolSet.isEmpty()) {
             for (ItemStack tool : toolSet) {
                 if (tool.isIn(ItemTags.PICKAXES)) {
                     restockList.add(Triple.of(tool.getItem(), 1, 1));
@@ -5617,28 +5668,49 @@ public class StepCheckered extends Module implements MapPrinter {
         return false;
     }
 
-    /** Finds a PICKAXE in the inventory (no other tool qualifies); -1 if none.
-     *  Usable-durability pickaxes are preferred; a worn one is only a fallback. */
+    /** Finds the pickaxe with the HIGHEST remaining durability in the inventory (no other
+     *  tool qualifies); -1 if none. Best-first, not first-found: the prep check must
+     *  measure the best pickaxe and slot 8 must arm the freshest one - first-found armed
+     *  stale pickaxes while fresh ones sat deeper in the inventory, re-triggering a fetch
+     *  every batch prep (live 2026-10-20: five pickaxes accumulated). */
     private int findPickaxeSlot() {
-        int wornSlot = -1;
+        int bestSlot = -1;
         for (int slot = 0; slot < 36; slot++) {
             ItemStack stack = mc.player.getInventory().getStack(slot);
             if (stack.isEmpty() || !stack.isIn(ItemTags.PICKAXES)) continue;
-            if (ToolUtils.getRemainingDamage(stack) >= minDurability.get()) return slot;
-            if (wornSlot == -1) wornSlot = slot;
+            if (bestSlot == -1 || ToolUtils.getRemainingDamage(stack) > ToolUtils.getRemainingDamage(mc.player.getInventory().getStack(bestSlot))) bestSlot = slot;
         }
-        return wornSlot;
+        return bestSlot;
     }
 
-    /** True when a pickaxe with usable durability is carried (reserved slot 8 or anywhere in
-     *  the inventory). A worn pickaxe below min-durability does NOT count - it must be
-     *  replaced, not reused. */
-    private boolean hasGoodPickaxe() {
-        ItemStack reserved = mc.player.getInventory().getStack(8);
-        if (reserved.isIn(ItemTags.PICKAXES) && ToolUtils.getRemainingDamage(reserved) >= minDurability.get()) return true;
+    private int countPickaxes() {
+        int count = 0;
         for (int slot = 0; slot < 36; slot++) {
             ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (!stack.isEmpty() && stack.isIn(ItemTags.PICKAXES) && ToolUtils.getRemainingDamage(stack) >= minDurability.get()) return true;
+            if (!stack.isEmpty() && stack.isIn(ItemTags.PICKAXES)) count++;
+        }
+        return count;
+    }
+
+    /** True when the chest currently being interacted with is registered as stocking a
+     *  pickaxe - the only chest a used pickaxe may be parked into. */
+    private boolean isOpenChestAPickaxeChest() {
+        if (lastInteractedChest == null) return false;
+        for (HashMap.Entry<Item, ArrayList<Pair<BlockPos, Vec3d>>> entry : materialDict.entrySet()) {
+            if (!new ItemStack(entry.getKey()).isIn(ItemTags.PICKAXES)) continue;
+            if (containsChest(entry.getValue(), lastInteractedChest)) return true;
+        }
+        return false;
+    }
+
+    /** True when ANY pickaxe is carried (slot 8 or anywhere in the inventory) - worn
+     *  ones count too: exchanges happen only at the pre-batch restock, so mid-run a
+     *  worn pickaxe is still the tool in hand (user rule, 2026-10-20). */
+    private boolean hasAnyPickaxe() {
+        if (mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) return true;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (!stack.isEmpty() && stack.isIn(ItemTags.PICKAXES)) return true;
         }
         return false;
     }

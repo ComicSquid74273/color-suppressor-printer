@@ -92,6 +92,108 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-10-20 (t) — FINAL tool-exchange design (user rule): ONE setting, prep-only, strictly-below
+User rejected the (r)/(s) two-setting + destruction-guard design: "no mid-run emergency
+restock for pickaxe or any tool; use only min-durability; not a hard cap at the touch —
+if it's gone below this, the slave exchanges it whenever it does a restock before
+starting a batch."
+- **`pickaxe-change-durability` DELETED** (never deployed, no stale config). The single
+  setting is **`min-durability`** (default 20, slider widened 0-2031 so ~800 is
+  reachable): tools are exchanged at the **batch-prep restock trip only**, when the best
+  pickaxe has gone STRICTLY below it (old one deposited into its chest, fresh taken,
+  spares returned — the (q) swap-not-add deposit is unchanged).
+- **NO mid-run durability actions**: the mining branch and the RESET ladder check no
+  longer look at durability at all — a worn pickaxe keeps swinging until it breaks. The
+  only remaining mid-run tool trip fires when a pickaxe is genuinely GONE (broke
+  mid-batch): arm any carried one, else the fetch trip (unavoidable — no tool = no
+  progress). `hasGoodPickaxe` (≥-floor test) replaced by `hasAnyPickaxe`.
+- **Tradeoff (told to user, their call on the number)**: at 20, a fresh diamond pickaxe
+  (1561) survives ~2 measured batches (~700-800 breaks each), then breaks mid-batch and
+  triggers one gone-tool fetch trip per pickaxe. min-durability ≥ ~800 (one batch's
+  worst-case breaking) makes mid-batch breakage — and thus that trip — impossible,
+  because the prep swap always fires first.
+- Saved config verified earlier: min-durability was never user-modified on either bot
+  (Meteor persists only changed settings), so the default 20 loads automatically.
+
+### 2026-10-20 (s) — min-durability IS the destruction guard; default 20 (user rule: "I don't want my tool to get destroyed")
+User clarified the two settings' jobs: `pickaxe-change-durability` (default 20) decides
+WHEN the planned batch-prep exchange happens; **`min-durability` is the hard floor — a
+tool is exchanged the moment its remaining durability reaches this value, MID-BATCH
+included, so it is never destroyed.** Its default is raised 5 → 20 (description
+rewritten to say exactly this).
+- **Boundary made consistent everywhere**: "worn" now means `remaining <= min-durability`
+  at ALL exchange gates (mining branch, RESET ladder check, legacy tool scan, prep fetch
+  bar) and "good" means `> min-durability` in `hasGoodPickaxe`. Reason: with the old
+  strict `<`, a tool sitting at EXACTLY the floor passed the check and could be swung —
+  at breaks-per-tick 20 that is 20 durability in one tick = destruction. At the floor it
+  is now always exchanged first; with any breaks-per-tick ≤ 20 the tool can never reach
+  0 (from 21: one tick max 20 breaks → 1 → exchanged).
+- **Effective behavior at both defaults = 20**: prep swaps the pickaxe when it drops to
+  20 (planned, at the chest); if it reaches 20 mid-batch instead, the emergency swap
+  run fires (north corridor → deposit the old one at the pickaxe chest → take fresh →
+  resume) — the tool is saved with ~17-20 remaining, never broken. Roughly one
+  emergency swap run per pickaxe (~every 2 batches with fresh diamond picks).
+- **Saved config verified**: Meteor only persists CHANGED settings — `min-durability`
+  was never modified on either bot (checked both instances' `modules.nbt`; probe
+  settings like bot-role ARE present, min-durability is not), so the new default 20
+  loads automatically after deploy. No manual UI change needed.
+
+### 2026-10-20 (r) — pickaxe change bar is now a SETTING (pickaxe-change-durability)
+User: "make the minimum durability of pickaxe for change configurable instead of hard
+coding to 10 in code." Note: no 10 was ever hardcoded — the deposit rule returns ALL
+spares structurally (see (q)); the hardcoded number governing WHEN a pickaxe is changed
+was the prep swap bar `PREP_PICKAXE_BUFFER = 800`. That bar is now the
+**`pickaxe-change-durability`** setting (Mining group, slider 0-2031): below it the
+batch-prep trip deposits the old pickaxe into its chest and takes a fresh one. The
+constant is deleted (single source of truth); the swap log line prints the configured
+bar. **Default 20 (user-ordered after being shown the tradeoff)** — pickaxes run to
+near-death before swapping (~half the pickaxe consumption of the 800 bar); consequence:
+a fresh diamond pickaxe survives ~2 batches, the second death happens MID-batch and
+triggers one emergency swap run (~30s) — the emergency path stays as the safety net.
+Setting it ≥800 restores "a pickaxe never dies mid-batch" (emergency restock stays for
+emergencies only). NOT a duplicate of the two existing durability settings:
+`min-durability` (default 5) is the mid-batch usability floor for ALL tools (mining
+branch, hasGoodPickaxe, legacy tool selection) — reusing it as the change bar would
+demand a new pickaxe the moment the active one dips below 20 MID-batch (constant
+emergency runs); `durability-buffer` is a percentage on the legacy mining-refill
+prediction. Setting lives in the EXISTING Mining group (no new group/HUD).
+
+### 2026-10-20 (q) — PICKAXE LIFECYCLE FIXED: swap-not-add, one-pickaxe invariant
+User: "bot should deposit the pickaxe if durability is below 10, in the restock phase
+only before starting it, and not cause an unnecessary emergency refill; it is getting
+so many pickaxes from the chest and not putting back the less durable one — 5 pickaxes
+in inventory; only one pickaxe in inventory."
+- **Root cause (why pickaxes piled up)**: the batch-prep predictive fetch
+  (`queueStepBuildPreparation`, buffer `PREP_PICKAXE_BUFFER=800`) measured the
+  FIRST-FOUND pickaxe, so a stale pickaxe in a low slot kept re-triggering a fetch
+  every batch even when a fresh one was carried; and the return-deposit at the
+  chest (`AwaitRestockResponse`) only parked pickaxes below `min-durability`
+  (default 5) — replaced pickaxes at a few hundred durability NEVER went back.
+  Net +1 pickaxe per batch → 5 carried. First-found arming also burned stale ones
+  mid-batch until every carried pickaxe was worn, THEN tripped the emergency
+  supply run (`pauseForRestockTrip`) — the "unnecessary emergency refill".
+- **`findPickaxeSlot` is now best-first** (highest remaining durability): the prep
+  check measures the best pickaxe and slot 8 always arms the freshest one.
+- **Swap-not-add deposit** (`AwaitRestockResponse`, only when the OPEN chest is a
+  registered pickaxe chest — `isOpenChestAPickaxeChest()`, never a material chest):
+  a pending pickaxe take parks ALL carried pickaxes (the fetch only queues when the
+  best is below the buffer, so all of them are), then the fresh one is taken — net
+  exactly one. With no take pending it keeps exactly ONE pickaxe (the best) and
+  returns every spare. A sub-10-durability pickaxe is never the kept one: it is
+  either a spare, or the sole pickaxe — in which case the 800-buffer fetch has
+  already queued its replacement.
+- **Pile drain at prep**: `queueStepBuildPreparation` queues a deposit-only
+  pickaxe-chest visit (restockList entry with 0 stacks = take nothing, park the
+  spares) whenever more than one pickaxe is carried and no fetch is needed — the
+  current 5-pickaxe state cleans itself on the first prep after deploy.
+- **Deposit-only entries advance**: the take loop's middle==0 no-op previously had
+  no exit for a 0-stack entry; it now calls `endRestocking()` when no take backlog
+  is in flight (a pending TAKE also passes through middle==0 while its backlog
+  drains — the tick's drain still ends that entry itself).
+- Emergency paths unchanged: mid-batch trips remain the safety net for a genuinely
+  dead/missing pickaxe; the invariant + best-first arming is what stops them from
+  firing on a bot that carries fresh spares it never arms.
+
 ### 2026-10-20 (p) — RESET scoped to the PRINTED batches (progress-driven, no whole-map pass)
 User: "we now know what batch was printed — in RESET, instead of walking and
 rendering the whole map to find what to clear, only do it for the printed batches."
