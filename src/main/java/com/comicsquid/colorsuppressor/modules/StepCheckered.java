@@ -5131,6 +5131,17 @@ public class StepCheckered extends Module implements MapPrinter {
     /** Mid-run supply trip: exit north from whatever lane the bot is on, refill at the chest
      *  station (materials while printing; a pickaxe when it broke/went missing), then resume
      *  the interrupted pass. All targets are world-truth based, so resuming is exact. */
+    /** Emergency-trip RETURN discipline: after a chest visit the resumed route must be
+     *  re-entered through the NORTH checkpoint - corridor back to the batch lane, then
+     *  south along the lane. Without this, the bot beelined diagonally from the north
+     *  chest straight across the printed box to the route's first (mid/south) position
+     *  (user callout, live 2026-10-20). */
+    private void prependNorthReEntry() {
+        if (checkpoints.isEmpty()) return;
+        double laneX = checkpoints.getFirst().getLeft().x;
+        checkpoints.addFirst(new Pair(new Vec3d(laneX, lowerMapCorner.getY(), lowerMapCorner.getZ() - 2), new Pair("sprint", null)));
+    }
+
     private void pauseForRestockTrip(boolean needPickaxe) {
         // Cooldown: prevent the supply-run trigger from re-firing every tick while the
         // bot is still Walking toward the chest (tryPlacingBlock sees no materials →
@@ -5172,8 +5183,8 @@ public class StepCheckered extends Module implements MapPrinter {
         } else {
             resumeBatchRoute(savedStage);
         }
-        // Corridor enters on the resumed route's own lane (priming/closing/break-all
-        // included), not the regular-batch formula
+        // Re-enter through the north checkpoint, then exit north via the corridor
+        prependNorthReEntry();
         prependNorthCorridor(checkpoints.isEmpty() ? lowerMapCorner.getX() + 2.5 : checkpoints.getFirst().getLeft().x);
         state = State.Walking;
         Utils.setForwardPressed(false);
@@ -5229,6 +5240,7 @@ public class StepCheckered extends Module implements MapPrinter {
         breakStage = 0;
         checkpoints.clear();
         resumeBatchRoute(4);
+        prependNorthReEntry();
         Pair<BlockPos, Vec3d> chest = getBestDepositChest();
         if (chest != null) {
             checkpoints.addFirst(new Pair(chest.getRight(), new Pair("depositBuilding", chest.getLeft())));
