@@ -4702,7 +4702,17 @@ public class StepCheckered extends Module implements MapPrinter {
                         bestAxeRemaining = Math.max(bestAxeRemaining, ToolUtils.getRemainingDamage(aStack));
                     }
                 }
-                if (bestAxeRemaining < minDurability.get()) {
+                // count carried axes in the same scan pass (one-axe invariant evidence)
+                int axeCarried = 0;
+                ItemStack bestAxe = null;
+                for (int aSlot2 = 0; aSlot2 < 36; aSlot2++) {
+                    ItemStack a2 = mc.player.getInventory().getStack(aSlot2);
+                    if (!a2.isEmpty() && a2.isIn(ItemTags.AXES)) {
+                        axeCarried++;
+                        if (bestAxe == null || ToolUtils.getRemainingDamage(a2) > ToolUtils.getRemainingDamage(bestAxe)) bestAxe = a2;
+                    }
+                }
+                if (bestAxeRemaining < minDurability.get() && axeCarried == 0) {
                     ItemStack axe = null;
                     float axeSpeed = -1;
                     for (ItemStack tool : toolSet) {
@@ -4711,9 +4721,26 @@ public class StepCheckered extends Module implements MapPrinter {
                         if (sp > axeSpeed) { axeSpeed = sp; axe = tool; }
                     }
                     if (axe != null) {
-                        info("§7Axe " + (bestAxeRemaining < 0 ? "missing" : "at " + bestAxeRemaining + " durability")
-                            + " - exchanging at the batch-prep trip (min-durability " + minDurability.get() + ").");
+                        info("§7Axe missing - fetching one at the batch-prep trip.");
                         restockList.add(Triple.of(axe.getItem(), 1, 1));
+                    }
+                } else if (axeCarried > 1) {
+                    // ONE-AXE INVARIANT (mirrors the pickaxe's): the best axe survives;
+                    // spares ride forever otherwise. Deposit-only visit (0 stacks = take
+                    // nothing) parks the spares at the chest. NEVER withdraws a new axe
+                    // while any axe above min-durability is carried.
+                    Item spareAxe = null;
+                    float spareSpeed = -1;
+                    for (ItemStack tool : toolSet) {
+                        if (!tool.isIn(ItemTags.AXES)) continue;
+                        float sp = tool.getMiningSpeedMultiplier(net.minecraft.block.Blocks.OAK_PLANKS.getDefaultState());
+                        if (sp > spareSpeed) { spareSpeed = sp; spareAxe = tool.getItem(); }
+                    }
+                    if (spareAxe != null && bestAxeRemaining >= minDurability.get()) {
+                        info("§7" + (axeCarried - 1) + " spare axe(s) carried (best at " + bestAxeRemaining
+                            + " durability, above min " + minDurability.get() + ") - depositing spares, NO new axe fetched.");
+                        restockList.add(Triple.of(spareAxe, 0, 0));
+                        if (!materialRestockQueued) addClosestRestockCheckpoint();
                     }
                 }
             }
