@@ -682,11 +682,11 @@ public class StepCheckered extends Module implements MapPrinter {
 
     /** MASTER AREA (user rule, 2026-10-20): the platform lattice is a BOUNDED area -
      *  lanes x_rel 125..253 (x = 125+2j), rows z_rel {14,40,64,88,112}, plus the fill
-     *  spot (125.5, 115.5). Inside it the master moves ONLY along lattice lines; the
-     *  area is entered and exited ONLY through the north-west GATE (platform 125,14).
-     *  Violations are logged by the per-tick lattice watchdog. */
+     *  at the gate too. Inside it the master moves ONLY along lattice lines; the area
+     *  is entered and exited ONLY through the north-west GATE (platform 125,14) -
+     *  never from anywhere else. Violations are logged by the lattice watchdog. */
     private static final int MASTER_AREA_X0 = 124, MASTER_AREA_X1 = 255;
-    private static final int MASTER_AREA_Z0 = 12, MASTER_AREA_Z1 = 117;
+    private static final int MASTER_AREA_Z0 = 12, MASTER_AREA_Z1 = 114;
 
     public StepCheckered() {
         super(Addon.CATEGORY, "step-checkered", "Uses the step-checker method to build colour-suppression maps.");
@@ -3312,7 +3312,10 @@ public class StepCheckered extends Module implements MapPrinter {
         stepMasterStage = StepMasterStage.FILL_MAP;
         stepMasterWaitTicks = 0;
         checkpoints.clear();
-        Vec3d fillSpot = stepCheckpoint(125, 115);
+        // FILL AT THE GATE (user rule, 2026-10-20): the map is filled standing on the
+        // north-west GATE platform - the same single checkpoint every entry and exit
+        // uses. The journey starts from here; the old fill spot (125,115) is gone.
+        Vec3d fillSpot = stepCheckpoint(125, 14);
         checkpoints.add(new Pair<>(fillSpot, new Pair<>("stepFillMap", null)));
         prependLatticeTransit(fillSpot.x, fillSpot.z);
         state = State.Walking;
@@ -6442,14 +6445,12 @@ public class StepCheckered extends Module implements MapPrinter {
         }
 
         if (renderMasterArea.get() && lowerMapCorner != null) {
-            // MASTER AREA bounding box + the single entry/exit GATE (user rule)
+            // MASTER AREA bounding box only - the GATE platform (125,14) renders as a
+            // NORMAL checkpoint via the platform grid (user rule), no special pillar.
             double ax0 = lowerMapCorner.getX() + MASTER_AREA_X0, ax1 = lowerMapCorner.getX() + MASTER_AREA_X1;
             double az0 = lowerMapCorner.getZ() + MASTER_AREA_Z0, az1 = lowerMapCorner.getZ() + MASTER_AREA_Z1;
             double ay = lowerMapCorner.getY();
             event.renderer.box(ax0, ay - 1, az0, ax1, ay, az1, specialCheckpointsColor.get(), specialCheckpointsColor.get(), ShapeMode.Lines, 0);
-            // The GATE: north-west platform (125,14), drawn solid + a pillar so it stands out
-            double gx = lowerMapCorner.getX() + 125, gz = lowerMapCorner.getZ() + 14;
-            event.renderer.box(gx, ay - 2, gz, gx + 1, ay + 2, gz + 1, specialCheckpointsColor.get(), specialCheckpointsColor.get(), ShapeMode.Both, 0);
         }
 
         if (renderCheckpointGrid.get() && lowerMapCorner != null) {
@@ -6472,12 +6473,6 @@ public class StepCheckered extends Module implements MapPrinter {
             // render every frame - the lock marker at rel x~98 showed up during every
             // batch and looked like a stray checkpoint.)
             ArrayList<Vec3d> specialPoints = new ArrayList<>();
-            if (stepMasterStage == StepMasterStage.IDLE
-                || stepMasterStage == StepMasterStage.FETCH_MAP
-                || stepMasterStage == StepMasterStage.FILL_MAP
-                || stepMasterStage == StepMasterStage.WAIT_FILLED_MAP) {
-                specialPoints.add(new Vec3d(lowerMapCorner.getX() + 125.5, lowerMapCorner.getY(), lowerMapCorner.getZ() + 115.5));
-            }
             if (cartographyTable != null
                 && (stepMasterStage == StepMasterStage.CLOSING_WALK
                     || stepMasterStage == StepMasterStage.WAIT_CLOSING_BREAK
