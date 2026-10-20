@@ -1508,7 +1508,21 @@ public class StepCheckered extends Module implements MapPrinter {
         // reaches these flags through the step-checker TCP protocol.
         if (state == State.AwaitBreakPermission2 && break2Permitted) {
             break2Permitted = false;
+            // PHASE TOOL SLOTS: breaking needs the tools - pickaxe to 8, carried axe
+            // to 9; both leave the staging set until the next print pass.
             ensurePickaxeSlot8();
+            availableHotBarSlots.remove(Integer.valueOf(8));
+            {
+                int axeSlot = -1;
+                for (int as2 = 0; as2 < 36 && axeSlot == -1; as2++) {
+                    ItemStack a3 = mc.player.getInventory().getStack(as2);
+                    if (!a3.isEmpty() && a3.isIn(ItemTags.AXES) && ToolUtils.getRemainingDamage(a3) >= minDurability.get()) axeSlot = as2;
+                }
+                if (axeSlot != -1 && axeSlot != 9) {
+                    Utils.performSwap(axeSlot, 9);
+                }
+                availableHotBarSlots.remove(Integer.valueOf(9));
+            }
             breakStage = 2;
             state = State.Mining;
         } else if (state == State.AwaitBreakPermissionAll && breakAllPermitted) {
@@ -2576,30 +2590,54 @@ public class StepCheckered extends Module implements MapPrinter {
                 if (inHotbar) continue;
                 if (fe.getValue() < bringInZ) { bringInZ = fe.getValue(); bringIn = fe.getKey(); }
             }
-            if (bringIn != null) {
+            // BELADY MULTI-SWAP (v4, live 2026-10-21: v3's one-swap-per-second + the
+            // never-evict-sooner-resident guard left soon-used materials missing while
+            // far ones rode the hotbar). Eviction = farthest-next-use (true Belady),
+            // and ALL missing window materials are staged this check - a swap cascade
+            // every second, each evicting the farthest-future resident.
+            int swapsDone = 0;
+            java.util.ArrayList<Item> bringOrder = new java.util.ArrayList<>();
+            java.util.ArrayList<Integer> bringZs = new java.util.ArrayList<>();
+            for (java.util.Map.Entry<Item, Integer> fe : firstUseZ.entrySet()) {
+                boolean inHotbar = false;
+                for (int hs : availableHotBarSlots) {
+                    ItemStack hStack = mc.player.getInventory().getStack(hs);
+                    if (!hStack.isEmpty() && hStack.getItem().equals(fe.getKey())) { inHotbar = true; break; }
+                }
+                if (!inHotbar) { bringOrder.add(fe.getKey()); bringZs.add(fe.getValue()); }
+            }
+            for (int a = 0; a < bringOrder.size(); a++) {
+                for (int b = a + 1; b < bringOrder.size(); b++) {
+                    if (bringZs.get(b) < bringZs.get(a)) {
+                        Item tI = bringOrder.get(a); bringOrder.set(a, bringOrder.get(b)); bringOrder.set(b, tI);
+                        Integer tZ = bringZs.get(a); bringZs.set(a, bringZs.get(b)); bringZs.set(b, tZ);
+                    }
+                }
+            }
+            for (int bi = 0; bi < bringOrder.size() && swapsDone < 4; bi++) {
+                Item inItem = bringOrder.get(bi);
+                int inZ = bringZs.get(bi);
                 int srcSlot = -1;
                 for (int is = 9; is < 36 && srcSlot == -1; is++) {
                     ItemStack iStack = mc.player.getInventory().getStack(is);
-                    if (!iStack.isEmpty() && iStack.getItem().equals(bringIn)) srcSlot = is;
+                    if (!iStack.isEmpty() && iStack.getItem().equals(inItem)) srcSlot = is;
                 }
-                if (srcSlot != -1) {
-                    // evict the resident with the LARGEST first-use z (empty slot wins instantly)
-                    int evictSlot = -1;
-                    int worstZ = Integer.MIN_VALUE;
-                    for (int hs : availableHotBarSlots) {
-                        ItemStack eStack = mc.player.getInventory().getStack(hs);
-                        if (eStack.isEmpty()) { evictSlot = hs; worstZ = Integer.MAX_VALUE; break; }
-                        Integer eZ = firstUseZ.get(eStack.getItem());
-                        int eDist = (eZ == null) ? Integer.MAX_VALUE : eZ;
-                        if (eDist > worstZ) { worstZ = eDist; evictSlot = hs; }
-                    }
-                    // never evict a resident that is needed SOONER than the bring-in
-                    if (evictSlot != -1 && worstZ >= bringInZ) {
-                        Utils.performSwap(srcSlot, evictSlot);
-                        info("§7Hotbar rolling: §f" + bringIn.getName().getString() + "§7 swapped in (slot " + evictSlot
-                            + ", first use ~" + (bringInZ - botZNow) + " rows ahead).");
-                    }
+                if (srcSlot == -1) continue;
+                int evictSlot = -1;
+                int worstZ = Integer.MIN_VALUE;
+                for (int hs : availableHotBarSlots) {
+                    ItemStack eStack = mc.player.getInventory().getStack(hs);
+                    if (eStack.isEmpty()) { evictSlot = hs; worstZ = Integer.MAX_VALUE; break; }
+                    Integer eZ = firstUseZ.get(eStack.getItem());
+                    int eDist = (eZ == null) ? Integer.MAX_VALUE : eZ;
+                    if (eDist > worstZ) { worstZ = eDist; evictSlot = hs; }
                 }
+                if (evictSlot == -1) break;
+                if (worstZ < inZ) break;
+                Utils.performSwap(srcSlot, evictSlot);
+                swapsDone++;
+                info("§7Hotbar rolling: §f" + inItem.getName().getString() + "§7 swapped in (slot " + evictSlot
+                    + ", first use ~" + (inZ - botZNow) + " rows ahead).");
             }
         }
         // Range gate uses EYE distance - the same metric the target pickers use. A
@@ -4530,6 +4568,25 @@ public class StepCheckered extends Module implements MapPrinter {
         // actual batch route is appended only after preparation is complete.
         queueStepBuildPreparation(walkX);
 
+        // PHASE TOOL SLOTS (user rule, live 2026-10-21): printing needs NO tools -
+        // slots 8-9 join the staging set during the print pass. The pickaxe/axe move
+        // to the main inventory here; break(2)/break(4) moves them back into 8/9.
+        {
+            for (int ts = 8; ts <= 9; ts++) {
+                ItemStack tStack = mc.player.getInventory().getStack(ts);
+                if (!tStack.isEmpty() && (tStack.isIn(ItemTags.PICKAXES) || tStack.isIn(ItemTags.AXES))) {
+                    int freeSlot = -1;
+                    for (int fs = 9; fs < 36 && freeSlot == -1; fs++) {
+                        if (mc.player.getInventory().getStack(fs).isEmpty()) freeSlot = fs;
+                    }
+                    if (freeSlot != -1) {
+                        Utils.performSwap(ts, freeSlot);
+                        if (!availableHotBarSlots.contains(ts)) availableHotBarSlots.add(ts);
+                        info("§7Print phase: " + tStack.getItem().getName().getString() + " moved out of slot " + ts + " - staging slot freed.");
+                    }
+                }
+            }
+        }
         // HOTBAR LOOKAHEAD (user rule, live 2026-10-21): pre-arrange the hotbar with
         // the FIRST distinct materials of this batch's plan (walking order), so the
         // print pass rarely stalls on mid-run swaps - the old on-demand one-slot
