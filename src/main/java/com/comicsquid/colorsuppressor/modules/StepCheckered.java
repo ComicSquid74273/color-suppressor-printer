@@ -566,6 +566,7 @@ public class StepCheckered extends Module implements MapPrinter {
     HashMap<BlockPos, Integer> placementAttempts;                    // per-position placement attempts (adaptive-pace cap)
     int placeHoldTicks;                                              // consecutive adaptive-pace hold ticks (watchdog)
     int breakHoldTicks;                                              // consecutive break-pace hold ticks (watchdog)
+    BlockPos vanillaStickyTarget;                                    // ONE multi-tick vanilla target at a time (progress must accumulate)
     int rateTick;                                                   // 20-tick rate-report cycle
     int breakSentPerSec, breakConfirmedPerSec, placeSentPerSec;      // [RATE] verification counters
     java.util.HashMap<BlockPos, Integer> collectSkips;               // collection run: picks per drop (10 = blacklisted)
@@ -2866,7 +2867,16 @@ public class StepCheckered extends Module implements MapPrinter {
         if (mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) {
             mc.player.getInventory().setSelectedSlot(8);
         }
+        // STICKY VANILLA: multi-tick breaking is stateful single-target — a NEW
+        // BlockUtils.breakBlock on a different pos resets the previous one's progress.
+        // Round-robining several vanilla targets per tick = nothing ever breaks (live
+        // 2026-10-20 batch 13: 68 blocks frozen 80s "trying to break"). ONE vanilla
+        // target at a time, held across ticks until air; everything else fastBreak.
+        if (vanillaStickyTarget != null && miningBlockState(vanillaStickyTarget).isAir()) {
+            vanillaStickyTarget = null;
+        }
         int sent = 0;
+        boolean vanillaSentThisTick = false;
         for (int pick = 0; pick < maxSends * 3 && sent < maxSends; pick++) {
             BlockPos breakTarget;
             if (pick == 0 && nextBlockPos != null && !attempted.contains(nextBlockPos)) {
@@ -2880,13 +2890,62 @@ public class StepCheckered extends Module implements MapPrinter {
             attempted.add(breakTarget);
             if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
             if (breakPending.containsKey(breakTarget)) continue;  // awaiting server confirm - next distinct
+            boolean needsVanilla = needsVanillaBreak.contains(breakTarget);
+            if (needsVanilla) {
+                if (vanillaSentThisTick) continue;                 // one vanilla send per tick
+                if (vanillaStickyTarget != null && !breakTarget.equals(vanillaStickyTarget)) {
+                    continue;                                      // stick to the current vanilla target
+                }
+            }
             nextBlockPos = breakTarget;
+            // BEST-TOOL AUTO-SWITCH (user rule, live 2026-10-20: oak/spruce planks,
+            // crimson/warped hyphae in the art need an AXE — with the pickaxe they
+            // take ~60 ticks/block). The server computes break time from the HELD item.
+            if (!ensureBestToolFor(breakTarget)) continue;        // no usable tool - try next candidate
             sendHybridBreak(breakTarget);
+            if (needsVanilla) {
+                vanillaStickyTarget = breakTarget;
+                vanillaSentThisTick = true;
+            }
             sent++;
             breakSentPerSec++;
         }
         if (sent > 0) breakSweepActedThisTick = true;
         return sent;
+    }
+
+    /** Hold the FASTEST TOOL for the target block (axe for wood, pickaxe for stone).
+     *  Ranks the registered toolSet against the block, finds a matching stack in the
+     *  inventory, and selects it. Falls back to the reserved pickaxe (slot 8). */
+    private boolean ensureBestToolFor(BlockPos target) {
+        BlockState state = miningBlockState(target);
+        ItemStack best = toolSet.isEmpty() ? null : ToolUtils.getBestTool(toolSet, state);
+        ItemStack reserved = mc.player.getInventory().getStack(8);
+        if (best == null || (reserved.isIn(ItemTags.PICKAXES)
+            && new ItemStack(best.getItem()).getMiningSpeedMultiplier(state) <= reserved.getMiningSpeedMultiplier(state))) {
+            best = reserved;
+        }
+        Item bestItem = best.getItem();
+        if (mc.player.getMainHandStack().getItem().equals(bestItem)) return true;
+        for (int slot : availableHotBarSlots) {
+            if (!mc.player.getInventory().getStack(slot).isEmpty()
+                && mc.player.getInventory().getStack(slot).getItem().equals(bestItem)) {
+                mc.player.getInventory().setSelectedSlot(slot);
+                return true;
+            }
+        }
+        for (int slot = 9; slot < 36; slot++) {
+            if (!mc.player.getInventory().getStack(slot).isEmpty()
+                && mc.player.getInventory().getStack(slot).getItem().equals(bestItem)) {
+                Utils.performSwap(slot, mc.player.getInventory().getSelectedSlot());
+                return true;
+            }
+        }
+        if (reserved.isIn(ItemTags.PICKAXES)) {
+            mc.player.getInventory().setSelectedSlot(8);
+            return true;
+        }
+        return false;
     }
 
     /** HYBRID BREAK SEND - the ONE copy of the break rules. One fastBreak per position
@@ -2903,7 +2962,7 @@ public class StepCheckered extends Module implements MapPrinter {
         } else {
             ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(target);
             mc.player.swingHand(Hand.MAIN_HAND);
-            breakPending.put(target, 2);
+            breakPending.put(target, 4);   // 4-tick window: Folia's block-update echo can lag 2-3 ticks
         }
     }
 
@@ -4450,6 +4509,28 @@ public class StepCheckered extends Module implements MapPrinter {
                 if (!materialRestockQueued) addClosestRestockCheckpoint();
             }
         }
+        // BEST-TOOL PREP: when the batch palette contains wood-class blocks (planks/
+        // hyphae need an AXE — a pickaxe takes ~60 ticks/block), make sure an axe is
+        // carried. Only fetches when none is in the inventory (one, from tool chests).
+        if (currentBuildPlan != null && !carriesAxe()) {
+            boolean needsWoodTool = false;
+            for (Block b : currentBuildPlan.values()) {
+                if (b.getDefaultState().isIn(net.minecraft.registry.tag.BlockTags.AXE_MINEABLE)) { needsWoodTool = true; break; }
+            }
+            if (needsWoodTool) {
+                ItemStack axe = null;
+                float axeSpeed = -1;
+                for (ItemStack tool : toolSet) {
+                    if (!tool.isIn(ItemTags.AXES)) continue;
+                    float sp = tool.getMiningSpeedMultiplier(net.minecraft.block.Blocks.OAK_PLANKS.getDefaultState());
+                    if (sp > axeSpeed) { axeSpeed = sp; axe = tool; }
+                }
+                if (axe != null) {
+                    info("§7Batch palette has axe-class blocks - fetching an axe at the prep trip.");
+                    restockList.add(Triple.of(axe.getItem(), 1, 1));
+                }
+            }
+        }
         // FOOD (user rule): fetch ONLY when the OFFHAND stack is below 10 pieces, and
         // take only what fits in the offhand (never a second full stack on top of one).
         if (foodChest != null && offhandFoodCount() < 10) {
@@ -5705,6 +5786,15 @@ public class StepCheckered extends Module implements MapPrinter {
         ItemStack off = mc.player.getOffHandStack();
         if (off.isEmpty() || !off.contains(DataComponentTypes.FOOD)) return 0;
         return off.getCount();
+    }
+
+    /** Any axe with usable durability currently in the inventory? */
+    private boolean carriesAxe() {
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (!stack.isEmpty() && stack.isIn(ItemTags.AXES) && ToolUtils.getRemainingDamage(stack) >= minDurability.get()) return true;
+        }
+        return false;
     }
 
     private boolean hasFoodInInventory() {
