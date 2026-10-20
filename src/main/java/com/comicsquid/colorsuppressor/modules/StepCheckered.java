@@ -340,6 +340,21 @@ public class StepCheckered extends Module implements MapPrinter {
         .build()
     );
 
+    private final Setting<Boolean> batch0SplitBuild = sgAdvanced.add(new BoolSetting.Builder()
+        .name("batch0-split-build")
+        .description("Split batch 0 into floor/tops halves around W1 (the proven fix for pair 0's floor recording). OFF = batch 0 runs the STANDARD flow exactly like every other batch: build(4) -> W1 -> break(2) -> W2 -> break-all, no pre-build phase.")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<Integer> startBatch = sgAdvanced.add(new IntSetting.Builder()
+        .name("start-batch")
+        .description("First batch to build in a fresh run - all batches before it are SKIPPED (nothing built, no walks). 0 = start at batch 0; set 1 to test the pipeline from batch 1 onward.")
+        .defaultValue(1)
+        .sliderRange(0, 62)
+        .build()
+    );
+
     // Multi User
 
     private final Setting<String> tcpIp = sgMultiUser.add(new StringSetting.Builder()
@@ -538,6 +553,9 @@ public class StepCheckered extends Module implements MapPrinter {
     HashMap<BlockPos, Integer> placementCooldowns;                   // litematica-style: retry timer per position
     HashMap<BlockPos, Integer> placementAttempts;                    // per-position placement attempts (adaptive-pace cap)
     int placeHoldTicks;                                              // consecutive adaptive-pace hold ticks (watchdog)
+    int breakHoldTicks;                                              // consecutive break-pace hold ticks (watchdog)
+    java.util.HashMap<BlockPos, Integer> collectSkips;               // collection run: picks per drop (10 = blacklisted)
+    int breakHoldSuppression;                                        // ticks to skip break-pace holding after a watchdog release
     // BREAK CONFIRMATION: fastBreak sends packets but the server's block-update
     // arrives 1-2 ticks later. These track recently-broken positions and retry
     // any that the server didn't process — BEFORE the bot walks past them.
@@ -547,6 +565,8 @@ public class StepCheckered extends Module implements MapPrinter {
     BlockPos jamWatchTarget;                                        // feed-jam detector: armed target held out of range
     int jamWatchTicks;
     boolean breakSweepActedThisTick;                                // the Mining-state break loop already sent packets this tick
+    String lastMasterCpLog;                                         // dedup for the always-on master checkpoint log
+    int stepSavedProgressMapId = -1;                                // map id persisted with the progress file (crash/restart resume)
     String resetStallSig;                                           // reset arrival stall detector: last arrival state signature
     int resetStallRounds;
     int sweepWaitRounds;                                            // batch sweep: consecutive in-flight-drop dwell arrivals
@@ -601,7 +621,6 @@ public class StepCheckered extends Module implements MapPrinter {
     private volatile int stepSlaveReadyBatch = -1;
     private volatile int stepSlaveBreak2DoneBatch = -1;
     private volatile int stepSlaveDoneBatch = -1;
-    private volatile boolean stepSlaveReadyPriming;
     private volatile boolean stepSlaveReadyClosing;
     private volatile boolean stepSlaveClosingDone;
     private volatile StepMasterStage stepMasterStage = StepMasterStage.IDLE;
@@ -632,14 +651,15 @@ public class StepCheckered extends Module implements MapPrinter {
     private static final int[] RESET_SEG_START = {0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120};
     private static final int[] RESET_SEG_END = {7, 15, 23, 31, 39, 47, 55, 63, 71, 79, 87, 95, 103, 111, 119, 127};
     private static final int[] RESET_SEG_CENTER_Z = {4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92, 100, 108, 116, 124};
-    /** ITEM SCAN MARGIN: block drops skid 1-2 blocks outside the segment / print box in
-     *  any horizontal direction. Item scans (arrival, verify walk) extend this far past
-     *  the block bounds so outside drops are chased and collected, not ignored. */
-    private static final int RESET_ITEM_MARGIN = 2;
+    /** ITEM SCAN MARGIN: block drops skid up to 3-4 blocks outside the segment /
+     *  print box in any horizontal direction (worst case, user-measured 2026-10-20).
+     *  Item scans (arrival, verify walk, batch gates) extend this far past the block
+     *  bounds so outside drops are chased and collected, not ignored. */
+    private static final int RESET_ITEM_MARGIN = 4;
     /** Route actions during which placement may happen (also gates the Dynamic speed mode:
      *  these + Mining = "working", everything else is transit). */
     private static final List<String> ALLOW_PLACE_ACTIONS = Arrays.asList("lineBegin", "lineEnd", "sprint",
-        "mineBegin", "mineEnd", "batchBegin", "printDone", "printDone2", "stepPrimingReady", "stepPrimingWait",
+        "mineBegin", "mineEnd", "batchBegin", "printDone", "printDone2",
         "awaitBreak2", "break2Done", "breakAllBegin", "breakAllDone", "stepClosingReady", "stepClosingWait",
         "stepClosingDone", "batchExit", "sweepTick", "fullSweepStart", "fullSweepCenter", "fullSweepTick",
         "fullSweepDone", "resetStation", "resetPass", "verifyWalk");
@@ -809,9 +829,7 @@ public class StepCheckered extends Module implements MapPrinter {
         if (parts.length < 2) return;
         switch (parts[0]) {
             case "ready" -> {
-                if ("prime".equals(parts[1])) {
-                    stepSlaveReadyPriming = true;
-                } else if ("close".equals(parts[1])) {
+                if ("close".equals(parts[1])) {
                     stepSlaveReadyClosing = true;
                 } else {
                     Integer batch = parseStepBatch(parts[1]);
@@ -888,7 +906,10 @@ public class StepCheckered extends Module implements MapPrinter {
         pendingDisable = false;
         placementCooldowns = new HashMap<>();
         placementAttempts = new HashMap<>();
+        collectSkips = new java.util.HashMap<>();
         placeHoldTicks = 0;
+        breakHoldTicks = 0;
+        breakHoldSuppression = 0;
         breakPending = new HashMap<>();
         needsVanillaBreak = new java.util.HashSet<>();
         vanillaBreakRetries = new HashMap<>();
@@ -906,7 +927,6 @@ public class StepCheckered extends Module implements MapPrinter {
         stepSlaveReadyBatch = -1;
         stepSlaveBreak2DoneBatch = -1;
         stepSlaveDoneBatch = -1;
-        stepSlaveReadyPriming = false;
         stepSlaveReadyClosing = false;
         stepSlaveClosingDone = false;
         stepMasterStage = StepMasterStage.IDLE;
@@ -1747,17 +1767,7 @@ public class StepCheckered extends Module implements MapPrinter {
                     // the vanilla fallback on multi-tick blocks before.
                     if (breakPending.containsKey(breakTarget)) break;
                     nextBlockPos = breakTarget;
-                    if (needsVanillaBreak.contains(breakTarget)) {
-                        // fastBreak failed before — continue multi-tick vanilla progress.
-                        // NOT removed here: the air-check cleanup above owns removal, so
-                        // progress continues on the following ticks instead of dropping
-                        // the block back into fastBreak after a single vanilla call.
-                        mc.player.getInventory().setSelectedSlot(8);
-                        BlockUtils.breakBlock(breakTarget, true);
-                    } else {
-                        ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(breakTarget); mc.player.swingHand(Hand.MAIN_HAND);
-                        breakPending.put(breakTarget, 2);
-                    }
+                    sendHybridBreak(breakTarget);
                     breakSweepActedThisTick = true;
                     if (!miningBlockState(breakTarget).isAir()) break;  // server didn't accept, stop
                 }
@@ -1822,40 +1832,10 @@ public class StepCheckered extends Module implements MapPrinter {
         if (!(state.equals(State.Walking) || state.equals(State.Mining))) return;
         if (checkpoints.isEmpty()) return;
 
-        // ADAPTIVE PRINT PACE (real-time repair): hold forward while an in-range plan
-        // block is placeable RIGHT NOW. The condition mirrors the placement branch's
-        // FULL preconditions — same head-action allowlist (a "refill"/"centerLane" leg
-        // never attempts placements, so holding on it deadlocks: live 2026-10-20 01:36),
-        // same picker, material carried, per-position attempt cap. A 5-second watchdog
-        // force-releases any hold that persists without progress, so no future gap in
-        // these conditions can ever freeze the bot again.
-        boolean holdForPlacement = false;
-        if (state.equals(State.Walking) && breakStage == 0 && currentBuildPlan != null
-            && !checkpoints.isEmpty()
-            && ALLOW_PLACE_ACTIONS.contains(checkpoints.getFirst().getRight().getLeft())) {
-            BlockPos placeNow = getNextBatchPlacementPos();
-            if (placeNow != null && placementAttempts.getOrDefault(placeNow, 0) < 5) {
-                Block planned = currentBuildPlan.get(placeNow);
-                if (planned != null && isMaterialCarried(planned.asItem())) {
-                    placeHoldTicks++;
-                    if (placeHoldTicks > 100) {
-                        placementAttempts.put(placeNow, 5);   // force-release: treat as capped
-                        warning("§ePrint pace-hold watchdog: released a " + placeHoldTicks
-                            + "-tick hold on " + placeNow.toShortString() + " - walking on.");
-                        placeHoldTicks = 0;
-                    } else {
-                        holdForPlacement = true;
-                    }
-                } else {
-                    placeHoldTicks = 0;
-                }
-            } else {
-                placeHoldTicks = 0;
-            }
-        } else {
-            placeHoldTicks = 0;
-        }
-        Utils.setForwardPressed(!holdForPlacement);
+        // ADAPTIVE PACE GOVERNOR - the ONE place that decides whether the bot may
+        // advance while working. Two modes, one contract (see adaptivePaceHold()).
+        Utils.setForwardPressed(!adaptivePaceHold());
+
         Vec3d goal = checkpoints.get(0).getLeft();
         if (PlayerUtils.distanceTo(goal.add(0, mc.player.getY() - goal.y, 0)) < checkpointBuffer.get()) {
             Pair<String, BlockPos> checkpointAction = checkpoints.get(0).getRight();
@@ -1876,7 +1856,8 @@ public class StepCheckered extends Module implements MapPrinter {
                 || "resetStation".equals(checkpointAction.getLeft()))
                 || "sweepTick".equals(checkpointAction.getLeft())
                 || "batchExit".equals(checkpointAction.getLeft())
-                || "breakAllDone".equals(checkpointAction.getLeft());
+                || "breakAllDone".equals(checkpointAction.getLeft())
+                || "collectRun".equals(checkpointAction.getLeft());
             if (isSweepFamilyAction) {
                 stuckCheckpointCount = 0;
                 lastCheckpointAction = checkpointAction.getLeft();
@@ -2021,16 +2002,6 @@ public class StepCheckered extends Module implements MapPrinter {
                 case "printDone2":
                     if (!verifyPrintPass2()) return;
                     break;
-                case "stepPrimingReady":
-                    if (!verifyCurrentPlan("Priming")) return;
-                    info("§aPriming placement verified. Waiting for the master's recessive walk.");
-                    SlaveSystem.sendMessageToMaster("step:ready:prime");
-                    state = State.Walking;
-                    break;
-                case "stepPrimingWait":
-                    state = State.StandBy;
-                    Utils.setForwardPressed(false);
-                    return;
                 case "awaitBreak2":
                     if (printRepairPending) break;   // repair pass: walk through lane -1 placing
                     info("§aBatch " + currentBatch + " placed. Waiting for master's break(2) permission.");
@@ -2046,9 +2017,9 @@ public class StepCheckered extends Module implements MapPrinter {
                         // proceed to the normal break(2) wait.
                         printRepairPending = false;
                         double repairX = lowerMapCorner.getX() + 2 * currentBatch + 2 + 0.5;  // lane 2 (borrow-west) center
-                        boolean rFromSouth = slaveStartsFromSouth();
-                        double rStartZ = rFromSouth ? lowerMapCorner.getZ() + 128.7 : lowerMapCorner.getZ() - 2;
-                        double rFarZ = rFromSouth ? lowerMapCorner.getZ() - 2 : lowerMapCorner.getZ() + 128.7;
+                        // FIXED CYCLE: repair pass N->S like the print pass (no mirroring)
+                        double rStartZ = lowerMapCorner.getZ() - 2;
+                        double rFarZ = lowerMapCorner.getZ() + 128.7;
                         checkpoints.add(0, new Pair(new Vec3d(repairX, lowerMapCorner.getY(), rStartZ), new Pair("break2Done", null)));
                         checkpoints.add(0, new Pair(new Vec3d(repairX, lowerMapCorner.getY(), rFarZ), new Pair("awaitBreak2", null)));
                         checkpoints.add(0, new Pair(new Vec3d(repairX, lowerMapCorner.getY(), rFarZ), new Pair("printDone2", null)));
@@ -2120,27 +2091,67 @@ public class StepCheckered extends Module implements MapPrinter {
                             + (freeInventoryCapacity() == 0 ? " §cINV-FULL(item chase skipped)" : ""));
                     }
                     BlockPos straggler = nearestRemainingPlanBlock();
-                    ItemEntity dropItem = freeInventoryCapacity() > 0
-                        ? findNearestItemInArea(bwx0, bwx0 + 7, lowerMapCorner.getZ() - 3, lowerMapCorner.getZ() + 129) : null;
-                    double sDist = straggler != null ? mc.player.getEyePos().distanceTo(straggler.toCenterPos()) : Double.MAX_VALUE;
-                    double dDist = dropItem != null ? mc.player.getEyePos().distanceTo(dropItem.getEntityPos()) : Double.MAX_VALUE;
-                    if (straggler == null && dropItem == null) {
-                        if (census[1] + census[2] > 0) {
-                            // WAIT for in-flight drops: they land within ~10-20 ticks and a
-                            // departing bot never returns for them.
-                            checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("breakAllDone", null)));
-                            return;
-                        }
+                    int totalDrops = census[0] + census[1] + census[2];
+                    if (straggler == null && totalDrops == 0) {
                         info("§aBreak-all batch " + currentBatch + " CLEAN - fully confirmed.");
                         break;   // queue advances to batchExit (finishBatch re-verifies + completes)
                     }
-                    if (straggler != null && sDist <= dDist) {
-                        // arm the hybrid Mining loop on the straggler (walk + break)
+                    if (straggler != null) {
+                        // BLOCKS FIRST, always - no collection happens until break(4) has
+                        // actually finished (blocks = 0, server-confirmed).
                         nextBlockPos = straggler;
                         checkpoints.addFirst(new Pair(straggler.toCenterPos(), new Pair("breakAllDone", null)));
-                    } else {
-                        checkpoints.addFirst(new Pair(new Vec3d(dropItem.getX(), dropItem.getY(), dropItem.getZ()), new Pair("breakAllDone", null)));
+                        return;
                     }
+                    if (census[0] == 0) {
+                        // Only in-flight drops remain: they land within ~10-20 ticks and a
+                        // departing bot never returns for them - dwell and re-check.
+                        checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("breakAllDone", null)));
+                        return;
+                    }
+                    // break(4) COMPLETE (blocks=0) and ready drops on the ground: ONE
+                    // single south-to-north collection run. The break pass always ends at
+                    // the SOUTH end, so the run starts there and only ever advances
+                    // north (side-steps to drops are east-west; no NS reversals).
+                    info("§6[BREAKALL-VERIFY]§7 batch " + currentBatch + ": blocks=0, " + census[0]
+                        + " ready drops - single south-to-north collection run.");
+                    checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("collectRun", null)));
+                    state = State.Walking;
+                    return;
+                }
+                case "collectRun": {
+                    // SINGLE-RUN COLLECTOR: re-target the nearest drop at/ahead of the
+                    // bot (z never moves more than 1.5 blocks south) - the run sweeps
+                    // the whole window monotonically south -> north and ends clean. No
+                    // collection happens anywhere before break(4) completes.
+                    state = State.Walking;
+                    int[] cCensus = itemCensusInBatchWindow();
+                    if (cCensus[0] + cCensus[1] + cCensus[2] == 0) {
+                        // The run ends at the NORTH end - replace the stale south-end
+                        // batchExit (queued by startBreakAll next to breakAllDone) with
+                        // one HERE: the exit gate is position-independent, and walking a
+                        // full lane back south just to reach it is pure waste.
+                        checkpoints.removeIf(cp -> "batchExit".equals(cp.getRight().getLeft()));
+                        checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("batchExit", null)));
+                        info("§aBatch " + currentBatch + " collection run complete - window clean, exiting in place.");
+                        return;
+                    }
+                    if (cCensus[0] == 0) {
+                        // everything left is in flight - dwell one re-check
+                        checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("collectRun", null)));
+                        return;
+                    }
+                    ItemEntity next = nearestCollectTarget();
+                    if (next == null) {
+                        // only unreachable/blacklisted drops remain - hand off to the exit
+                        // gate HERE (finishBatch census will name them)
+                        checkpoints.removeIf(cp -> "batchExit".equals(cp.getRight().getLeft()));
+                        checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("batchExit", null)));
+                        warning("§6[BREAKALL-VERIFY]§e batch " + currentBatch + ": " + cCensus[0]
+                            + " drops unreachable in the collection run - exiting to the gate in place.");
+                        return;
+                    }
+                    checkpoints.addFirst(new Pair(new Vec3d(next.getX(), next.getY(), next.getZ()), new Pair("collectRun", null)));
                     return;
                 }
                 case "batchExit":
@@ -2314,18 +2325,10 @@ public class StepCheckered extends Module implements MapPrinter {
                     if (lTarget != null && bDist <= iDist) {
                         if (bDist <= interactionRange.get()) {
                             nextBlockPos = lTarget;
-                            // Same hybrid rules as the per-tick break loop: don't re-send
-                            // fastBreak while a confirmation is pending, and never raw-send
-                            // START/STOP on a vanilla-flagged block (it resets the server's
-                            // elapsed-time validation and starves the multi-tick progress).
-                            if (needsVanillaBreak.contains(lTarget)) {
-                                mc.player.getInventory().setSelectedSlot(8);
-                                BlockUtils.breakBlock(lTarget, true);
-                            } else if (!breakPending.containsKey(lTarget)) {
-                                ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(lTarget);
-                                mc.player.swingHand(Hand.MAIN_HAND);
-                                breakPending.put(lTarget, 2);
-                            }
+                            // Same hybrid rules as the per-tick break loop - via the ONE
+                            // shared sender (pending-guarded: no re-send while a
+                            // confirmation is in flight).
+                            if (!breakPending.containsKey(lTarget)) sendHybridBreak(lTarget);
                             checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("resetStation", null)));
                             state = State.Mining;
                             breakStage = 4;
@@ -2534,16 +2537,7 @@ public class StepCheckered extends Module implements MapPrinter {
                     if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
                     if (breakPending.containsKey(breakTarget)) break;
                     nextBlockPos = breakTarget;
-                    if (needsVanillaBreak.contains(breakTarget)) {
-                        // fastBreak failed before — this block needs 2-3 tick mining progress.
-                        // Vanilla updateBlockBreakingProgress handles it correctly. NOT removed
-                        // here: the air-check cleanup at the top of the tick owns removal.
-                        BlockUtils.breakBlock(breakTarget, true);
-                    } else {
-                        // First attempt — fastBreak (instant for resin and soft blocks)
-                        ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(breakTarget); mc.player.swingHand(Hand.MAIN_HAND);
-                        breakPending.put(breakTarget, 2);
-                    }
+                    sendHybridBreak(breakTarget);
                 }
                 return;
             }
@@ -2568,8 +2562,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 return;
             }
             InvUtils.swap(bestHotbarSlot, false);
-            ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(nextBlockPos); mc.player.swingHand(Hand.MAIN_HAND);
-            breakPending.put(nextBlockPos, 2);  // silent confirmation tracking
+            if (!breakPending.containsKey(nextBlockPos)) sendHybridBreak(nextBlockPos);
             state = State.Mining;
         }
     }
@@ -2762,6 +2755,80 @@ public class StepCheckered extends Module implements MapPrinter {
         //Set timeout for chest interaction
         interactTimeout = retryInteractTimer.get();
         lastInteractedChest = chestPos;
+    }
+
+    /** ADAPTIVE PACE GOVERNOR - the single decision point for holding the bot's walk
+     *  while work remains in reach. One method, two modes (never duplicated at call
+     *  sites - the pre-dedup copies drifted and froze runs):
+     *  PRINT mode (Walking, breakStage 0): hold while an in-range plan block is
+     *  placeable RIGHT NOW - the placement branch's full preconditions (head-action
+     *  allowlist - holding on a "refill" leg deadlocks, live 2026-10-20 01:36 - same
+     *  picker, material carried, per-position attempt cap). 5s watchdog force-caps the
+     *  position and walks on.
+     *  BREAK mode (Mining, breakStage != 0): hold while a plan block in range still
+     *  needs breaking, so break(2)/break-all passes clear rows as they walk instead of
+     *  sprinting past them (live 2026-10-20: 86 blocks left standing in a 23s pass).
+     *  10s watchdog releases and suppresses re-holding briefly. RESET is excluded
+     *  (its plan is null - the serpentine feed + segment gates already pace it). */
+    private boolean adaptivePaceHold() {
+        if (state.equals(State.Walking) && breakStage == 0 && currentBuildPlan != null
+            && !checkpoints.isEmpty()
+            && ALLOW_PLACE_ACTIONS.contains(checkpoints.getFirst().getRight().getLeft())) {
+            BlockPos placeNow = getNextBatchPlacementPos();
+            if (placeNow != null && placementAttempts.getOrDefault(placeNow, 0) < 5) {
+                Block planned = currentBuildPlan.get(placeNow);
+                if (planned != null && isMaterialCarried(planned.asItem())) {
+                    placeHoldTicks++;
+                    if (placeHoldTicks > 100) {
+                        placementAttempts.put(placeNow, 5);   // force-release: treat as capped
+                        warning("§ePrint pace-hold watchdog: released a " + placeHoldTicks
+                            + "-tick hold on " + placeNow.toShortString() + " - walking on.");
+                        placeHoldTicks = 0;
+                        return false;
+                    }
+                    return true;
+                }
+            }
+            placeHoldTicks = 0;
+        } else if (state.equals(State.Mining) && breakStage != 0 && currentBuildPlan != null
+            && !checkpoints.isEmpty()) {
+            if (breakHoldSuppression > 0) {
+                breakHoldSuppression--;
+            } else if (getNextBatchBreakPos() != null) {
+                breakHoldTicks++;
+                if (breakHoldTicks > 200) {
+                    breakHoldSuppression = 200;
+                    breakHoldTicks = 0;
+                    warning("§eBreak pace watchdog: held 10s on an unbroken block - advancing past it.");
+                    return false;
+                }
+                return true;
+            } else {
+                breakHoldTicks = 0;
+            }
+        } else {
+            placeHoldTicks = 0;
+            breakHoldTicks = 0;
+        }
+        return false;
+    }
+
+    /** HYBRID BREAK SEND - the ONE copy of the break rules. One fastBreak per position
+     *  per confirmation window (re-sending START/STOP every tick resets the server's
+     *  elapsed-time validation); blocks fastBreak already failed on progress through
+     *  vanilla mining instead (removal only via the air-check cleanup). Callers guard
+     *  the pending window themselves when a skip vs stop-loop distinction matters.
+     *  This logic MUST NOT be copied per call site - the pre-dedup copies drifted and
+     *  caused the server-clock-reset starvation bug. */
+    private void sendHybridBreak(BlockPos target) {
+        if (needsVanillaBreak.contains(target)) {
+            mc.player.getInventory().setSelectedSlot(8);
+            BlockUtils.breakBlock(target, true);
+        } else {
+            ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(target);
+            mc.player.swingHand(Hand.MAIN_HAND);
+            breakPending.put(target, 2);
+        }
     }
 
     /** Is any of this building material currently carried (hotbar or main inventory)? */
@@ -3104,22 +3171,38 @@ public class StepCheckered extends Module implements MapPrinter {
         stepSlaveReadyBatch = -1;
         stepSlaveBreak2DoneBatch = -1;
         stepSlaveDoneBatch = -1;
-        stepSlaveReadyPriming = false;
         stepSlaveReadyClosing = false;
         stepSlaveClosingDone = false;
         stepMapSwapPending = false;
         stepStowMap();
 
         if (stepFindWorkingMapSlot() >= 0) {
-            stepPinWorkingMap();
-            // Resume: if a progress file exists we continue from the saved batch, skipping
-            // priming and all already-completed batches (crash/restart recovery)
+            // CRASH/RESTART/DISABLE RECOVERY: the progress file carries the last
+            // in-progress batch AND the working map's id. Resume re-pins the EXACT
+            // saved map (never just any filled map - a wrong map would corrupt the
+            // run) and re-runs the in-progress batch. Only RESET deletes the file.
             int resumeBatch = loadStepProgress();
             if (resumeBatch > 0) {
+                if (stepSavedProgressMapId >= 0) {
+                    int savedSlot = stepFindMapIdSlot(stepSavedProgressMapId);
+                    if (savedSlot < 0) {
+                        error("§cProgress file says batch " + resumeBatch + " on map id " + stepSavedProgressMapId
+                            + ", but that map is NOT in the inventory - the recorded pixels cannot be recovered. "
+                            + "Starting a FRESH run (hold the working map to resume).");
+                        clearStepProgress();
+                        beginStepPrimingRun();
+                        return;
+                    }
+                    stepWorkingMapId = stepSavedProgressMapId;
+                    info("§aWorking map re-pinned by saved id=" + stepWorkingMapId + ".");
+                } else {
+                    stepPinWorkingMap();   // legacy progress file without map id
+                }
                 info("§aStep-checker: resuming from batch " + resumeBatch + " (progress file).");
-                stepMasterBatch = resumeBatch - 1;  // beginStepBatch will increment it
+                stepMasterBatch = resumeBatch - 1;
                 beginStepBatch(resumeBatch);
             } else {
+                stepPinWorkingMap();
                 beginStepPrimingRun();
             }
         } else if (findEmptyMapSlot() >= 0) {
@@ -3161,6 +3244,7 @@ public class StepCheckered extends Module implements MapPrinter {
     }
 
     private int loadStepProgress() {
+        stepSavedProgressMapId = -1;
         try {
             File file = stepProgressFile();
             if (!file.exists()) return 0;
@@ -3168,10 +3252,26 @@ public class StepCheckered extends Module implements MapPrinter {
             int batchStart = json.indexOf("\"batch\":") + 8;
             int batchEnd = json.indexOf(",", batchStart);
             if (batchEnd < 0) batchEnd = json.indexOf("}", batchStart);
+            int mapStart = json.indexOf("\"mapId\":");
+            if (mapStart >= 0) {
+                int mapEnd = json.indexOf(",", mapStart);
+                if (mapEnd < 0) mapEnd = json.indexOf("}", mapStart);
+                stepSavedProgressMapId = Integer.parseInt(json.substring(mapStart + 8, mapEnd).trim());
+            }
             return Integer.parseInt(json.substring(batchStart, batchEnd).trim());
         } catch (Exception e) {
             return 0;
         }
+    }
+
+    /** The inventory slot holding the EXACT persisted working map (unnamed), or -1. */
+    private int stepFindMapIdSlot(int wantedId) {
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            Integer id = mapIdOf(stack);
+            if (id != null && id == wantedId && !stack.contains(DataComponentTypes.CUSTOM_NAME)) return slot;
+        }
+        return -1;
     }
 
     private void clearStepProgress() {
@@ -3215,17 +3315,39 @@ public class StepCheckered extends Module implements MapPrinter {
     }
 
     private void beginStepPrimingRun() {
-        // FULL THEORY (user-approved): phase-0 window first - recessive-only lanes 0-1,
-        // walked once from Ev's block-125 CALIBRATED EDGE (x = corner+125.0, via the
-        // calibrated sweep positioning) so pair 0's floor records clean with nothing
-        // above it. Then batch 0 runs the standard full build(4) like every batch.
-        stepMasterStage = StepMasterStage.WAIT_PRIMING_BUILD;
+        int firstBatch = Math.max(0, Math.min(62, startBatch.get()));
+        if (firstBatch > 0) {
+            // START-BATCH SKIP (user directive 2026-10-20): begin the run at the
+            // configured batch - earlier batches are never built or walked.
+            info("§aStarting from batch " + firstBatch + " (start-batch) - earlier batches skipped.");
+            beginStepBatch(firstBatch);
+            return;
+        }
+        if (!batch0SplitBuild.get()) {
+            // SPLIT DISABLED (user directive 2026-10-20): batch 0 runs the STANDARD
+            // flow like every other batch - build(4) -> W1 -> break(2) -> W2 ->
+            // break-all. No pre-build/priming phase at all.
+            info("§aBatch 0: split-build disabled - running the standard batch flow.");
+            beginStepBatch(0);
+            return;
+        }
+        // UNIFIED BATCH 0, phase 1 (floor half): identical stages and signals to every
+        // other batch - WAIT_BATCH_BUILD, ready:0, then W1 on lane 125 (the batch-0
+        // lane pick in the standard consumer). Only the command differs: "prime" tells
+        // the slave to build the floor half; W1's completion then requests the tops
+        // half (the split-build physics: pair 0's floor must record with no tops above).
+        stepMasterBatch = 0;
+        stepMasterStage = StepMasterStage.WAIT_BATCH_BUILD;
         stepMasterWaitTicks = 0;
-        stepSlaveReadyPriming = false;
+        stepSlaveReadyBatch = -1;
+        stepSlaveBreak2DoneBatch = -1;
+        stepSlaveDoneBatch = -1;
+        stepMasterBreak2Sent = false;
+        stepMasterBreakAllSent = false;
         stepSendToSlave("prime");
-        stepQueueWaitHere("stepPrimingSafe");
+        stepQueueWaitHere("stepBatchSafe");
         stepStowMap();
-        info("§aStep-checker: phase-0 window requested; waiting at the nearest platform.");
+        info("§aBatch 0 phase 1 (floor half): build requested; waiting in place.");
     }
 
     private void beginStepBatch(int batch) {
@@ -3235,6 +3357,10 @@ public class StepCheckered extends Module implements MapPrinter {
             return;
         }
         stepMasterBatch = batch;
+        // PERSISTENCE: "batch k is in progress" is written on every batch start, so a
+        // crash/restart/disable at ANY point resumes by re-running exactly this batch
+        // (with the map id re-pinned from the file). Only RESET deletes the file.
+        saveStepProgress(batch);
         stepMasterStage = StepMasterStage.WAIT_BATCH_BUILD;
         stepMasterWaitTicks = 0;
         stepSlaveReadyBatch = stepSlaveReadyBatch == batch ? batch : -1;
@@ -3242,9 +3368,9 @@ public class StepCheckered extends Module implements MapPrinter {
         stepSlaveDoneBatch = -1;
         stepMasterBreak2Sent = false;
         stepMasterBreakAllSent = false;
-        if (batch == 0) {
-            // MERGED BATCH 0 (resume safety - the fresh-run path goes through the priming
-            // walk merge): floor via the split flow if batch 0 is ever entered directly.
+        if (batch == 0 && batch0SplitBuild.get()) {
+            // MERGED BATCH 0, split mode (resume safety - the fresh-run path goes through
+            // the priming walk merge): floor via the split flow if entered directly.
             stepSendToSlave("buildhalf:0:f");
             stepQueueWaitHere("stepBatchSafe");
             stepStowMap();
@@ -3306,6 +3432,11 @@ public class StepCheckered extends Module implements MapPrinter {
     }
 
     private void stepStartSweep(int lane, int startSpot, int endSpot) {
+        // Always-on direction log: every sweep announces its lane and z-range, so a
+        // wrong-direction or unexpected walk is visible in the log immediately.
+        info("§7Sweep: lane x=" + lane + " z " + STEP_CHECKPOINT_Z[startSpot]
+            + " -> " + STEP_CHECKPOINT_Z[endSpot]
+            + (startSpot < endSpot ? " (N->S)" : " (S->N)") + ".");
         stepPendingSweepLane = lane;
         stepPendingSweepStart = startSpot;
         stepPendingSweepEnd = endSpot;
@@ -3330,29 +3461,12 @@ public class StepCheckered extends Module implements MapPrinter {
         stepMasterSweepCompletionPending = false;
         if (debugPrints.get()) info("§3[dbg] sweep complete in stage §b" + stepMasterStage);
         switch (stepMasterStage) {
-            case PRIMING_WALK -> {
-                stepStowMap();
-                // MERGED BATCH 0: the priming build IS the floor half (assemblePriming is
-                // byte-identical to the buildhalf:0:f plan) and THIS walk IS W1 — the
-                // world state it recorded (floor+borrow standing, no dominants) is exactly
-                // what W1 would record after a floor-half pass. Request the TOPS half
-                // directly; the master waits WHERE IT STANDS (map stowed = safe anywhere)
-                // and W2 sweeps from whichever end it is at.
-                stepMasterBatch = 0;
-                stepMasterBreak2Sent = true;   // "first half done" - lane logic picks 127 for W2
-                stepSlaveReadyBatch = -1;
-                stepSlaveBreak2DoneBatch = -1;
-                stepMasterBreakAllSent = false;
-                stepMasterStage = StepMasterStage.WAIT_BATCH_BUILD;
-                stepMasterWaitTicks = 0;
-                stepSendToSlave("buildhalf:0:t");
-                stepQueueWaitHere("stepBatchSafe");
-                info("§aBatch 0 merged: priming walk = W1 (floor recorded clean) - tops half requested, waiting in place.");
-            }
             case BATCH_WALK_A -> {
-                if (stepMasterBatch == 0 && !stepMasterBreak2Sent) {
-                    // Unreachable in the merged flow (the priming walk already set the
-                    // first-half-done flag) - kept as the safety net for resume paths.
+                if (stepMasterBatch == 0 && batch0SplitBuild.get() && !stepMasterBreak2Sent) {
+                    // BATCH 0 SPLIT (physics: pair 0's floor must record with no tops above,
+                    // so the build is split around W1): W1 recorded the floor+borrow clean.
+                    // Request the TOPS half now; W2 (on 127) records them. No break(2) for
+                    // batch 0 - W2 IS the tops' first and only record.
                     stepStowMap();
                     stepMasterBreak2Sent = true;   // reuses the flag as "first half done"
                     stepSlaveReadyBatch = -1;
@@ -3363,33 +3477,32 @@ public class StepCheckered extends Module implements MapPrinter {
                     info("§aBatch 0: floor recorded - tops half requested.");
                     return;
                 }
-                // Standard flow: walk 1 recorded the batch. Send break(2), then W2 = the
-                // return sweep on the EAST lane 2k+129 (the broken west columns sit
-                // beyond record range there) FROM WHICHEVER END the master is at - W1's
-                // end - so no leg is walked twice.
+                // Standard flow: walk 1 recorded the batch -> break(2) NOW. W2 (the
+                // S->N suppression walk) waits until the slave COMPLETES break(2)
+                // (user rule, live 2026-10-20): safe because W2 rides the EAST lane
+                // 2k+129 - 127.5+ blocks from the west tops, beyond dominant record
+                // range - so the already-recorded west pixels cannot be re-recorded.
                 stepStowMap();
-                if (!stepMasterBreak2Sent) {
-                    stepMasterBreak2Sent = true;
-                    stepSendToSlave("break2");
-                    info("§aBatch " + stepMasterBatch + ": walk 1 complete - break(2) requested.");
-                }
-                stepMasterStage = StepMasterStage.BATCH_WALK_B;
-                int w2Lane = 2 * (stepMasterBatch + 1) + 127;
-                boolean w2SouthFirst = mc.player.getZ() > lowerMapCorner.getZ() + 64;
-                stepStartSweep(w2Lane, w2SouthFirst ? 4 : 0, w2SouthFirst ? 0 : 4);
+                stepMasterBreak2Sent = true;
+                stepSendToSlave("break2");
+                stepMasterStage = StepMasterStage.WAIT_BREAK_2;
+                stepMasterWaitTicks = 0;
+                stepQueueWaitHere("stepBreak2Point");
+                info("§aBatch " + stepMasterBatch + ": walk 1 complete - break(2) requested; W2 follows its completion.");
             }
             case BATCH_WALK_B -> {
-                // East-lane return reached NORTH: master + slave both on the N side.
-                // Batch 0 split flow: NO break(2) exists - send breakall directly.
-                // Standard flow: wait for the slave's break2done, then breakall.
+                // W2 COMPLETE (and break(2) already completed before W2 started).
+                // Batch 0 split flow: NO break(2) exists - breakall directly.
+                // Standard flow: break2done has arrived (W2 was gated on it), so
+                // break-all is requested immediately.
                 stepStowMap();
                 stepMasterStage = StepMasterStage.WAIT_BREAK_ALL;
                 stepMasterWaitTicks = 0;
-                boolean batch0Split = stepMasterBatch == 0 && stepMasterBreak2Sent;
+                boolean batch0Split = stepMasterBatch == 0 && batch0SplitBuild.get() && stepMasterBreak2Sent;
                 if ((batch0Split || stepSlaveBreak2DoneBatch == stepMasterBatch) && !stepMasterBreakAllSent) {
                     stepMasterBreakAllSent = true;
                     stepSendToSlave("breakall");
-                    info("§aBatch " + stepMasterBatch + ": break-all requested at the north checkpoint.");
+                    info("§aBatch " + stepMasterBatch + ": W2 complete - break-all requested.");
                 } else {
                     requeueStepWait(stepMasterBatch + 2, "stepBreakAllPoint");
                 }
@@ -3419,7 +3532,7 @@ public class StepCheckered extends Module implements MapPrinter {
         // stretched a "30s" heartbeat to ~10 real minutes (observed live 2026-10-20:
         // a stalled run produced no heartbeat at all).
         String waitSignal = switch (stepMasterStage) {
-            case WAIT_PRIMING_BUILD -> "ready:prime";
+            case WAIT_BREAK_2 -> "break2done:" + stepMasterBatch;
             case WAIT_BATCH_BUILD -> "ready:" + stepMasterBatch;
             case WAIT_CLOSING_BUILD -> "ready:close";
             case WAIT_BREAK_ALL -> stepMasterBreakAllSent ? "done:" + stepMasterBatch : "break2done:" + stepMasterBatch;
@@ -3479,10 +3592,13 @@ public class StepCheckered extends Module implements MapPrinter {
             if (stepFindWorkingMapSlot() >= 0) {
                 stepPinWorkingMap();
                 int resumeBatch = loadStepProgress();
-                if (resumeBatch > 0) {
-                    info("§aStep-checker: resuming from batch " + resumeBatch + ".");
-                    stepMasterBatch = resumeBatch - 1;
-                    beginStepBatch(resumeBatch);
+                // start-batch is a FLOOR: a stale saved progress file can never drag
+                // the run back before the configured starting batch.
+                int firstBatch = Math.max(resumeBatch, Math.max(0, Math.min(62, startBatch.get())));
+                if (firstBatch > 0) {
+                    info("§aStep-checker: starting from batch " + firstBatch
+                        + (resumeBatch > firstBatch - 1 ? " (resumed progress)" : " (start-batch)") + ".");
+                    beginStepBatch(firstBatch);
                 } else {
                     beginStepPrimingRun();
                 }
@@ -3512,8 +3628,7 @@ public class StepCheckered extends Module implements MapPrinter {
         if (stepMasterDwellTicks > 0) {
             Utils.setForwardPressed(false);
             Utils.setSneakPressed(false);
-            if (stepMasterStage == StepMasterStage.PRIMING_WALK
-                || stepMasterStage == StepMasterStage.BATCH_WALK_A
+            if (stepMasterStage == StepMasterStage.BATCH_WALK_A
                 || stepMasterStage == StepMasterStage.BATCH_WALK_B
                 || stepMasterStage == StepMasterStage.CLOSING_WALK) {
                 if (!stepEnsureMapHeld()) {
@@ -3538,31 +3653,45 @@ public class StepCheckered extends Module implements MapPrinter {
         // arrival handlers keep their stage guards and act as fallbacks only.
         // (Heartbeat/timeout counting lives at the TOP of this method, before the
         // pause gates, so it counts real ticks.)
-        boolean waitSouthFirst = mc.player.getZ() > lowerMapCorner.getZ() + 64;
+        // FIXED CYCLE (user rule): W1 always N->S (records), W2 always S->N
+        // (suppression) - identical every batch like the doc's walk pair, and it
+        // chains perfectly: W1 ends south (wait there through break(2)), W2 runs
+        // S->N from that end and ends north, where the next batch's W1 starts.
         switch (stepMasterStage) {
-            case WAIT_PRIMING_BUILD -> {
-                if (stepSlaveReadyPriming) {
-                    stepSlaveReadyPriming = false;
-                    stepMasterStage = StepMasterStage.PRIMING_WALK;
-                    stepStartSweep(125, waitSouthFirst ? 4 : 0, waitSouthFirst ? 0 : 4);
+            case WAIT_BREAK_2 -> {
+                // break(2) in progress. Sent at W1's completion (fallback: here).
+                // When the slave reports break2done, W2 (the S->N suppression walk)
+                // starts - NEVER before break(2) completes (user rule, live 2026-10-20).
+                if (!stepMasterBreak2Sent) {
+                    stepMasterBreak2Sent = true;
+                    stepSendToSlave("break2");
+                    info("§aBatch " + stepMasterBatch + ": break(2) requested.");
+                } else if (stepSlaveBreak2DoneBatch == stepMasterBatch) {
+                    stepMasterStage = StepMasterStage.BATCH_WALK_B;
+                    int w2Lane = 2 * (stepMasterBatch + 1) + 127;
+                    stepStartSweep(w2Lane, 4, 0);   // W2: fixed S->N
+                    info("§aBatch " + stepMasterBatch + ": break(2) complete - W2 suppression walk starting.");
                 }
             }
             case WAIT_BATCH_BUILD -> {
                 if (stepSlaveReadyBatch == stepMasterBatch) {
                     stepMasterStage = StepMasterStage.BATCH_WALK_A;
-                    int lane = stepMasterBatch == 0 ? (stepMasterBreak2Sent ? 127 : 125) : 2 * stepMasterBatch + 127;
-                    stepStartSweep(lane, waitSouthFirst ? 4 : 0, waitSouthFirst ? 0 : 4);
+                    // Split mode only: batch 0's W1 rides lane 125 (floor record); every
+                    // other case uses the standard lane 2k+127.
+                    int lane = stepMasterBatch == 0 && batch0SplitBuild.get() && !stepMasterBreak2Sent
+                        ? 125 : 2 * stepMasterBatch + 127;
+                    stepStartSweep(lane, 0, 4);   // W1: fixed N->S
                 }
             }
             case WAIT_CLOSING_BUILD -> {
                 if (stepSlaveReadyClosing) {
                     stepSlaveReadyClosing = false;
                     stepMasterStage = StepMasterStage.CLOSING_WALK;
-                    stepStartSweep(253, waitSouthFirst ? 4 : 0, waitSouthFirst ? 0 : 4);
+                    stepStartSweep(253, 0, 4);   // closing sweep: fixed N->S
                 }
             }
             case WAIT_BREAK_ALL -> {
-                boolean batch0Split = stepMasterBatch == 0 && stepMasterBreak2Sent;
+                boolean batch0Split = stepMasterBatch == 0 && batch0SplitBuild.get() && stepMasterBreak2Sent;
                 if (!stepMasterBreakAllSent && (batch0Split || stepSlaveBreak2DoneBatch == stepMasterBatch)) {
                     stepMasterBreakAllSent = true;
                     stepSendToSlave("breakall");
@@ -3586,7 +3715,6 @@ public class StepCheckered extends Module implements MapPrinter {
             && stepSlaveDoneBatch == stepMasterBatch) {
             int completedBatch = stepMasterBatch;
             stepSlaveDoneBatch = -1;
-            saveStepProgress(completedBatch + 1);   // persist resume point
             if (completedBatch < 62) {
                 beginStepBatch(completedBatch + 1);
             } else {
@@ -3623,6 +3751,11 @@ public class StepCheckered extends Module implements MapPrinter {
         Vec3d horizontalGoal = goal.add(0, mc.player.getY() - goal.y, 0);
         if (PlayerUtils.distanceTo(horizontalGoal) < checkpointBuffer.get()) {
             String action = checkpoints.removeFirst().getRight().getLeft();
+            String cpLog = action + "@" + (int) goal.x + "," + (int) goal.y + "," + (int) goal.z;
+            if (!cpLog.equals(lastMasterCpLog)) {
+                lastMasterCpLog = cpLog;
+                info("§7Master checkpoint: §f" + action + "§7 at (" + (int) goal.x + ", " + (int) goal.y + ", " + (int) goal.z + ")");
+            }
             handleStepMasterCheckpoint(action);
             return;
         }
@@ -3652,16 +3785,6 @@ public class StepCheckered extends Module implements MapPrinter {
                     }
                 }
             }
-            case "stepPrimingSafe" -> {
-                if (stepMasterStage == StepMasterStage.WAIT_PRIMING_BUILD && stepSlaveReadyPriming) {
-                    stepSlaveReadyPriming = false;
-                    stepMasterStage = StepMasterStage.PRIMING_WALK;
-                    boolean southFirst = mc.player.getZ() > lowerMapCorner.getZ() + 64;
-                    stepStartSweep(125, southFirst ? 4 : 0, southFirst ? 0 : 4);
-                } else if (stepMasterStage == StepMasterStage.WAIT_PRIMING_BUILD) {
-                    requeueStepWait(2, "stepPrimingSafe");
-                }
-            }
             case "stepBatchSafe" -> {
                 if (stepMasterStage == StepMasterStage.WAIT_BATCH_BUILD && stepSlaveReadyBatch == stepMasterBatch) {
                     stepMasterStage = StepMasterStage.BATCH_WALK_A;
@@ -3670,24 +3793,18 @@ public class StepCheckered extends Module implements MapPrinter {
                     // safety: without the flag it is W1 (floor) on 125). Every other
                     // batch sweeps its standard W1 lane. Direction: from whichever end
                     // the master is at (record content is direction-independent).
-                    int lane = stepMasterBatch == 0 ? (stepMasterBreak2Sent ? 127 : 125) : 2 * stepMasterBatch + 127;
-                    boolean southFirst = mc.player.getZ() > lowerMapCorner.getZ() + 64;
-                    stepStartSweep(lane, southFirst ? 4 : 0, southFirst ? 0 : 4);
+                    int lane = stepMasterBatch == 0 && batch0SplitBuild.get() && !stepMasterBreak2Sent
+                        ? 125 : 2 * stepMasterBatch + 127;
+                    stepStartSweep(lane, 0, 4);   // W1: fixed N->S
                 } else if (stepMasterStage == StepMasterStage.WAIT_BATCH_BUILD) {
                     // Wait IN PLACE (map stowed - safety from map-closed, not distance)
                     requeueStepWait(stepMasterBatch + 1, "stepBatchSafe");
                 }
             }
             case "stepBreak2Point" -> {
-                if (stepMasterStage != StepMasterStage.WAIT_BREAK_2) return;
-                if (!stepMasterBreak2Sent) {
-                    stepMasterBreak2Sent = true;
-                    stepSendToSlave("break2");
-                }
-                stepMasterStage = StepMasterStage.WAIT_BREAK_ALL;
-                stepQueueWaitHere("stepBreakAllPoint");
-                stepStowMap();
-                info("§aBatch " + stepMasterBatch + ": break(2) requested; waiting in place.");
+                // Position holder for the WAIT_BREAK_2 stage - the tick-level consumer
+                // sends break(2) and starts W2 on break2done. Doing either here would
+                // race it (an arrival-driven breakall would skip W2 entirely).
             }
             case "stepBreakAllPoint" -> {
                 if (stepMasterStage != StepMasterStage.WAIT_BREAK_ALL) return;
@@ -3702,8 +3819,7 @@ public class StepCheckered extends Module implements MapPrinter {
             case "stepClosingSafe" -> {
                 if (stepMasterStage == StepMasterStage.WAIT_CLOSING_BUILD && stepSlaveReadyClosing) {
                     stepMasterStage = StepMasterStage.CLOSING_WALK;
-                    boolean southFirst = mc.player.getZ() > lowerMapCorner.getZ() + 64;
-                    stepStartSweep(253, southFirst ? 4 : 0, southFirst ? 0 : 4);
+                    stepStartSweep(253, 0, 4);   // closing sweep: fixed N->S
                 } else if (stepMasterStage == StepMasterStage.WAIT_CLOSING_BUILD) {
                     requeueStepWait(64, "stepClosingSafe");
                 }
@@ -3731,8 +3847,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 // Crossing a platform while the map is stowed is intentionally a no-op.
             }
             case "stepDwell" -> {
-                if (stepMasterStage != StepMasterStage.PRIMING_WALK
-                    && stepMasterStage != StepMasterStage.BATCH_WALK_A
+                if (stepMasterStage != StepMasterStage.BATCH_WALK_A
                     && stepMasterStage != StepMasterStage.BATCH_WALK_B
                     && stepMasterStage != StepMasterStage.CLOSING_WALK) return;
                 if (!stepEnsureMapHeld()) {
@@ -3755,8 +3870,10 @@ public class StepCheckered extends Module implements MapPrinter {
      *  walked just to reach a wait position. */
     private void stepQueueWaitHere(String action) {
         checkpoints.clear();
-        checkpoints.add(new Pair<>(stepNearestPlatform(), new Pair<>(action, null)));
+        Vec3d platform = stepNearestPlatform();
+        checkpoints.add(new Pair<>(platform, new Pair<>(action, null)));
         state = State.Walking;
+        info("§7Master queued: §f" + action + "§7 at (" + (int) platform.x + ", " + (int) platform.y + ", " + (int) platform.z + ")");
     }
 
     private Vec3d stepNearestPlatform() {
@@ -3767,7 +3884,10 @@ public class StepCheckered extends Module implements MapPrinter {
             double d = Math.abs(mc.player.getZ() - (lowerMapCorner.getZ() + STEP_CHECKPOINT_Z[i]));
             if (d < best) { best = d; zIdx = i; }
         }
-        return stepCheckpoint(125 + 2 * laneIdx, zIdx);
+        // THE VALUE, not the index: passing zIdx (0..4) here queued every wait at
+        // z_rel ~0.5 - the BOX'S NORTH EDGE - instead of the platform (live-caught
+        // 2026-10-20: "stepBatchSafe at (-316, 99, -319)" every batch).
+        return stepCheckpoint(125 + 2 * laneIdx, STEP_CHECKPOINT_Z[zIdx]);
     }
 
     private void requeueStepWait(int checkpointIndex, String action) {
@@ -4010,6 +4130,7 @@ public class StepCheckered extends Module implements MapPrinter {
         currentBatch = k;
         batchPassRetries = 0;
         placementAttempts.clear();
+        collectSkips.clear();
         sweepReArmSig = null;
         sweepWaitRounds = 0;
         sweepWaitLogged = false;
@@ -4036,18 +4157,19 @@ public class StepCheckered extends Module implements MapPrinter {
         // actual batch route is appended only after preparation is complete.
         queueStepBuildPreparation(walkX);
 
-        // The batch route (consumed front-to-back as the slave progresses) - MIRRORED
-        // when the bot already stands on the south half: it prints/breaks from there
-        boolean fromSouth = slaveStartsFromSouth();
-        double startZ = fromSouth ? southZ : northZ;
-        double farZ = fromSouth ? northZ : southZ;
-        checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("batchBegin", null)));
-        checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("printDone", null)));
-        checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("awaitBreak2", null)));
-        checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("break2Done", null)));
-        checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("awaitBreakAll", null)));
+        // FIXED CYCLE (user rule, live 2026-10-20): every batch runs the same
+        // directions - print N->S, break(2) S->N, break-all N->S (forced in
+        // startBreakAll), collection S->N - ending each batch at the north end where
+        // the next one starts. NO position-based mirroring: it flipped the parity
+        // after any interrupt and manufactured dead NS walks. Repositioning happens
+        // once, at the boundary, via the north corridor.
+        checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), northZ), new Pair("batchBegin", null)));
+        checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), southZ), new Pair("printDone", null)));
+        checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), southZ), new Pair("awaitBreak2", null)));
+        checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), northZ), new Pair("break2Done", null)));
+        checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), northZ), new Pair("awaitBreakAll", null)));
         prependLaneCentering(walkX);
-        if (!fromSouth) prependNorthCorridor(walkX);
+        prependNorthCorridor(walkX);
     }
 
     /**
@@ -4125,6 +4247,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 currentBatch = batch;
                 batchPassRetries = 0;
                 placementAttempts.clear();
+                collectSkips.clear();
                 sweepReArmSig = null;
                 sweepWaitRounds = 0;
                 sweepWaitLogged = false;
@@ -4134,9 +4257,9 @@ public class StepCheckered extends Module implements MapPrinter {
                     // chain. Print pass from whichever side the bot is on, then wait for
                     // breakall directly. The bot just finished the floor pass, so it's
                     // already near lane 2 and materials are in inventory.
-                    boolean fromSouth = slaveStartsFromSouth();
-                    double startZ = fromSouth ? lowerMapCorner.getZ() + 128.7 : lowerMapCorner.getZ() - 2;
-                    double farZ = fromSouth ? lowerMapCorner.getZ() - 2 : lowerMapCorner.getZ() + 128.7;
+                    // FIXED CYCLE: print N->S like every batch (no mirroring)
+                    double startZ = lowerMapCorner.getZ() - 2;
+                    double farZ = lowerMapCorner.getZ() + 128.7;
                     checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("batchBegin", null)));
                     checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("printDone", null)));
                     // "awaitBreak2" (NOT "awaitBreakAll") - only this sends step:ready:N,
@@ -4218,20 +4341,24 @@ public class StepCheckered extends Module implements MapPrinter {
         }
     }
 
-    /** Priming places only recessive pairs 0 and 1; the regular batch 0 overwrites it later. */
+    /** BATCH 0, phase 1 - the floor half (recessive pairs 0+1). Identical route shape,
+     *  signals and machinery to every other batch: supply -> print pass -> awaitBreak2
+     *  (sends ready:0). The "prime" command is the only difference from "build:0" - it
+     *  builds the floor half that W1 records before the tops exist (split-build
+     *  physics). The supply run fetches the tops materials too, so the tops pass needs
+     *  no refill; mid-print shortages use the emergency restock. */
     private void beginPriming() {
         if (!initialSetup()) {
             state = State.StandBy;
             return;
         }
-        currentBatch = -1;
+        currentBatch = 0;
         breakStage = 0;
         printRepairPending = false;
         placementAttempts.clear();
         // A new run kills any leftover RESET state - a stale fullSweepActive here made
         // the first mid-run supply run resurrect the dead reset ladder over the priming
         fullSweepActive = false;
-        currentBuildPlan = assemblePriming();
         checkpoints.clear();
         state = State.Walking;
 
@@ -4240,23 +4367,20 @@ public class StepCheckered extends Module implements MapPrinter {
         double stagingX = lowerMapCorner.getX() + 2.5;
         double northZ = lowerMapCorner.getZ() - 2;
         double southZ = lowerMapCorner.getZ() + 128.7;
-        // MERGED BATCH 0 SUPPLY (one trip): fetch materials for the priming plan AND the
-        // tops half (dominant pair 0) together - the priming build IS the floor half, so
-        // the tops pass that follows needs no refill walk. Mid-print shortages fall back
-        // to the existing emergency restock path.
-        HashMap<BlockPos, Block> primingPlan = assemblePriming();
+        HashMap<BlockPos, Block> floorPlan = assemblePriming();
         if (stepDomLayers != null && stepDomLayers.get(0) != null) {
-            addLayerAt(primingPlan, stepDomLayers.get(0), 2);
+            addLayerAt(floorPlan, stepDomLayers.get(0), 2);   // merged batch-0 supply basis
         }
-        currentBuildPlan = primingPlan;   // requirement basis for the supply run
+        currentBuildPlan = floorPlan;
         queueStepBuildPreparation(stagingX);
-        currentBuildPlan = assemblePriming();   // the actual print plan
+        currentBuildPlan = assemblePriming();   // the actual print plan (floor only)
+        // FIXED CYCLE: print N->S like every batch (no mirroring - see beginBatch)
         checkpoints.add(new Pair(new Vec3d(stagingX, lowerMapCorner.getY(), northZ), new Pair("batchBegin", null)));
-        checkpoints.add(new Pair(new Vec3d(stagingX, lowerMapCorner.getY(), southZ), new Pair("stepPrimingReady", null)));
-        checkpoints.add(new Pair(new Vec3d(stagingX, lowerMapCorner.getY(), northZ), new Pair("stepPrimingWait", null)));
+        checkpoints.add(new Pair(new Vec3d(stagingX, lowerMapCorner.getY(), southZ), new Pair("printDone", null)));
+        checkpoints.add(new Pair(new Vec3d(stagingX, lowerMapCorner.getY(), southZ), new Pair("awaitBreak2", null)));
         prependLaneCentering(stagingX);
         prependNorthCorridor(stagingX);
-        info("§aPriming: §b" + currentBuildPlan.size() + "§7 recessive blocks planned.");
+        info("§aBatch 0 floor half: §b" + currentBuildPlan.size() + "§7 blocks planned.");
     }
 
     /** Build the final dominant pair 63 after regular batch 62 has been recycled. */
@@ -4551,6 +4675,35 @@ public class StepCheckered extends Module implements MapPrinter {
         return count;
     }
 
+    /** Collection-run target: the nearest ready drop in the batch window AT/AHEAD of
+     *  the bot (z never more than 1.5 blocks behind) so the run advances monotonically
+     *  south -> north. Falls back to the nearest drop anywhere if everything left is
+     *  behind (e.g. an interrupted run). A drop re-picked 10x without disappearing is
+     *  blacklisted for this batch (unreachable) and skipped. */
+    private ItemEntity nearestCollectTarget() {
+        if (mc.world == null || mc.player == null) return null;
+        int westX = lowerMapCorner.getX() + 2 * Math.max(currentBatch, 0);
+        ItemEntity best = null, bestAny = null;
+        double bestDist = Double.MAX_VALUE, bestAnyDist = Double.MAX_VALUE;
+        for (Entity entity : mc.world.getEntities()) {
+            if (!(entity instanceof ItemEntity itemEntity)) continue;
+            if (!itemEntity.groundCollision || itemEntity.cannotPickup() || itemEntity.getOwner() != null) continue;
+            if (itemEntity.getX() < westX - 4 || itemEntity.getX() > westX + 7) continue;
+            if (itemEntity.getZ() < lowerMapCorner.getZ() - 3 || itemEntity.getZ() > lowerMapCorner.getZ() + 129) continue;
+            if (itemEntity.getY() < lowerMapCorner.getY() - 3 || itemEntity.getY() > lowerMapCorner.getY() + 5) continue;
+            BlockPos key = BlockPos.ofFloored(itemEntity.getX(), itemEntity.getY(), itemEntity.getZ());
+            if (collectSkips.getOrDefault(key, 0) >= 10) continue;   // blacklisted this batch
+            double dist = mc.player.getEyePos().distanceTo(itemEntity.getEntityPos());
+            if (dist < bestAnyDist) { bestAnyDist = dist; bestAny = itemEntity; }
+            if (itemEntity.getZ() >= mc.player.getZ() - 1.5 && dist < bestDist) { bestDist = dist; best = itemEntity; }
+        }
+        if (best != null) {
+            BlockPos key = BlockPos.ofFloored(best.getX(), best.getY(), best.getZ());
+            collectSkips.merge(key, 1, Integer::sum);
+        }
+        return best != null ? best : bestAny;
+    }
+
     /** Nearest still-standing plan block to the bot (break-all straggler chase target). */
     private BlockPos nearestRemainingPlanBlock() {
         if (currentBuildPlan == null || mc.player == null) return null;
@@ -4682,11 +4835,6 @@ public class StepCheckered extends Module implements MapPrinter {
 
     /** Direction-agnostic passes: the slave starts a print/break route from whichever
      *  end of the window it is already on (south half -> south-first mirrored route). */
-    private boolean slaveStartsFromSouth() {
-        return lowerMapCorner != null && mc.player != null
-            && mc.player.getZ() > lowerMapCorner.getZ() + 64.0;
-    }
-
     /** The walking lane (lane 2 center) of the phase the slave is in: batch k, priming,
      *  or the closing build. Placement is gated on standing centered here. */
     private double currentWalkLaneX() {
@@ -4784,13 +4932,10 @@ public class StepCheckered extends Module implements MapPrinter {
             return false;
         }
         batchPassRetries++;
-        info("§eBatch " + currentBatch + " break(2) leftover (" + remaining.size() + ") - walking back for a retry pass.");
+        info("§eBatch " + currentBatch + " break(2) leftover (" + remaining.size() + ") - fixed-direction retry pass (S->N).");
         double lane2X = lowerMapCorner.getX() + 2.0 * currentBatch + 2.5;
-        boolean bFromSouth = slaveStartsFromSouth();
-        double bStartZ = bFromSouth ? lowerMapCorner.getZ() - 2 : lowerMapCorner.getZ() + 128.7;
-        double bFarZ = bFromSouth ? lowerMapCorner.getZ() + 128.7 : lowerMapCorner.getZ() - 2;
-        checkpoints.add(new Pair(new Vec3d(lane2X, lowerMapCorner.getY(), bStartZ), new Pair("sprint", null)));
-        checkpoints.add(new Pair(new Vec3d(lane2X, lowerMapCorner.getY(), bFarZ), new Pair("break2Done", null)));
+        checkpoints.add(new Pair(new Vec3d(lane2X, lowerMapCorner.getY(), lowerMapCorner.getZ() + 128.7), new Pair("sprint", null)));
+        checkpoints.add(new Pair(new Vec3d(lane2X, lowerMapCorner.getY(), lowerMapCorner.getZ() - 2), new Pair("break2Done", null)));
         state = State.Mining;
         return false;
     }
@@ -4802,9 +4947,10 @@ public class StepCheckered extends Module implements MapPrinter {
         breakStage = 4;
         checkpoints.clear();
         double walkX = lowerMapCorner.getX() + 2.0 * currentBatch + 2.5;
-        boolean fromSouth = slaveStartsFromSouth();
-        double startZ = fromSouth ? lowerMapCorner.getZ() + 128.7 : lowerMapCorner.getZ() - 2;
-        double farZ = fromSouth ? lowerMapCorner.getZ() - 2 : lowerMapCorner.getZ() + 128.7;
+        // ALWAYS north -> south: the pass must END at the south end so the single
+        // south-to-north collection run starts exactly where the bot stands.
+        double startZ = lowerMapCorner.getZ() - 2;
+        double farZ = lowerMapCorner.getZ() + 128.7;
 
         Pair<BlockPos, Vec3d> chest = getBestDepositChest();
         checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("breakAllBegin", null)));
@@ -4813,7 +4959,7 @@ public class StepCheckered extends Module implements MapPrinter {
         if (chest != null) {
             checkpoints.addFirst(new Pair(chest.getRight(), new Pair("depositBuilding", chest.getLeft())));
             prependNorthCorridor(chest.getRight().x);
-        } else if (!fromSouth) {
+        } else {
             prependNorthCorridor(walkX);
         }
         state = State.Walking;
@@ -4958,19 +5104,11 @@ public class StepCheckered extends Module implements MapPrinter {
     }
 
     /** Rebuilds the remaining route after an interruption (supply run / deposit trip).  The
-     *  2k lane formula and the regular checkpoint names only apply to real batches; priming
-     *  (-1) and closing (63) keep their own staging lanes and checkpoint names. */
+     *  2k lane formula applies to every batch (batch 0 included - its floor half uses
+     *  the same route); closing (63) keeps its own staging lane and names. */
     private void resumeBatchRoute(int stage) {
         double northZ = lowerMapCorner.getZ() - 2;
         double southZ = lowerMapCorner.getZ() + 128.7;
-        if (currentBatch == -1) {
-            // Priming has no break phases - only the print pass and its wait
-            double stagingX = lowerMapCorner.getX() + 2.5;
-            checkpoints.add(new Pair(new Vec3d(stagingX, lowerMapCorner.getY(), northZ), new Pair("batchBegin", null)));
-            checkpoints.add(new Pair(new Vec3d(stagingX, lowerMapCorner.getY(), southZ), new Pair("stepPrimingReady", null)));
-            checkpoints.add(new Pair(new Vec3d(stagingX, lowerMapCorner.getY(), northZ), new Pair("stepPrimingWait", null)));
-            return;
-        }
         if (currentBatch == 63) {
             if (stage == 4) {
                 double sweepX = lowerMapCorner.getX() + 253.5;
@@ -4985,27 +5123,26 @@ public class StepCheckered extends Module implements MapPrinter {
             }
             return;
         }
+        // FIXED CYCLE on resume too: the same directions as a fresh batch, so an
+        // emergency interrupt can never flip the parity into dead NS walks.
         double walkX = lowerMapCorner.getX() + 2.0 * currentBatch + 2.5;
-        boolean fromSouth = slaveStartsFromSouth();
-        double startZ = fromSouth ? southZ : northZ;
-        double farZ = fromSouth ? northZ : southZ;
         switch (stage) {
             case 0 -> {
-                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("batchBegin", null)));
-                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("printDone", null)));
-                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("awaitBreak2", null)));
-                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("break2Done", null)));
-                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("awaitBreakAll", null)));
+                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), southZ), new Pair("printDone", null)));
+                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), southZ), new Pair("awaitBreak2", null)));
+                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), northZ), new Pair("break2Done", null)));
+                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), northZ), new Pair("awaitBreakAll", null)));
             }
             case 2 -> {
-                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("break2Resume", null)));
-                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("break2Done", null)));
-                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("awaitBreakAll", null)));
+                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), northZ), new Pair("break2Done", null)));
+                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), northZ), new Pair("awaitBreakAll", null)));
             }
             default -> {
-                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("breakAllBegin", null)));
-                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("breakAllDone", null)));
-                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("batchExit", null)));
+                // break-all: N->S (forced); the batchExit queued here is stale by
+                // design - the collection run replaces it with an in-place exit.
+                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), northZ), new Pair("breakAllBegin", null)));
+                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), southZ), new Pair("breakAllDone", null)));
+                checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), southZ), new Pair("batchExit", null)));
             }
         }
     }
@@ -5138,7 +5275,7 @@ public class StepCheckered extends Module implements MapPrinter {
      *  RESET census uses, over the batch's recycling window incl. its item margin. */
     private int[] itemCensusInBatchWindow() {
         int westX = lowerMapCorner.getX() + 2 * Math.max(currentBatch, 0);
-        return itemCensusInArea(westX - 2, westX + 4, lowerMapCorner.getZ() - 3, lowerMapCorner.getZ() + 129);
+        return itemCensusInArea(westX - 4, westX + 6, lowerMapCorner.getZ() - 3, lowerMapCorner.getZ() + 129);
     }
 
     /** The batch the renderer shows: the ACTIVE batch while a run is in progress,
@@ -5180,7 +5317,7 @@ public class StepCheckered extends Module implements MapPrinter {
         for (Entity entity : mc.world.getEntities()) {
             if (!(entity instanceof ItemEntity itemEntity)) continue;
             if (!itemEntity.groundCollision || itemEntity.cannotPickup() || itemEntity.getOwner() != null) continue;
-            if (itemEntity.getX() < westX - 2 || itemEntity.getX() > westX + 5) continue;
+            if (itemEntity.getX() < westX - 4 || itemEntity.getX() > westX + 7) continue;
             if (itemEntity.getZ() < lowerMapCorner.getZ() - 3 || itemEntity.getZ() > lowerMapCorner.getZ() + 130) continue;
             if (itemEntity.getY() < lowerMapCorner.getY() - 2 || itemEntity.getY() > lowerMapCorner.getY() + 5) continue;
             count++;
@@ -6151,13 +6288,26 @@ public class StepCheckered extends Module implements MapPrinter {
                     event.renderer.box(platform, gridColor, gridColor, isNextLane ? ShapeMode.Both : ShapeMode.Lines, 0);
                 }
             }
-            // Special master points, distinct from the lane grid: the map fill spot (entry)
-            // and the cartography lock position captured at registration
-            Vec3d[] specialPoints = cartographyTable != null
-                ? new Vec3d[]{
-                    new Vec3d(lowerMapCorner.getX() + 125.5, lowerMapCorner.getY(), lowerMapCorner.getZ() + 115.5),
-                    cartographyTable.getRight()}
-                : new Vec3d[]{new Vec3d(lowerMapCorner.getX() + 125.5, lowerMapCorner.getY(), lowerMapCorner.getZ() + 115.5)};
+            // Special master points, distinct from the lane grid - rendered ONLY while
+            // their phase is relevant: the fill spot before the first build, the
+            // cartography lock position from the closing phase onward. (Both used to
+            // render every frame - the lock marker at rel x~98 showed up during every
+            // batch and looked like a stray checkpoint.)
+            ArrayList<Vec3d> specialPoints = new ArrayList<>();
+            if (stepMasterStage == StepMasterStage.IDLE
+                || stepMasterStage == StepMasterStage.FETCH_MAP
+                || stepMasterStage == StepMasterStage.FILL_MAP
+                || stepMasterStage == StepMasterStage.WAIT_FILLED_MAP) {
+                specialPoints.add(new Vec3d(lowerMapCorner.getX() + 125.5, lowerMapCorner.getY(), lowerMapCorner.getZ() + 115.5));
+            }
+            if (cartographyTable != null
+                && (stepMasterStage == StepMasterStage.CLOSING_WALK
+                    || stepMasterStage == StepMasterStage.WAIT_CLOSING_BREAK
+                    || stepMasterStage == StepMasterStage.READY_TO_LOCK
+                    || stepMasterStage == StepMasterStage.LOCK_WALK
+                    || stepMasterStage == StepMasterStage.LOCKING)) {
+                specialPoints.add(cartographyTable.getRight());
+            }
             for (Vec3d point : specialPoints) {
                 double s = indicatorSize.get() + 0.15;
                 event.renderer.box(point.x - s, point.y - s, point.z - s, point.x + s, point.y + s, point.z + s,
@@ -6277,8 +6427,6 @@ public class StepCheckered extends Module implements MapPrinter {
         FETCH_MAP,
         FILL_MAP,
         WAIT_FILLED_MAP,
-        WAIT_PRIMING_BUILD,
-        PRIMING_WALK,
         WAIT_BATCH_BUILD,
         BATCH_WALK_A,
         BATCH_WALK_B,

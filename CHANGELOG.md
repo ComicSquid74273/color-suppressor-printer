@@ -92,6 +92,225 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-10-20 (o) — DURABLE PROGRESS: crash/restart/disable resume with the SAME map
+User: "whenever bot crashes, restarts, pauses or disables, progress must be saved and
+only reset by RESET ALL." The progress file (`_configs/step_checkered_progress.json`)
+existed but had two holes: the saved mapId was never read back (a restart re-pinned
+WHATEVER filled map it found — wrong-map corruption risk with old maps in inventory),
+and progress was only saved after a batch COMPLETED. Now:
+- **saveStepProgress(k) on EVERY batch start** — "batch k in progress" is the file's
+  semantic; a crash at any point resumes by re-running exactly the in-progress batch
+  (idempotent: the build's world-verify/repair re-places, the walks re-record the
+  same standing content). The old post-done save was removed (beginStepBatch(k+1)
+  writes the same value).
+- **Resume re-pins the EXACT saved map**: `loadStepProgress` parses the stored mapId;
+  START ALL with a progress file finds that precise map in the inventory
+  (`stepFindMapIdSlot`) and pins it. If the saved map is missing from the inventory
+  the recorded pixels are unrecoverable — loud error + fresh start (progress cleared)
+  instead of silently recording into the wrong map.
+- Module disable/pause already kept the file (only `resetStepRun`/RESET deletes it);
+  onDeactivate stages ABORTED, which START ALL accepts for resume.
+- Slave restart mid-batch: the master's wait heartbeat/timeout aborts cleanly; the
+  next START ALL resumes at the in-progress batch.
+
+### 2026-10-20 (n) — CAUGHT: master waits queued at the BOX EDGE (stepNearestPlatform z bug)
+User: "master making a checkpoint around x 98, z -320 ±2 every batch, just before the
+slave starts a new batch." The new always-on master checkpoint log caught it verbatim:
+`Master checkpoint: stepBatchSafe at (-316, 99, -319)` every requeue second = relative
+(131.5, 0.5) — the north edge of the print box, NOT a platform. Root cause: a
+one-liner in `stepNearestPlatform` — it passed the z array INDEX (0..4) into
+`stepCheckpoint` instead of the VALUE (14/40/64/88/112), so every "wait in place"
+landed at z_rel ≈ 0.5. Consequences: the master stood inside the box's north edge
+during every wait (map stowed, so no recording harm) and hiked back to the sweep
+stations afterward — the recurring dead walk. Fixed to `STEP_CHECKPOINT_Z[zIdx]`.
+With the fix, every wait snaps to a real platform: post-W2 the master waits on the
+next batch's W1 lane north station (zero walk to W1), post-W1 it waits at the south
+station where W2 starts (zero walk). Also de-duplicated the always-on checkpoint log
+(it printed once per requeue second).
+
+### 2026-10-20 (m) — FIXED master cycle: W1 always N→S, W2 always S→N (auto-direction removed)
+User: "MASTER STILL WALKS S→N BEFORE SLAVE SENDS BREAK2DONE." The master log PROVED
+the (k) gate held (batch 4: break(2) requested → 41s of break2done heartbeats → W2
+started only on break2done). What the user saw was W1 itself running S→N: the
+auto-direction sweep picks its direction from the master's position, so W1 sometimes
+ran S→N and looked exactly like an early W2. All master sweeps are now pinned:
+**W1 always N→S** (0→4), **W2 always S→N** (4→0), closing N→S — the doc's fixed walk
+pair. Chains with zero dead legs: W1 ends south → wait there through break(2) → W2
+S→N from that exact platform → ends north → next batch's W1 starts north. All six
+sweep-start sites pinned (tick consumer + arrival fallbacks); no auto-direction
+remains on the master. Matches the slave's fixed cycle (l).
+
+### 2026-10-20 (l) — FIXED CYCLE: all slave passes pinned to fixed directions (no mirroring)
+User: "both master and slave are doing dead walks N->S or S->N at random times, not
+even in order." Two causes: (1) the pre-(j) jar's stale south batchExit cascade
+(fixed earlier); (2) a REAL remaining flaw — every slave route mirrored its direction
+based on where the bot happened to stand (`slaveStartsFromSouth()`), so any interrupt
+or odd position flipped the parity and manufactured dead NS walks + reversed phase
+order. All passes are now pinned to the FIXED CYCLE the user prescribed:
+**print N→S → break(2) S→N → break-all N→S (forced) → collection S→N → exit in
+place at north → next batch** — identical every batch, ending where the next begins.
+Repositioning happens once, at a phase boundary, via the north corridor. Fixed at:
+beginBatch, beginPriming, the tops route, resumeBatchRoute (all stages), the
+verifyBreak2 retry, the print-repair pass; `slaveStartsFromSouth()` deleted.
+
+### 2026-10-20 (k) — FINAL walk order: W1 → break(2) COMPLETE → W2 → break-all (user rule)
+User (second, clarifying directive): "master will do the S->N walk, but NOT before
+slave completes break(2)." Supersedes (i)'s both-walks-first order and the original
+concurrent design. Sequence per batch: build → W1 (records) → break(2) requested at
+W1's completion; master waits in place (map stowed, heartbeat) → slave completes
+break(2) (break2done) → W2 (the S->N suppression walk) starts — never earlier →
+W2 completes → break-all immediately (break2done already arrived). Safety: W2 rides
+the EAST lane 2k+129, 127.5+ blocks from the west tops (beyond dominant record
+range 127.2), so it cannot re-record over the broken west columns — the doc's §4
+same-lane re-record hazard does not apply to the east lane. `stepBreak2Point` is now
+a pure position holder (the tick-level consumer sends break2 and starts W2; an
+arrival-driven path would have skipped W2).
+
+### 2026-10-20 (j) — stale south-end batchExit: exit gate now runs where collection ended
+User: "after picking dropped blocks the slave was correctly at N — why did it walk back
+to the S checkpoint instead of starting the next batch?" `startBreakAll` queues
+`batchExit` beside `breakAllDone` at the SOUTH end; the collection run ends at the
+NORTH end, so the bot walked a full lane back south just to reach a gate that is
+position-independent. Fix: the collection run's completion (and unreachable-drops
+handoff) replaces the queued batchExit with one at the bot's current position — the
+bot exits in place at the north end, exactly where the next batch's north-corridor
+supply run starts.
+
+### 2026-10-20 (i) — break(2) moved AFTER both walks (doc §4 order restored, user callout)
+User: "master is doing SN run even before slave completes break(2)." The code sent
+break(2) at W1's completion and ran W2 CONCURRENT with the slave's break(2) — a
+module-era optimization that contradicts the doc's load-bearing rule (§4: "break(2)
+must come AFTER both walks — a walk over broken dominant columns re-records borrow
+values / terrain over them") and was never among the 0-mismatch-verified orderings.
+New order per batch: build -> W1 -> W2 (immediately, back-to-back) -> break(2)
+requested at W2's completion (WAIT_BREAK_2, tick-level send with the
+stepBreak2Point arrival as fallback) -> break2done -> breakall. Batch-0 split mode
+keeps its direct breakall (no break(2) exists there). Cost: W2 is no longer overlapped
+with break(2) (~40s serial per batch).
+
+### 2026-10-20 (h) — break(4) collection redesigned: single south→north run (user spec)
+User spec: "slave should not collect any block till break(4) phase is complete; the
+bot is at the SOUTH checkpoint when break(4) ends; after break(4) it collects every
+block in one optimized run south→north — no multiple NS passes."
+- **Break pass forced north → south ALWAYS** (was direction-mirrored): breakAllBegin
+  at the north end, breakAllDone at the south end, corridor-staged from anywhere.
+- **No collection before blocks=0**: the gate chases straggler blocks only; item
+  collection starts exclusively after the window is server-confirmed air. In-flight
+  drops are dwelt for.
+- **ZIGZAG + PER-ITEM CHASE DELETED** (the NSNS passes): replaced by `collectRun` — a
+  single monotone collector. Each arrival re-targets the nearest ready drop AT/AHEAD
+  of the bot (z never moves more than 1.5 blocks south), so the run sweeps the window
+  south → north with east-west side-steps only, one run, ending at the north end
+  (where the next batch's supply run starts). A drop re-picked 10x without
+  disappearing is blacklisted for the batch (unreachable) and the run hands off to
+  the exit gate, whose census names what remains. collectRun is exempt from the
+  generic anti-stuck force-skip; `collectSkips` cleared at batch starts.
+
+### 2026-10-20 (g) — collection zigzag: once per gate, 2 legs, outliers to per-item chase
+Live 03:38 run: the paced break-all arrived blocks=0 (pace fix works), zigzag 1
+collected 137→34 drops — then the gate queued a SECOND zigzag for the 34, which sat
+there while the user watched drops remain on the ground. Root cause: the margin-4
+census SEES drops 3-4 blocks outside the window, but the zigzag lanes only REACH
+~1 block past it — a repeat zigzag can never collect them (unreachable-outlier loop).
+Fixes: (1) the zigzag runs at most ONCE per gate sequence (`batchZigzagDone`, reset
+when blocks get chased or at batch start) — remaining drops, regardless of count, go
+to the per-item chase which walks to each drop; (2) the zigzag itself was walking one
+lane twice (4 NS legs with a redundant same-lane return) — now a proper 2-leg zigzag
+(near end → far on wx+1, hop east, back on wx+3), roughly half the time.
+
+### 2026-10-20 (f) — drop-scan margin widened to 4 (worst-case bounce, user-measured)
+User: "sometimes in even worst case dropped blocks can drop to 3-4 blocks far." The
+margin-2 item windows couldn't even SEE such drops (gates declared CLEAN with drops
+lying outside), and the zigzag lanes reach only ~1 block past the window. Changes:
+- `RESET_ITEM_MARGIN` 2 -> 4 (one constant: reset segment scans, verify walk,
+  print-box content range, all keyed on it).
+- Batch-window census + finishBatch's ground-items counter + the break-all gate's
+  item chase all widened to x = west-4 .. west+7 (matching each other exactly).
+- Collection self-corrects: the zigzag sweeps the bulk (2 lanes cover the window);
+  far-bounce outliers are now VISIBLE in the census, so they fall to the per-item
+  chase (<=8 threshold) and CLEAN only fires when the margin-4 census is empty.
+
+### 2026-10-20 (e) — break-all missed blocks + didn't collect: pass pace + gate priority fixed
+Live 03:12 run (batch 1, standard flow): the break-all pass covered the lane in 23s at
+sprint speed and arrived with **86 of ~490 blocks standing** and 199 drops; the gate
+then launched the item zigzag (items outranked standing blocks) whose first leg walked
+27s straight INTO the standing west-pair blocks before the user killed it. Two fixes:
+
+1. **ADAPTIVE BREAK PACE** (the structural one — this is what RESET always had and
+   break-all lacked): while walking a break(2)/break-all pass (Mining + breakStage!=0
+   + plan present), the bot holds forward whenever a plan block in range still needs
+   breaking — the pass clears rows as it walks instead of sprinting past them
+   (~490 blocks at the ~10-20/s hybrid rate => the pass now takes 1-2 min instead of
+   23s, and arrives ~clean). Watchdog: a 10s hold releases and suppresses re-holding
+   for 10s (a stubborn block can neither stall the pass nor spam). RESET is excluded
+   (plan null there — the serpentine feed + segment gates already pace it).
+2. **GATE PRIORITY — blocks first, unconditionally**: `straggler != null` now always
+   takes the block chase; the zigzag collection pass and per-item chases only run on
+   a fully-air window (their stated precondition, now enforced).
+3. **DEDUPLICATION** (user callout — "same code or duplication?"): the hybrid
+   break-send rules existed in 3 drifted copies and the two pace-holds were parallel
+   copies of one pattern. Now: `sendHybridBreak(target)` is the ONE break sender
+   (used by the Mining loop, the second target loop, the resetPass arrival handler,
+   and the legacy mining tail — zero raw fastBreak sends outside it), and
+   `adaptivePaceHold()` is the ONE pace governor (print mode + break mode, one call
+   site). Behavior identical; compile-verified.
+
+### 2026-10-20 (d) — start-batch setting: batch 0 skipped for pipeline testing
+User directive: "skip building for batch0, will start testing from batch1, for now."
+New Advanced setting `start-batch` (0-62, **default 1**): a fresh run begins at that
+batch - earlier batches are never built or walked. The resume path takes
+max(savedProgress, start-batch) so a stale progress file can never drag the run back.
+No `step_checkered_progress.json` exists yet, so the first run starts cleanly at 1.
+Set it back to 0 for full runs. Build green; UNCOMMITTED.
+
+### 2026-10-20 (c) — batch-0 pre-build DISABLED by default (user directive): standard flow for batch 0
+"BOT DID AGAIN PREBUILD THING FOR BATCH0, WHICH I DONT WANT, DISABLE/SKIP IT" - the
+floor-half/priming pre-build phase is now behind a setting, **OFF by default**:
+
+- New setting `batch0-split-build` (Advanced group). OFF (default): the master goes
+  straight from map-fill to `beginStepBatch(0)` - batch 0 runs the STANDARD flow
+  exactly like batches 1-62: `build:0` (full 681) -> W1 (lane 127) -> break(2) ->
+  W2 (lane 129) -> break-all. No pre-build phase, no prime command, no buildhalf
+  halves. ON: the split flow (floor -> W1@125 -> tops -> W2@127, no break(2)).
+- Gated on the setting: beginStepPrimingRun's split entry, beginStepBatch(0)'s
+  buildhalf resume path, the BATCH_WALK_A tops-request branch, both lane picks
+  (W1@125 is split-only), and the batch0Split break-all shortcuts in BATCH_WALK_B
+  and the WAIT_BREAK_ALL consumer.
+- KNOWN PIXEL RISK (documented, user-accepted): the split existed because pair 0's
+  floor cannot record cleanly from a full build (R_dom - R_rec = 1.74 > 1 row
+  interleave - the impossibility theorem; the pre-split era showed 53 rec gaps on
+  batch 0). With the split OFF, pair 0's floor may again record corrupted - flip
+  `batch0-split-build` back on to restore the proven flow.
+
+### 2026-10-20 (b) — BATCH 0 UNIFIED with the standard batch flow + bulk drop collection
+Rollback anchor: `fdbcb86` (everything through the stall fixes). User directive: batch 0
+must flow like every other batch. Post-(d) the standard stages already expressed the
+merged sequence, so the priming special-casing is now DELETED:
+
+- **Master**: `beginStepPrimingRun` now uses the standard `WAIT_BATCH_BUILD` with
+  `stepMasterBatch = 0` and the standard wait/heartbeat machinery — the only difference
+  from `build:k` is the command ("prime" = floor half). The priming walk IS W1 through
+  the standard `BATCH_WALK_A` lane pick (batch 0 -> lane 125), and W1's completion
+  requests the tops half via the existing split branch. REMOVED: `WAIT_PRIMING_BUILD`
+  and `PRIMING_WALK` stages, `stepPrimingSafe` handler, `stepSlaveReadyPriming`
+  field/signal, `ready:prime` parsing, the PRIMING_WALK sweep-complete case.
+- **Slave**: `beginPriming` now sets `currentBatch = 0` and runs the STANDARD route
+  (`batchBegin -> printDone -> awaitBreak2`, sends `ready:0`, direction-mirrored).
+  REMOVED: `stepPrimingReady`/`stepPrimingWait` cases, the ready:prime send, the
+  `currentBatch == -1` special branch in `resumeBatchRoute`.
+- **Remaining batch-0 deltas (physics-mandated, expressed as data not separate paths)**:
+  (1) the build is split around W1 (floor -> W1 -> tops - pair 0's floor must record
+  with no tops above; oracle-verified split), (2) no break(2) (W2 is the tops' first
+  and only record), (3) W1 rides lane 125 instead of 127. Everything else — commands
+  consumed, stages, signals, waits, routes, gates — is the same code as batches 1-62.
+- **BULK DROP COLLECTION PASS (the 94-item stall)**: live run 2026-10-20 01:52 showed
+  the break-all gate facing 94 ready drops (west-pair drops land 1.5-3.5 blocks off the
+  breaking lane - outside vanilla pickup radius; per-item chasing costs minutes per
+  batch). When the gate sees >8 ready drops (and inventory has room) it now queues one
+  zigzag walk over the window's two collection lanes (x = west+1 and west+3 - the
+  window is confirmed air first), sweeping the drops by proximity, then re-verifies.
+  Straggler chase remains for <=8 items; blocks are always chased first.
+
 ### 2026-10-20 — live stall diagnosed + fixed: print-pass deadlock at pass start
 User ran START ALL with the (d) build; the slave froze at the start of the priming
 phase twice (01:01 run: 2 PLACE lines at the staging then minutes of silence; 01:36
