@@ -2857,6 +2857,15 @@ public class StepCheckered extends Module implements MapPrinter {
      *  @return number of break actions sent this tick */
     private int sendDistinctBreaks(int maxSends, boolean fullSweep) {
         java.util.HashSet<BlockPos> attempted = new java.util.HashSet<>();
+        // INSTA-BREAK REQUIRES THE PICKAXE IN HAND: the server computes break time
+        // from the HELD item at packet time. With a building material selected
+        // (left over from the print pass), same-tick START+STOP is rejected and
+        // blocks stall into the vanilla queue (live 2026-10-20: 25/s sent but only
+        // 3.8/s confirmed, 75 stragglers, batch timeout). The old second loop did
+        // setSelectedSlot(8) every tick; this shared sender must too.
+        if (mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) {
+            mc.player.getInventory().setSelectedSlot(8);
+        }
         int sent = 0;
         for (int pick = 0; pick < maxSends * 3 && sent < maxSends; pick++) {
             BlockPos breakTarget;
