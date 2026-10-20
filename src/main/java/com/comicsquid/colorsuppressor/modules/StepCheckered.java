@@ -672,6 +672,14 @@ public class StepCheckered extends Module implements MapPrinter {
      *  full batch's breaking (print repairs + break(2) + break-all + stragglers). */
     private static final int PREP_PICKAXE_BUFFER = 800;
 
+    /** MASTER AREA (user rule, 2026-10-20): the platform lattice is a BOUNDED area -
+     *  lanes x_rel 125..253 (x = 125+2j), rows z_rel {14,40,64,88,112}, plus the fill
+     *  spot (125.5, 115.5). Inside it the master moves ONLY along lattice lines; the
+     *  area is entered and exited ONLY through the north-west GATE (platform 125,14).
+     *  Violations are logged by the per-tick lattice watchdog. */
+    private static final int MASTER_AREA_X0 = 124, MASTER_AREA_X1 = 255;
+    private static final int MASTER_AREA_Z0 = 12, MASTER_AREA_Z1 = 117;
+
     public StepCheckered() {
         super(Addon.CATEGORY, "step-checkered", "Uses the step-checker method to build colour-suppression maps.");
         // Local-only supervisor hook: if the (git-ignored) BotControlEndpoint tool is on the
@@ -783,6 +791,7 @@ public class StepCheckered extends Module implements MapPrinter {
         stepMasterStage = StepMasterStage.LOCK_WALK;
         checkpoints.clear();
         checkpoints.add(new Pair<>(cartographyTable.getRight(), new Pair<>("stepLockTable", null)));
+        prependLatticeTransit(lowerMapCorner.getX() + 125.5, lowerMapCorner.getZ() + 14.5);   // exit via the GATE
         state = State.Walking;
         stepStowMap();
         info("§aWalking to the configured cartography table to lock the pinned map.");
@@ -3193,6 +3202,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 stepMasterWaitTicks = 0;
                 checkpoints.clear();
                 checkpoints.add(new Pair(mapChest.getRight(), new Pair("stepFetchMap", mapChest.getLeft())));
+                prependLatticeTransit(lowerMapCorner.getX() + 125.5, lowerMapCorner.getZ() + 14.5);   // exit via the GATE
                 state = State.Walking;
                 info("§aStep-checker: walking to the map chest to get an empty map.");
             } else {
@@ -3296,6 +3306,7 @@ public class StepCheckered extends Module implements MapPrinter {
         checkpoints.clear();
         Vec3d fillSpot = stepCheckpoint(125, 115);
         checkpoints.add(new Pair<>(fillSpot, new Pair<>("stepFillMap", null)));
+        prependLatticeTransit(fillSpot.x, fillSpot.z);
         state = State.Walking;
         stepStowMap();
         info("§aStep-checker: walking to the fill checkpoint for the working map.");
@@ -3402,6 +3413,43 @@ public class StepCheckered extends Module implements MapPrinter {
             lowerMapCorner.getZ() + relativeZ + 0.5);
     }
 
+    private boolean stepInMasterArea() {
+        return lowerMapCorner != null && mc.player != null
+            && mc.player.getX() >= lowerMapCorner.getX() + MASTER_AREA_X0 && mc.player.getX() <= lowerMapCorner.getX() + MASTER_AREA_X1
+            && mc.player.getZ() >= lowerMapCorner.getZ() + MASTER_AREA_Z0 && mc.player.getZ() <= lowerMapCorner.getZ() + MASTER_AREA_Z1;
+    }
+
+    /** Nearest lattice lane x (block 125+2j) to a world x, clamped to the lattice. */
+    private double stepNearestLaneX(double worldX) {
+        int j = (int) Math.round(Math.clamp(worldX - lowerMapCorner.getX() - 125, 0, 128) / 2.0);
+        return lowerMapCorner.getX() + 125 + 2 * j + 0.5;
+    }
+
+    /** Prepend LATTICE transit legs to the queue: from the master's current position
+     *  to (targetX, targetZ) moving ONLY along lane lines (vertical) and the final
+     *  z (horizontal at the destination's z) - an L, never a diagonal. When starting
+     *  OUTSIDE the area, the first leg is the north-west GATE (platform 125,14) -
+     *  the single legal entry/exit. Callers queue their final checkpoint first. */
+    private void prependLatticeTransit(double targetX, double targetZ) {
+        double y = lowerMapCorner.getY();
+        double targetLaneX = stepNearestLaneX(targetX);
+        ArrayList<Pair<Vec3d, Pair<String, BlockPos>>> legs = new ArrayList<>();
+        double startLaneX;
+        if (stepInMasterArea()) {
+            startLaneX = stepNearestLaneX(mc.player.getX());
+        } else {
+            startLaneX = lowerMapCorner.getX() + 125.5;   // the GATE lane
+            legs.add(new Pair(new Vec3d(lowerMapCorner.getX() + 125.5, y, lowerMapCorner.getZ() + 14.5), new Pair("sprint", null)));
+        }
+        if (Math.abs(startLaneX - targetLaneX) > 0.75) {
+            legs.add(new Pair(new Vec3d(startLaneX, y, targetZ), new Pair("sprint", null)));   // z leg on the start lane
+            legs.add(new Pair(new Vec3d(targetLaneX, y, targetZ), new Pair("sprint", null)));  // x leg at the target z
+        } else if (Math.abs(mc.player.getZ() - targetZ) > 1.5 || !legs.isEmpty()) {
+            legs.add(new Pair(new Vec3d(targetLaneX, y, targetZ), new Pair("sprint", null)));
+        }
+        for (int i = legs.size() - 1; i >= 0; i--) checkpoints.addFirst(legs.get(i));
+    }
+
     private void stepQueueSweep(int lane, int startSpot, int endSpot) {
         checkpoints.clear();
         int direction = Integer.compare(endSpot, startSpot);
@@ -3419,6 +3467,10 @@ public class StepCheckered extends Module implements MapPrinter {
         state = State.Walking;
         stepMasterDwellTicks = 0;
         stepMasterSweepCompletionPending = false;
+        // Approach discipline: reach the first station via LATTICE legs (gate if
+        // entering from outside) - never a diagonal across the area (the resume case).
+        Vec3d firstStation = checkpoints.getFirst().getLeft();
+        prependLatticeTransit(firstStation.x, firstStation.z);
     }
 
     private void stepStartSweep(int lane, int startSpot, int endSpot) {
@@ -3702,6 +3754,26 @@ public class StepCheckered extends Module implements MapPrinter {
                 }
             }
             default -> { }
+        }
+
+        // LATTICE WATCHDOG (user rule, 2026-10-20): inside the master area the bot
+        // may only stand/move on lattice lines (a lane x = 125+2j, or a row z of the
+        // 5 stations). Anything else - e.g. a manual nudge or a stray walk - is logged
+        // with the position. Throttled: checked every 2 ticks, warned at most every 5s.
+        if (stepInMasterArea()) {
+            double px = mc.player.getX() - lowerMapCorner.getX() - 125.5;
+            double laneOff = Math.abs(px / 2.0 - Math.round(px / 2.0)) * 2.0;   // distance to nearest lane center
+            double pz = mc.player.getZ() - lowerMapCorner.getZ() - 0.5;
+            boolean onRow = false;
+            for (int rz : STEP_CHECKPOINT_Z) {
+                if (Math.abs(mc.player.getZ() - (lowerMapCorner.getZ() + rz + 0.5)) <= 0.9) { onRow = true; break; }
+            }
+            if (laneOff > 0.9 && !onRow && mapHoldWarnCooldown <= 0) {
+                mapHoldWarnCooldown = 100;   // reuse the 5s warn throttle
+                warning("§cLATTICE VIOLATION: master is off the platform lattice at ("
+                    + (int) mc.player.getX() + ", " + (int) mc.player.getZ() + ") - inside the area it may only move "
+                    + "along lane/row lines, entering/exiting via the north-west gate.");
+            }
         }
 
         // MAP-HOLD GUARD (user rule, 2026-10-20): while the module is enabled, the
