@@ -3563,12 +3563,14 @@ public class StepCheckered extends Module implements MapPrinter {
         checkpoints.clear();
         int direction = Integer.compare(endSpot, startSpot);
         for (int spot = startSpot; ; spot += direction) {
-            // CALIBRATED CHECKPOINT: sweeps stand at the block EDGE (lane+0.0), not the
-            // centre - the doc's kernel (125.46 / 127.2 probes) was measured from exactly
-            // this point. +0.5 east put the near east lane at 125.0 (inter-spot rows
-            // frozen = the batch-0 gaps) and the far dominant into the marginal band.
+            // SWEEP STANDING = PLATFORM CENTRE (lane + 0.5) - the EXACT position of the
+            // proven python runner's cp(): (127 + 2k + 0.5), 0 mismatches across dozens
+            // of verified batches. The old edge standing (lane + 0.0, from the dormant
+            // batch-0 split proof) had ZERO pixel-verified normal batches behind it and
+            // shaved the margin on the east pair's record band; the runner's centre is
+            // the only experimentally proven standing.
             checkpoints.add(new Pair<>(new Vec3d(
-                lowerMapCorner.getX() + lane,
+                lowerMapCorner.getX() + lane + 0.5,
                 lowerMapCorner.getY(),
                 lowerMapCorner.getZ() + STEP_CHECKPOINT_Z[spot] + 0.5), new Pair<>("stepDwell", null)));
             if (spot == endSpot) break;
@@ -3585,7 +3587,7 @@ public class StepCheckered extends Module implements MapPrinter {
     private void stepStartSweep(int lane, int startSpot, int endSpot) {
         // Always-on direction log: every sweep announces its lane and z-range, so a
         // wrong-direction or unexpected walk is visible in the log immediately.
-        info("§7Sweep: lane x=" + lane + " z " + STEP_CHECKPOINT_Z[startSpot]
+        info("§7Sweep: standing x=" + (lowerMapCorner.getX() + lane + 0.5) + " z " + STEP_CHECKPOINT_Z[startSpot]
             + " -> " + STEP_CHECKPOINT_Z[endSpot]
             + (startSpot < endSpot ? " (N->S)" : " (S->N)") + ".");
         stepPendingSweepLane = lane;
