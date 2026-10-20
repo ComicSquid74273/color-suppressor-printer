@@ -484,7 +484,6 @@ public class StepCheckered extends Module {
     );
 
     int timeoutTicks;
-    int toBeSwappedSlot;
     int heartbeatTicks;
     boolean pendingDisable;                                          // deferred toggle (see requestDisable)
     StepCheckerLayers stepLayers;                                    // converted per-pair rec/dom layers (StepCheckerLayers.empty() until the NBT loads)
@@ -502,22 +501,12 @@ public class StepCheckered extends Module {
     int resetLadderSeg;                                              // 0..4  current z-segment (resume anchor)
     int resetLadderEndCol;                                           // last column of the scoped reset
     int restockCooldown;                                             // blocks repeat supply-run triggers
-    HashMap<BlockPos, Integer> placementCooldowns;                   // litematica-style: retry timer per position
-    HashMap<BlockPos, Integer> placementAttempts;                    // per-position placement attempts (adaptive-pace cap)
-    int placeHoldTicks;                                              // consecutive adaptive-pace hold ticks (watchdog)
-    BlockPos vanillaStickyTarget;                                    // ONE multi-tick vanilla target at a time (progress must accumulate)
-    int rateTick;                                                   // 20-tick rate-report cycle
-    int breakSentPerSec, breakConfirmedPerSec, placeSentPerSec;      // [RATE] verification counters
     HashMap<BlockPos, Integer> collectSkips;               // collection run: picks per drop (10 = blacklisted)
     // BREAK CONFIRMATION: fastBreak sends packets but the server's block-update
     // arrives 1-2 ticks later. These track recently-broken positions and retry
     // any that the server didn't process — BEFORE the bot walks past them.
-    HashMap<BlockPos, Integer> breakPending;                        // pos -> ticks until silently confirmed
-    HashSet<BlockPos> needsVanillaBreak;                  // fastBreak failed → use vanilla mining
-    HashMap<BlockPos, Integer> vanillaBreakRetries;                 // pos -> times expired into vanilla fallback (server-rejection evidence)
     BlockPos jamWatchTarget;                                        // feed-jam detector: armed target held out of range
     int jamWatchTicks;
-    boolean breakSweepActedThisTick;                                // the Mining-state break loop already sent packets this tick
     int resetPendingScope = -2;                                     // persisted RESET scope (-2 unread, -1 none, >=0 resume)                                     // in-memory mirror of the progress file's batch (idle render + resume UI)
     String resetStallSig;                                           // reset arrival stall detector: last arrival state signature
     int resetStallRounds;
@@ -542,7 +531,6 @@ public class StepCheckered extends Module {
     ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests;
     BlockPos tempChestPos;
     BlockPos nextBlockPos;
-    Item lastSwappedMaterial;
     HashMap<Integer, Pair<Block, Integer>> blockPaletteDict;        // Maps palette block id to the Minecraft block and amount
     HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict;   // Maps block to the chest pos and the open position
     Set<ItemStack> toolSet;                                         // Set of all registered tool item stacks
@@ -567,7 +555,7 @@ public class StepCheckered extends Module {
     private static final int RESET_ITEM_MARGIN = 4;
     /** Route actions during which placement may happen (also gates the Dynamic speed mode:
      *  these + Mining = "working", everything else is transit). */
-    private static final List<String> ALLOW_PLACE_ACTIONS = Arrays.asList("sprint",
+    static final List<String> ALLOW_PLACE_ACTIONS = Arrays.asList("sprint",
         "batchBegin", "printDone", "printDone2",
         "awaitBreak2", "break2Done", "breakAllBegin", "breakAllDone", "stepClosingReady", "stepClosingWait",
         "stepClosingDone", "batchExit", "sweepTick", "fullSweepStart", "fullSweepCenter", "fullSweepTick",
@@ -584,6 +572,7 @@ public class StepCheckered extends Module {
     private final StepRenderer renderer = new StepRenderer(this);
     final StepMaster master = new StepMaster(this);
     final RestockManager restock = new RestockManager(this);
+    final BreakPlaceEngine engine = new BreakPlaceEngine(this);
 
     public StepCheckered() {
         super(Addon.CATEGORY, "step-checkered", "Uses the step-checker method to build colour-suppression maps.");
@@ -808,24 +797,15 @@ public class StepCheckered extends Module {
         xpBottleChest = null;
         pendingRole = null;
         mapMaterialChests = new ArrayList<>();
-        lastSwappedMaterial = null;
+        engine.lastSwappedMaterial = null;
         restock.toBeHandledInvPacket = null;
         restock.closeNextInvPacket = false;
         timeoutTicks = 0;
         restock.interactTimeout = 0;
-        toBeSwappedSlot = -1;
+        engine.resetForActivation();
         heartbeatTicks = 0;
         pendingDisable = false;
-        placementCooldowns = new HashMap<>();
-        placementAttempts = new HashMap<>();
         collectSkips = new HashMap<>();
-        placeHoldTicks = 0;
-        breakPending = new HashMap<>();
-        needsVanillaBreak = new HashSet<>();
-        vanillaBreakRetries = new HashMap<>();
-        jamWatchTarget = null;
-        jamWatchTicks = 0;
-        breakSweepActedThisTick = false;
         resetStallSig = null;
         resetStallRounds = 0;
         sweepWaitRounds = 0;
@@ -1062,15 +1042,15 @@ public class StepCheckered extends Module {
         // the activation path recursively (StackOverflowError -> client death)
         if (consumeStartBuildingRequest()) return;
 
-        // Supply-run cooldown ticks down; tryPlacingBlock can't re-trigger mid-trip
+        // Supply-run cooldown ticks down; engine.tryPlacingBlock can't re-trigger mid-trip
         if (restockCooldown > 0) restockCooldown--;
 
         // Placement cooldowns tick down (litematica-style): expired positions become
         // eligible for retry; successfully placed positions are already skipped by the
-        // world-state check in getNextBatchPlacementPos
-        if (!placementCooldowns.isEmpty()) {
-            placementCooldowns.replaceAll((pos, ticks) -> ticks - 1);
-            placementCooldowns.values().removeIf(ticks -> ticks <= 0);
+        // world-state check in engine.getNextBatchPlacementPos
+        if (!engine.placementCooldowns.isEmpty()) {
+            engine.placementCooldowns.replaceAll((pos, ticks) -> ticks - 1);
+            engine.placementCooldowns.values().removeIf(ticks -> ticks <= 0);
         }
 
         if (consumePendingDisable()) return;
@@ -1085,7 +1065,7 @@ public class StepCheckered extends Module {
 
         // Manual break calls remain available for isolated slave diagnostics; the normal run
         // reaches these flags through the step-checker TCP protocol.
-        if (armPermittedBreakPhase()) return;
+        if (engine.armPermittedBreakPhase()) return;
 
         // Inventory truly out of space mid-break-all (partial-stack headroom included):
         // deposit the building blocks, then resume
@@ -1109,7 +1089,7 @@ public class StepCheckered extends Module {
             return;
         }
 
-        if (consumeHotbarSwap()) return;
+        if (engine.consumeHotbarSwap()) return;
 
         if (restock.drainRestockBacklog()) return;
 
@@ -1117,9 +1097,9 @@ public class StepCheckered extends Module {
 
         armResetFeedTarget();
 
-        tickBreakConfirmations();
+        engine.tickBreakConfirmations();
 
-        pumpArmedBreakTarget();
+        engine.pumpArmedBreakTarget();
 
         if (restock.processDeferredInventoryIO()) return;
 
@@ -1127,8 +1107,8 @@ public class StepCheckered extends Module {
         if (checkpoints.isEmpty()) return;
 
         // ADAPTIVE PACE GOVERNOR - the ONE place that decides whether the bot may
-        // advance while working. Two modes, one contract (see adaptivePaceHold()).
-        Utils.setForwardPressed(!adaptivePaceHold());
+        // advance while working. Two modes, one contract (see engine.adaptivePaceHold()).
+        Utils.setForwardPressed(!engine.adaptivePaceHold());
 
         Vec3d goal = checkpoints.get(0).getLeft();
         if (PlayerUtils.distanceTo(goal.add(0, mc.player.getY() - goal.y, 0)) < checkpointBuffer.get()) {
@@ -1147,8 +1127,8 @@ public class StepCheckered extends Module {
         // ROLLING HOTBAR LOOKAHEAD (user rule: "always, for the whole batch") - runs
         // BEFORE the range gate (v2 fix: the first version sat after it and was
         // unreachable exactly when a swap was needed).
-        if (state.equals(State.Walking) && breakStage == 0 && currentBuildPlan != null && rateTick == 10) {
-            rollingHotbarLookahead();
+        if (state.equals(State.Walking) && breakStage == 0 && currentBuildPlan != null && engine.rateTick == 10) {
+            engine.rollingHotbarLookahead();
         }
         // Range gate uses EYE distance - the same metric the target pickers use. A
         // feet-based 3D check here rejects upper-layer blocks (y+2.5 above the feet)
@@ -1204,42 +1184,6 @@ public class StepCheckered extends Module {
 
     /** Manual/TCP break-permission gates. break(2) arms the phase and lets the tick
      *  continue; break-all hands over to startBreakAll and ends the tick. */
-    private boolean armPermittedBreakPhase() {
-        if (state == State.AwaitBreakPermission2 && break2Permitted) {
-            break2Permitted = false;
-            // PHASE TOOL SLOTS: breaking needs the tools - pickaxe to 8, carried axe
-            // to hotbar 7 (hotbar is 0-8; the old 'axe to 9' addressed main
-            // inventory and crashed performSwap's setSelectedSlot). Both leave the
-            // staging set until the next print pass. Best-first like the pickaxe.
-            restock.ensurePickaxeSlot8();
-            availableHotBarSlots.remove(Integer.valueOf(8));
-            {
-                int axeSlot = -1;
-                int axeLife = -1;
-                for (int as2 = 0; as2 < 36; as2++) {
-                    ItemStack a3 = mc.player.getInventory().getStack(as2);
-                    if (a3.isEmpty() || !a3.isIn(ItemTags.AXES)) continue;
-                    int life = ToolUtils.getRemainingDamage(a3);
-                    if (life >= minDurability.get() && life > axeLife) { axeLife = life; axeSlot = as2; }
-                }
-                if (axeSlot >= 9) {
-                    Utils.performSwap(axeSlot, 7);
-                    availableHotBarSlots.remove(Integer.valueOf(7));
-                } else if (axeSlot >= 0) {
-                    // already in the hotbar - reserve it in place so staging never evicts it
-                    availableHotBarSlots.remove(Integer.valueOf(axeSlot));
-                }
-            }
-            breakStage = 2;
-            state = State.Mining;
-            return false;
-        } else if (state == State.AwaitBreakPermissionAll && breakAllPermitted) {
-            breakAllPermitted = false;
-            startBreakAll();
-            return true;
-        }
-        return false;
-    }
 
     /** State-transition + checkpoint-consumption debug logs (debug-prints setting). */
     private void logTickDebug() {
@@ -1279,16 +1223,6 @@ public class StepCheckered extends Module {
     /** Chest/table interaction retry timer. */
 
     /** Pending on-demand hotbar swap (material found in the inventory, not hotbar). */
-    private boolean consumeHotbarSwap() {
-        if (toBeSwappedSlot == -1) return false;
-        restock.swapIntoHotbar(toBeSwappedSlot);
-        toBeSwappedSlot = -1;
-        if (postSwapDelay.get() != 0) {
-            timeoutTicks = postSwapDelay.get();
-            return true;
-        }
-        return false;
-    }
 
     /** Restock backlog: one chest-slot take per delay tick while the chest screen stays open. */
 
@@ -1353,77 +1287,10 @@ public class StepCheckered extends Module {
      *  (every checkpoint arrival handler returns), and a second processor further down
      *  used to double-decrement the same timers and silently remove expired entries on
      *  all those ticks — failed fastBreaks then NEVER reached the vanilla fallback.
-     *  Confirmed (now air) → remove. Expired + still solid → needsVanillaBreak. */
-    private void tickBreakConfirmations() {
-        breakSweepActedThisTick = false;
-        if (++rateTick >= 20) {
-            rateTick = 0;
-            if (breakSentPerSec > 0 || breakConfirmedPerSec > 0 || placeSentPerSec > 0) {
-                info("§d[RATE]§7 break §f" + breakSentPerSec + "/s sent §a" + breakConfirmedPerSec
-                    + "/s confirmed§7 | place §f" + placeSentPerSec + "/s sent§7");
-            }
-            breakSentPerSec = 0; breakConfirmedPerSec = 0; placeSentPerSec = 0;
-        }
-        if (!breakPending.isEmpty()) {
-            int confirmedThisTick = 0, expiredThisTick = 0;
-            Iterator<BlockPos> pendingIt = breakPending.keySet().iterator();
-            while (pendingIt.hasNext()) {
-                BlockPos pending = pendingIt.next();
-                int ticksLeft = breakPending.get(pending) - 1;
-                if (miningBlockState(pending).isAir()) {
-                    pendingIt.remove();
-                    confirmedThisTick++;
-                    vanillaBreakRetries.remove(pending);
-                } else if (ticksLeft <= 0) {
-                    // fastBreak failed — multi-tick block. Vanilla progress REQUIRES the
-                    // block in server reach: at speed-hack pace the bot outruns the echo
-                    // and expired blocks behind it could never progress (live 2026-10-21:
-                    // 51 blocks frozen in vanillaQ). Still-in-reach -> vanilla; behind
-                    // the bot -> drop it, the breakAllDone gate chases it on foot.
-                    if (mc.player.getEyePos().distanceTo(pending.toCenterPos()) <= 4.4) {
-                        needsVanillaBreak.add(pending);
-                    }
-                    int retries = vanillaBreakRetries.getOrDefault(pending, 0) + 1;
-                    vanillaBreakRetries.put(pending, retries);
-                    if (retries == 4) {
-                        warning("§6[RESET-VERIFY]§c PERSISTENT REJECTION: " + pending.toShortString()
-                            + " expired into vanilla fallback " + retries
-                            + " times without ever being server-confirmed - the fastBreak/vanilla "
-                            + "cycle is not making progress on this block.");
-                    }
-                    expiredThisTick++;
-                    pendingIt.remove();
-                } else {
-                    breakPending.put(pending, ticksLeft);
-                }
-            }
-            breakConfirmedPerSec += confirmedThisTick;
-            if (debugPrints.get() && (confirmedThisTick + expiredThisTick) > 0) {
-                info("§3[dbg] break-confirmation: §aserver-confirmed=" + confirmedThisTick
-                    + "§3 expired-to-vanilla=§e" + expiredThisTick
-                    + "§3 inFlight=" + breakPending.size() + " vanillaQ=" + needsVanillaBreak.size());
-            }
-        }
-        // Clean vanilla-fallback set when blocks break
-        if (!needsVanillaBreak.isEmpty()) {
-            needsVanillaBreak.removeIf(pos -> miningBlockState(pos).isAir());
-        }
-    }
+     *  Confirmed (now air) → remove. Expired + still solid → engine.needsVanillaBreak. */
 
     /** The armed break target: clear it once the world shows air, otherwise keep
      *  sending distinct breaks at the per-tick budget. */
-    private void pumpArmedBreakTarget() {
-        if (!state.equals(State.Mining) || nextBlockPos == null) return;
-        if (miningBlockState(nextBlockPos).isAir()) {
-            nextBlockPos = null;
-            state = State.Mining;
-        } else {
-            // Distinct-position multi-send (25-30/s target): the per-tick stop-after-
-            // one pacing was the rate cap - the client cannot see confirmations
-            // within the same tick. See sendDistinctBreaks.
-            sendDistinctBreaks(breaksPerTick.get(), fullSweepActive);
-        }
-    }
 
     /** Handle a pending block-entity interaction response packet, then any queued
      *  screen close. @return true when a packet was handled (tick stops). */
@@ -1565,9 +1432,9 @@ public class StepCheckered extends Module {
                 state = State.StandBy;
                 Utils.setForwardPressed(false);
                 SlaveSystem.sendMessageToMaster("step:done:" + Math.max(currentBatch, 0));
-                info("§6[RESET-VERIFY]§7 completion state: breakPending(in-flight server confirms)=" + breakPending.size()
-                    + " vanillaQueue=" + needsVanillaBreak.size()
-                    + " persistentRejections=" + vanillaBreakRetries.size()
+                info("§6[RESET-VERIFY]§7 completion state: engine.breakPending(in-flight server confirms)=" + engine.breakPending.size()
+                    + " vanillaQueue=" + engine.needsVanillaBreak.size()
+                    + " persistentRejections=" + engine.vanillaBreakRetries.size()
                     + " - all should be 0 at completion.");
                 info("§aRESET complete - print area cleared, items deposited, standby.");
                 return true;
@@ -1882,7 +1749,7 @@ public class StepCheckered extends Module {
                 // Same hybrid rules as the per-tick break loop - via the ONE
                 // shared sender (pending-guarded: no re-send while a
                 // confirmation is in flight).
-                if (!breakPending.containsKey(lTarget)) sendHybridBreak(lTarget);
+                if (!engine.breakPending.containsKey(lTarget)) engine.sendHybridBreak(lTarget);
                 checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("resetStation", null)));
                 state = State.Mining;
                 breakStage = 4;
@@ -1939,10 +1806,10 @@ public class StepCheckered extends Module {
     /** The next place/break work target for the current state (null = none). */
     private BlockPos pickWorkTarget() {
         if (state.equals(State.Walking)) {
-            return (currentBuildPlan != null && breakStage == 0) ? getNextBatchPlacementPos() : null;
+            return (currentBuildPlan != null && breakStage == 0) ? engine.getNextBatchPlacementPos() : null;
         }
         return fullSweepActive ? nextBlockPos
-            : breakStage != 0 ? getNextBatchBreakPos() : null;
+            : breakStage != 0 ? engine.getNextBatchBreakPos() : null;
     }
 
     /** ROLLING HOTBAR LOOKAHEAD (user rule: "always, for the whole batch, not just at
@@ -1952,58 +1819,6 @@ public class StepCheckered extends Module {
      *  swaps/sec), each evicting the resident with the FARTHEST next-use z (true
      *  Belady). Multi-stack materials: an emptied hotbar stack counts as missing, so
      *  the next carried stack of the same item stages automatically. */
-    private void rollingHotbarLookahead() {
-        HashMap<Item, Integer> firstUseZ = new HashMap<>();
-        int botZNow = mc.player.getBlockZ();
-        for (Map.Entry<BlockPos, Block> ue : currentBuildPlan.entrySet()) {
-            BlockPos up = ue.getKey();
-            int uz = up.getZ();
-            if (uz < botZNow - 2 || uz > botZNow + 24) continue;   // the walking window
-            if (miningBlockState(up).isAir()) continue;
-            Item uItem = ue.getValue().asItem();
-            Integer prev = firstUseZ.get(uItem);
-            if (prev == null || uz < prev) firstUseZ.put(uItem, uz);
-        }
-        int swapsDone = 0;
-        ArrayList<Item> bringOrder = new ArrayList<>();
-        ArrayList<Integer> bringZs = new ArrayList<>();
-        for (Map.Entry<Item, Integer> fe : firstUseZ.entrySet()) {
-            if (!restock.isItemInHotbar(fe.getKey())) { bringOrder.add(fe.getKey()); bringZs.add(fe.getValue()); }
-        }
-        for (int a = 0; a < bringOrder.size(); a++) {
-            for (int b = a + 1; b < bringOrder.size(); b++) {
-                if (bringZs.get(b) < bringZs.get(a)) {
-                    Item tI = bringOrder.get(a); bringOrder.set(a, bringOrder.get(b)); bringOrder.set(b, tI);
-                    Integer tZ = bringZs.get(a); bringZs.set(a, bringZs.get(b)); bringZs.set(b, tZ);
-                }
-            }
-        }
-        for (int bi = 0; bi < bringOrder.size() && swapsDone < 4; bi++) {
-            Item inItem = bringOrder.get(bi);
-            int inZ = bringZs.get(bi);
-            int srcSlot = -1;
-            for (int is = 9; is < 36 && srcSlot == -1; is++) {
-                ItemStack iStack = mc.player.getInventory().getStack(is);
-                if (!iStack.isEmpty() && iStack.getItem().equals(inItem)) srcSlot = is;
-            }
-            if (srcSlot == -1) continue;
-            int evictSlot = -1;
-            int worstZ = Integer.MIN_VALUE;
-            for (int hs : availableHotBarSlots) {
-                ItemStack eStack = mc.player.getInventory().getStack(hs);
-                if (eStack.isEmpty()) { evictSlot = hs; worstZ = Integer.MAX_VALUE; break; }
-                Integer eZ = firstUseZ.get(eStack.getItem());
-                int eDist = (eZ == null) ? Integer.MAX_VALUE : eZ;
-                if (eDist > worstZ) { worstZ = eDist; evictSlot = hs; }
-            }
-            if (evictSlot == -1) break;
-            if (worstZ < inZ) break;
-            Utils.performSwap(srcSlot, evictSlot);
-            swapsDone++;
-            info("§7Hotbar rolling: §f" + inItem.getName().getString() + "§7 swapped in (slot " + evictSlot
-                + ", first use ~" + (inZ - botZNow) + " rows ahead).");
-        }
-    }
 
     /** The tick's work engine once a target passed the range gate: batch multi-place
      *  or batch break (reserved pickaxe + distinct sends). Sets nextBlockPos before
@@ -2020,14 +1835,14 @@ public class StepCheckered extends Module {
                 HashSet<BlockPos> attempted = new HashSet<>();
                 int placed = 0;
                 for (int pick = 0; pick < blocksPerTick.get() * 3 && placed < blocksPerTick.get(); pick++) {
-                    BlockPos target = getNextBatchPlacementPos(attempted);
+                    BlockPos target = engine.getNextBatchPlacementPos(attempted);
                     if (target == null) break;
                     attempted.add(target);
                     nextBlockPos = target;
-                    placementCooldowns.put(target, 4);  // ~0.2s before retry
-                    placementAttempts.merge(target, 1, Integer::sum);  // adaptive-pace cap
-                    int code = tryPlacingBlock();
-                    if (code == 1) { placed++; placeSentPerSec++; }
+                    engine.placementCooldowns.put(target, 4);  // ~0.2s before retry
+                    engine.placementAttempts.merge(target, 1, Integer::sum);  // adaptive-pace cap
+                    int code = engine.tryPlacingBlock();
+                    if (code == 1) { placed++; engine.placeSentPerSec++; }
                     else break;  // swap pending or material missing — tick handles it
                 }
             }
@@ -2050,12 +1865,12 @@ public class StepCheckered extends Module {
         // Target new blocks — HYBRID: fastBreak (instant) for new targets,
         // vanilla mining for blocks fastBreak already failed on (multi-tick).
         // During RESET (fullSweepActive), currentBuildPlan is null so
-        // getNextBatchBreakPos() returns nothing — use the ring-scanner instead.
+        // engine.getNextBatchBreakPos() returns nothing — use the ring-scanner instead.
         // Skipped entirely when the Mining-state loop earlier in the tick already
         // sent packets this tick: both loops acting on the same target doubles the
         // packets and re-resets server break-progress on vanilla targets.
-        if (breakSweepActedThisTick) return;
-        sendDistinctBreaks(breaksPerTick.get(), fullSweepActive && currentBuildPlan == null);
+        if (engine.breakSweepActedThisTick) return;
+        engine.sendDistinctBreaks(breaksPerTick.get(), fullSweepActive && currentBuildPlan == null);
     }
 
     // Restocking
@@ -2084,31 +1899,6 @@ public class StepCheckered extends Module {
      *  sprinting past them (live 2026-10-20: 86 blocks left standing in a 23s pass).
      *  10s watchdog releases and suppresses re-holding briefly. RESET is excluded
      *  (its plan is null - the serpentine feed + segment gates already pace it). */
-    private boolean adaptivePaceHold() {
-        if (state.equals(State.Walking) && breakStage == 0 && currentBuildPlan != null
-            && !checkpoints.isEmpty()
-            && ALLOW_PLACE_ACTIONS.contains(checkpoints.getFirst().getRight().getLeft())) {
-            BlockPos placeNow = getNextBatchPlacementPos();
-            if (placeNow != null && placementAttempts.getOrDefault(placeNow, 0) < 5) {
-                Block planned = currentBuildPlan.get(placeNow);
-                if (planned != null && restock.isMaterialCarried(planned.asItem())) {
-                    placeHoldTicks++;
-                    if (placeHoldTicks > 100) {
-                        placementAttempts.put(placeNow, 5);   // force-release: treat as capped
-                        warning("§ePrint pace-hold watchdog: released a " + placeHoldTicks
-                            + "-tick hold on " + placeNow.toShortString() + " - walking on.");
-                        placeHoldTicks = 0;
-                        return false;
-                    }
-                    return true;
-                }
-            }
-            placeHoldTicks = 0;
-        } else {
-            placeHoldTicks = 0;
-        }
-        return false;
-    }
 
     /** DISTINCT-POSITION MULTI-SEND (user target: 25-30 breaks/s). The old loop
      *  stopped after ONE send because the client cannot see the server's confirmation
@@ -2117,103 +1907,10 @@ public class StepCheckered extends Module {
      *  re-send of a pending position ever happens). This sends up to maxSends distinct
      *  in-range targets per tick, skipping pending ones via the exclusion set.
      *  @return number of break actions sent this tick */
-    private int sendDistinctBreaks(int maxSends, boolean fullSweep) {
-        HashSet<BlockPos> attempted = new HashSet<>();
-        // INSTA-BREAK REQUIRES THE PICKAXE IN HAND: the server computes break time
-        // from the HELD item at packet time. With a building material selected
-        // (left over from the print pass), same-tick START+STOP is rejected and
-        // blocks stall into the vanilla queue (live 2026-10-20: 25/s sent but only
-        // 3.8/s confirmed, 75 stragglers, batch timeout). The old second loop did
-        // setSelectedSlot(8) every tick; this shared sender must too.
-        if (mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) {
-            mc.player.getInventory().setSelectedSlot(8);
-        }
-        // STICKY VANILLA: multi-tick breaking is stateful single-target — a NEW
-        // BlockUtils.breakBlock on a different pos resets the previous one's progress.
-        // Round-robining several vanilla targets per tick = nothing ever breaks (live
-        // 2026-10-20 batch 13: 68 blocks frozen 80s "trying to break"). ONE vanilla
-        // target at a time, held across ticks until air; everything else fastBreak.
-        if (vanillaStickyTarget != null && (miningBlockState(vanillaStickyTarget).isAir()
-            || mc.player.getEyePos().distanceTo(vanillaStickyTarget.toCenterPos()) > 4.4)) {
-            vanillaStickyTarget = null;   // broke, or the bot outran it - never freeze the queue on it
-        }
-        int sent = 0;
-        boolean vanillaSentThisTick = false;
-        for (int pick = 0; pick < maxSends * 6 && sent < maxSends; pick++) {
-            BlockPos breakTarget;
-            if (pick == 0 && nextBlockPos != null && !attempted.contains(nextBlockPos)) {
-                breakTarget = nextBlockPos;
-            } else if (fullSweep) {
-                breakTarget = findNearestPrintBoxBlock(attempted);
-            } else {
-                breakTarget = getNextBatchBreakPos(attempted);
-            }
-            if (breakTarget == null) break;                       // no more distinct candidates
-            attempted.add(breakTarget);
-            // NEAREST-FIRST + SERVER-REACH (user rule): pickers are distance-sorted
-            // (nearest land first, farthest still sent when in range). Clamp the send
-            // range to the SERVER's survival reach (~4.5) - client range 5.0 sends at
-            // 4.5-5.0 get silently rejected, which starved the rate and caused the
-            // rare stuck (block 'trying to break but nothing happens').
-            if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > Math.min(interactionRange.get(), 4.4)) continue;
-            if (breakPending.containsKey(breakTarget)) continue;  // awaiting server confirm - next distinct
-            boolean needsVanilla = needsVanillaBreak.contains(breakTarget);
-            if (needsVanilla) {
-                if (vanillaSentThisTick) continue;                 // one vanilla send per tick
-                if (vanillaStickyTarget != null && !breakTarget.equals(vanillaStickyTarget)) {
-                    continue;                                      // stick to the current vanilla target
-                }
-            }
-            nextBlockPos = breakTarget;
-            // BEST-TOOL AUTO-SWITCH (user rule, live 2026-10-20: oak/spruce planks,
-            // crimson/warped hyphae in the art need an AXE — with the pickaxe they
-            // take ~60 ticks/block). The server computes break time from the HELD item.
-            if (!ensureBestToolFor(breakTarget)) continue;        // no usable tool - try next candidate
-            sendHybridBreak(breakTarget);
-            if (needsVanilla) {
-                vanillaStickyTarget = breakTarget;
-                vanillaSentThisTick = true;
-            }
-            sent++;
-            breakSentPerSec++;
-        }
-        if (sent > 0) breakSweepActedThisTick = true;
-        return sent;
-    }
 
     /** Hold the FASTEST TOOL for the target block (axe for wood, pickaxe for stone).
      *  Ranks the registered toolSet against the block, finds a matching stack in the
      *  inventory, and selects it. Falls back to the reserved pickaxe (slot 8). */
-    private boolean ensureBestToolFor(BlockPos target) {
-        BlockState state = miningBlockState(target);
-        ItemStack best = toolSet.isEmpty() ? null : ToolUtils.getBestTool(toolSet, state);
-        ItemStack reserved = mc.player.getInventory().getStack(8);
-        if (best == null || (reserved.isIn(ItemTags.PICKAXES)
-            && new ItemStack(best.getItem()).getMiningSpeedMultiplier(state) <= reserved.getMiningSpeedMultiplier(state))) {
-            best = reserved;
-        }
-        Item bestItem = best.getItem();
-        if (mc.player.getMainHandStack().getItem().equals(bestItem)) return true;
-        for (int slot : availableHotBarSlots) {
-            if (!mc.player.getInventory().getStack(slot).isEmpty()
-                && mc.player.getInventory().getStack(slot).getItem().equals(bestItem)) {
-                mc.player.getInventory().setSelectedSlot(slot);
-                return true;
-            }
-        }
-        for (int slot = 9; slot < 36; slot++) {
-            if (!mc.player.getInventory().getStack(slot).isEmpty()
-                && mc.player.getInventory().getStack(slot).getItem().equals(bestItem)) {
-                Utils.performSwap(slot, mc.player.getInventory().getSelectedSlot());
-                return true;
-            }
-        }
-        if (reserved.isIn(ItemTags.PICKAXES)) {
-            mc.player.getInventory().setSelectedSlot(8);
-            return true;
-        }
-        return false;
-    }
 
     /** HYBRID BREAK SEND - the ONE copy of the break rules. One fastBreak per position
      *  per confirmation window (re-sending START/STOP every tick resets the server's
@@ -2222,16 +1919,6 @@ public class StepCheckered extends Module {
      *  the pending window themselves when a skip vs stop-loop distinction matters.
      *  This logic MUST NOT be copied per call site - the pre-dedup copies drifted and
      *  caused the server-clock-reset starvation bug. */
-    private void sendHybridBreak(BlockPos target) {
-        if (needsVanillaBreak.contains(target)) {
-            mc.player.getInventory().setSelectedSlot(8);
-            BlockUtils.breakBlock(target, true);
-        } else {
-            ((IClientPlayerInteractionManager) mc.interactionManager).fastBreak(target);
-            mc.player.swingHand(Hand.MAIN_HAND);
-            breakPending.put(target, 6);   // 4-tick window: Folia's block-update echo can lag 2-3 ticks
-        }
-    }
 
     /** Is any of this building material currently carried (hotbar or main inventory)? */
 
@@ -2241,56 +1928,6 @@ public class StepCheckered extends Module {
      *  (swap/restock already triggered). The multi-place loop uses the code to keep
      *  sending distinct positions while material is in the hotbar and stop cleanly
      *  on a swap. */
-    private int tryPlacingBlock() {
-        if (currentBuildPlan == null) return -1;
-        Item material;
-        Block planned = currentBuildPlan.get(nextBlockPos);
-        if (planned == null) return -1;
-        material = planned.asItem();
-        // PLACEMENT DIAGNOSTIC: log every batch placement with its lane (x), layer (y,
-        // 99-102) and z relative to the bot — positive dz = AHEAD (south).
-        if (debugPrints.get()) {
-            double dz = nextBlockPos.getZ() - mc.player.getZ();
-            info(String.format("§3[dbg] PLACE %s at x=%d y=%d z=%d (bot z=%.1f, dz=%+.1f %s)",
-                material.getName().getString(), nextBlockPos.getX(), nextBlockPos.getY(),
-                nextBlockPos.getZ(), mc.player.getZ(), dz,
-                dz > 0 ? "§cAHEAD" : "§abehind"));
-        }
-        //info("Placing " + material.getName().getString() + " at: " + relativePos.toShortString());
-        //Check hot-bar slots
-        for (int slot : availableHotBarSlots) {
-            if (mc.player.getInventory().getStack(slot).isEmpty()) continue;
-            Item foundMaterial = mc.player.getInventory().getStack(slot).getItem();
-            if (foundMaterial.equals(material)) {
-                // Direct placement via interaction manager (litematica-style air-place):
-                // construct a BlockHitResult on the target position itself (inside-block
-                // hit = true). This works through walls because we don't rely on a visible
-                // neighbor face — soft anticheats (6b6t) accept this without rotation.
-                mc.player.getInventory().setSelectedSlot(slot);
-                BlockHitResult hitResult = new BlockHitResult(
-                    nextBlockPos.toCenterPos(), Direction.UP, nextBlockPos, true);
-                mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hitResult);
-                mc.player.swingHand(Hand.MAIN_HAND);
-                if (material == lastSwappedMaterial) lastSwappedMaterial = null;
-                return 1;
-            }
-        }
-        for (int slot : availableSlots) {
-            if (mc.player.getInventory().getStack(slot).isEmpty() || availableHotBarSlots.contains(slot)) continue;
-            Item foundMaterial = mc.player.getInventory().getStack(slot).getItem();
-            if (foundMaterial.equals(material)) {
-                lastSwappedMaterial = material;
-                toBeSwappedSlot = slot;
-                Utils.setForwardPressed(false);
-                timeoutTicks = preSwapDelay.get();
-                return 0;
-            }
-        }
-        if (lastSwappedMaterial == material) return 0;    //Wait for swapped material
-        // Mid-print supply run: refill the missing material via the north checkpoint
-        pauseForRestockTrip(false);
-        return -1;
-    }
 
     /**
      * Authoritative block state for MINING decisions - the live world, not the map cache.
@@ -2451,7 +2088,7 @@ public class StepCheckered extends Module {
         }
         currentBatch = k;
         batchPassRetries = 0;
-        placementAttempts.clear();
+        engine.placementAttempts.clear();
         collectSkips.clear();
         clearResetPending();   // a new run supersedes any interrupted reset
         sweepReArmSig = null;
@@ -2771,7 +2408,7 @@ public class StepCheckered extends Module {
                 currentBuildPlan = half;
                 currentBatch = batch;
                 batchPassRetries = 0;
-                placementAttempts.clear();
+                engine.placementAttempts.clear();
                 collectSkips.clear();
                 clearResetPending();
                 sweepReArmSig = null;
@@ -2913,7 +2550,7 @@ public class StepCheckered extends Module {
         currentBatch = 0;
         breakStage = 0;
         printRepairPending = false;
-        placementAttempts.clear();
+        engine.placementAttempts.clear();
         clearResetPending();
         // A new run kills any leftover RESET state - a stale fullSweepActive here made
         // the first mid-run supply run resurrect the dead reset ladder over the priming
@@ -3069,7 +2706,7 @@ public class StepCheckered extends Module {
      *  window (fastBreak sent, server block-update not yet received). */
     private int countPendingInRange(int x0, int x1, int z0, int z1) {
         int n = 0;
-        for (BlockPos pos : breakPending.keySet()) {
+        for (BlockPos pos : engine.breakPending.keySet()) {
             if (pos.getX() >= x0 && pos.getX() <= x1 && pos.getZ() >= z0 && pos.getZ() <= z1) n++;
         }
         return n;
@@ -3092,7 +2729,7 @@ public class StepCheckered extends Module {
     /** RESET verification logging: blocks flagged for multi-tick vanilla breaking inside the window. */
     private int countVanillaInRange(int x0, int x1, int z0, int z1) {
         int n = 0;
-        for (BlockPos pos : needsVanillaBreak) {
+        for (BlockPos pos : engine.needsVanillaBreak) {
             if (pos.getX() >= x0 && pos.getX() <= x1 && pos.getZ() >= z0 && pos.getZ() <= z1) n++;
         }
         return n;
@@ -3111,10 +2748,9 @@ public class StepCheckered extends Module {
         currentBuildPlan = null;
         breakStage = 0;
         nextBlockPos = null;
-        vanillaBreakRetries.clear();
+        engine.vanillaBreakRetries.clear();
         jamWatchTarget = null;
         jamWatchTicks = 0;
-        breakSweepActedThisTick = false;
         resetStallSig = null;
         resetStallRounds = 0;
         sweepWaitRounds = 0;
@@ -3122,7 +2758,7 @@ public class StepCheckered extends Module {
         sweepReArmSig = null;
         restock.toBeHandledInvPacket = null;
         restock.closeNextInvPacket = false;
-        toBeSwappedSlot = -1;
+
         fullSweepActive = false;
         timeoutTicks = 0;
         restock.interactTimeout = 0;
@@ -3181,7 +2817,7 @@ public class StepCheckered extends Module {
     }
 
     /** Exclusion-set variant for the distinct-position multi-sender. */
-    private BlockPos findNearestPrintBoxBlock(Set<BlockPos> exclude) {
+    BlockPos findNearestPrintBoxBlock(Set<BlockPos> exclude) {
         if (mc.world == null || mc.player == null || lowerMapCorner == null) return null;
         BlockPos best = null;
         double bestDist = Double.MAX_VALUE;
@@ -3394,7 +3030,7 @@ public class StepCheckered extends Module {
      *  end of the window it is already on (south half -> south-first mirrored route). */
     /** The walking lane (lane 2 center) of the phase the slave is in: batch k, priming,
      *  or the closing build. Placement is gated on standing centered here. */
-    private double currentWalkLaneX() {
+    double currentWalkLaneX() {
         if (currentBatch == -1) return lowerMapCorner.getX() + 2.5;
         if (currentBatch == 63) return lowerMapCorner.getX() + 127.5;
         return lowerMapCorner.getX() + 2.0 * currentBatch + 2.5;
@@ -3496,7 +3132,7 @@ public class StepCheckered extends Module {
     /** On the master's break-all call: deposit every building block first (north corridor
      *  trip), then break the whole window from lane 2 north -> south, collect everything,
      *  and exit north along lane 2 picking up any leftovers. */
-    private void startBreakAll() {
+    void startBreakAll() {
         breakStage = 4;
         checkpoints.clear();
         double walkX = lowerMapCorner.getX() + 2.0 * currentBatch + 2.5;
@@ -3548,7 +3184,7 @@ public class StepCheckered extends Module {
 
     void pauseForRestockTrip(boolean needPickaxe) {
         // Cooldown: prevent the supply-run trigger from re-firing every tick while the
-        // bot is still Walking toward the chest (tryPlacingBlock sees no materials →
+        // bot is still Walking toward the chest (engine.tryPlacingBlock sees no materials →
         // calls this again → clears the route → loops forever without moving)
         if (restockCooldown > 0) return;
         restockCooldown = 100;   // 5 seconds before another supply run can trigger
@@ -3699,7 +3335,7 @@ public class StepCheckered extends Module {
             sweepReArmSig = null;
             info("§6[SWEEP-VERIFY]§7 batch " + currentBatch + " gate: blocks=0 items=0 census[ready="
                 + census[0] + " falling=" + census[1] + " pickupDelay=" + census[2] + " owned=" + census[3]
-                + "] pendBrk=" + pendBrk + " vanillaQ=" + needsVanillaBreak.size());
+                + "] pendBrk=" + pendBrk + " vanillaQ=" + engine.needsVanillaBreak.size());
             info("§aBatch " + currentBatch + " COMPLETE: printed and fully recycled.");
             int finishedBatch = currentBatch;
             currentBuildPlan = null;
@@ -3742,7 +3378,7 @@ public class StepCheckered extends Module {
                 info("§6[SWEEP-VERIFY]§7 batch " + currentBatch + " SWEEP: blocks=" + remainingBlocks
                     + " items[ready=" + census[0] + " falling=" + census[1] + " pickupDelay=" + census[2]
                     + " owned=" + census[3] + "] pendBrk=" + pendBrk
-                    + " vanillaQ=" + needsVanillaBreak.size()
+                    + " vanillaQ=" + engine.needsVanillaBreak.size()
                     + " - re-arm " + (frozen ? "(FROZEN) " : "") + "retry " + batchPassRetries + "/8.");
                 return;
             }
@@ -3818,64 +3454,13 @@ public class StepCheckered extends Module {
     }
 
     /** Nearest unplaced plan block within reach that does not intersect the player's body. */
-    private BlockPos getNextBatchPlacementPos() {
-        return getNextBatchPlacementPos(Collections.emptySet());
-    }
 
     /** Exclusion-set variant: nearest eligible position NOT in `exclude` (multi-place). */
-    private BlockPos getNextBatchPlacementPos(Set<BlockPos> exclude) {
-        if (currentBuildPlan == null) return null;
-        // LANE GATE: no printing unless the bot stands centered on the phase's lane-2
-        // centerline. Off-center (e.g. after a sweep left it straddling lanes), freshly
-        // placed floor blocks on the west lanes can catch the bot's side and wall it in.
-        if (lowerMapCorner != null && Math.abs(mc.player.getX() - currentWalkLaneX()) > 0.3) return null;
-        // Litematica-style: any plan block is placed the moment it enters interaction
-        // range — ahead, beside, or behind. The walking lane (2, the east borrow lane)
-        // only carries y2 blocks above the head, so nothing is ever placed at feet level
-        // on the bot's path; blocks intersecting its body are retried once it moves on.
-        BlockPos best = null;
-        double bestDist = Double.MAX_VALUE;
-        for (BlockPos pos : currentBuildPlan.keySet()) {
-            if (!miningBlockState(pos).isAir()) continue;
-            if (exclude.contains(pos)) continue;
-            // Skip positions on placement cooldown (litematica-style: don't hammer the
-            // same failed block — let the timeout expire, then retry)
-            if (placementCooldowns.getOrDefault(pos, 0) > 0) continue;
-            double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
-            if (dist > interactionRange.get()) continue;
-            if (mc.player.getBoundingBox().intersects(new Box(pos))) continue;
-            if (dist < bestDist) {
-                bestDist = dist;
-                best = pos;
-            }
-        }
-        return best;
-    }
 
     /** break target: nearest still-standing plan block in reach (break(2) = west lanes' Y2/Y3 only). */
-    private BlockPos getNextBatchBreakPos() {
-        return getNextBatchBreakPos(Collections.emptySet());
-    }
 
     /** Exclusion-set variant: returns the nearest eligible target NOT in `exclude` —
-     *  lets sendDistinctBreaks pick several DIFFERENT positions per tick. */
-    private BlockPos getNextBatchBreakPos(Set<BlockPos> exclude) {
-        if (currentBuildPlan == null) return null;
-        boolean break2Only = breakStage == 2;
-        int westX = lowerMapCorner.getX() + 2 * currentBatch;
-        BlockPos best = null;
-        double bestDist = Double.MAX_VALUE;
-        for (BlockPos pos : currentBuildPlan.keySet()) {
-            if (miningBlockState(pos).isAir()) continue;
-            if (exclude.contains(pos)) continue;
-            if (breakPending.containsKey(pos)) continue;   // awaiting server confirm - not sendable
-            if (break2Only && (pos.getX() >= westX + 2 || pos.getY() < lowerMapCorner.getY() + 2)) continue;
-            double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
-            if (dist > interactionRange.get()) continue;
-            if (dist < bestDist) { bestDist = dist; best = pos; }
-        }
-        return best;
-    }
+     *  lets engine.sendDistinctBreaks pick several DIFFERENT positions per tick. */
 
     /** Pieces of food currently in the OFFHAND stack (0 if it holds something else). */
 
