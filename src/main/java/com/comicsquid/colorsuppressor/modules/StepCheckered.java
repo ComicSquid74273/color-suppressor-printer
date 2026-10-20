@@ -1263,8 +1263,14 @@ public class StepCheckered extends Module implements MapPrinter {
                         foundMaterials = true;
                         int highestFreeSlot = Utils.findHighestFreeSlot(packet);
                         if (highestFreeSlot == -1) {
-                            warning("No free slots found in inventory.");
-                            requestDisable();
+                            // RECOVER instead of disable (live 2026-10-20: full inventory
+                            // of prior-run drops killed the run here): close the chest and
+                            // re-run the prep path - its dump now frees the excess slots.
+                            warning("§eInventory full at withdrawal - running the excess dump, then retrying the restock.");
+                            if (mc.player.currentScreenHandler != null) mc.player.closeHandledScreen();
+                            restockBacklogSlots.clear();
+                            timeoutTicks = postRestockDelay.get();
+                            pauseForRestockTrip(false);
                             return;
                         }
                         restockBacklogSlots.add(slot);
@@ -4503,20 +4509,47 @@ public class StepCheckered extends Module implements MapPrinter {
         // handler treats a pre-filled backlog at chest-open as a filtered dump) and
         // rides the SAME north-corridor trip, before the first refill checkpoint.
         if (lowerMapCorner != null && stepRecLayers != null && currentBatch >= 0) {
-            java.util.HashSet<Item> futureItems = new java.util.HashSet<>();
+            // QUANTITATIVE future need: per-item block counts over all remaining
+            // batches + closing (nothing stands yet for future batches, so full plan
+            // counts). Excess beyond that need is dead weight fragmenting slots - the
+            // live batch-1 stall: inventory full of prior-run drops, every item
+            // "needed" by SOME future batch, zero free slots at the chest withdrawal.
+            java.util.HashMap<Item, Integer> futureNeed = new java.util.HashMap<>();
             for (int fb = currentBatch; fb <= 62; fb++) {
-                for (Block fbBlock : assembleBatch(fb).values()) futureItems.add(fbBlock.asItem());
+                for (Block fbBlock : assembleBatch(fb).values()) {
+                    Item fbItem = fbBlock.asItem();
+                    futureNeed.put(fbItem, futureNeed.getOrDefault(fbItem, 0) + 1);
+                }
             }
-            for (Block cb : assembleClosing().values()) futureItems.add(cb.asItem());
-            java.util.HashSet<Item> unneededItems = null;
-            java.util.ArrayList<Integer> dumpSlots = new java.util.ArrayList<>();
+            for (Block cb : assembleClosing().values()) {
+                Item cbItem = cb.asItem();
+                futureNeed.put(cbItem, futureNeed.getOrDefault(cbItem, 0) + 1);
+            }
+            java.util.HashMap<Item, Integer> carried = new java.util.HashMap<>();
+            java.util.HashMap<Item, java.util.ArrayList<Integer>> itemSlots = new java.util.HashMap<>();
             for (int dSlot = 0; dSlot < 36; dSlot++) {
                 ItemStack dStack = mc.player.getInventory().getStack(dSlot);
                 if (dStack.isEmpty() || ToolUtils.isTool(dStack) || dStack.contains(DataComponentTypes.FOOD)) continue;
-                if (!materialDict.containsKey(dStack.getItem()) || futureItems.contains(dStack.getItem())) continue;
-                if (unneededItems == null) unneededItems = new java.util.HashSet<>();
-                unneededItems.add(dStack.getItem());
-                dumpSlots.add(dSlot);
+                if (!materialDict.containsKey(dStack.getItem())) continue;
+                Item dItem = dStack.getItem();
+                carried.put(dItem, carried.getOrDefault(dItem, 0) + dStack.getCount());
+                itemSlots.computeIfAbsent(dItem, k -> new java.util.ArrayList<>()).add(dSlot);
+            }
+            java.util.HashSet<Item> unneededItems = null;
+            java.util.ArrayList<Integer> dumpSlots = new java.util.ArrayList<>();
+            for (java.util.Map.Entry<Item, java.util.ArrayList<Integer>> ent : itemSlots.entrySet()) {
+                int need = futureNeed.getOrDefault(ent.getKey(), 0);
+                int have = carried.getOrDefault(ent.getKey(), 0);
+                if (have <= need) continue;   // fully used later - keep every stack
+                int toDump = have - need;     // deposit the excess, newest slots first
+                java.util.ArrayList<Integer> slotsOfItem = ent.getValue();
+                for (int si = slotsOfItem.size() - 1; si >= 0 && toDump > 0; si--) {
+                    int dSlot = slotsOfItem.get(si);
+                    dumpSlots.add(dSlot);
+                    toDump -= mc.player.getInventory().getStack(dSlot).getCount();
+                    if (unneededItems == null) unneededItems = new java.util.HashSet<>();
+                    if (!unneededItems.contains(ent.getKey())) { unneededItems.add(ent.getKey()); }
+                }
             }
             if (unneededItems != null) {
                 Pair<BlockPos, Vec3d> dumpChest = getBestDepositChest();
