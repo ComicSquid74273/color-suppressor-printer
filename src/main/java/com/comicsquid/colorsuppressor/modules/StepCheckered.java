@@ -77,7 +77,7 @@ public class StepCheckered extends Module {
     // General
 
     // Legacy (parked) engine line width - fixed at 2, not a setting anymore
-    private static final int linesPerRun = 2;
+    static final int linesPerRun = 2;
 
     final Setting<Double> interactionRange = sgGeneral.add(new DoubleSetting.Builder()
         .name("interaction-range")
@@ -484,7 +484,6 @@ public class StepCheckered extends Module {
     );
 
     int timeoutTicks;
-    int interactTimeout;
     int toBeSwappedSlot;
     int heartbeatTicks;
     boolean pendingDisable;                                          // deferred toggle (see requestDisable)
@@ -530,7 +529,6 @@ public class StepCheckered extends Module {
     volatile boolean break2Permitted;                                // master calls (TCP "step:break2")
     volatile boolean breakAllPermitted;                              // master calls (TCP "step:breakall")
     HashMap<BlockPos, Block> currentBuildPlan;                       // the slave's active placement plan
-    boolean closeNextInvPacket;
     State state;
     State debugPreviousState;
     String debugLastAction;
@@ -543,22 +541,15 @@ public class StepCheckered extends Module {
     Pair<BlockPos, Vec3d> xpBottleChest;
     ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests;
     BlockPos tempChestPos;
-    BlockPos lastInteractedChest;
     BlockPos nextBlockPos;
     Item lastSwappedMaterial;
-    InventoryS2CPacket toBeHandledInvPacket;
     HashMap<Integer, Pair<Block, Integer>> blockPaletteDict;        // Maps palette block id to the Minecraft block and amount
     HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict;   // Maps block to the chest pos and the open position
     Set<ItemStack> toolSet;                                         // Set of all registered tool item stacks
     ArrayList<Integer> availableSlots;
     ArrayList<Integer> availableHotBarSlots;
-    ArrayList<Triple<Item, Integer, Integer>> restockList;          // Material, Stacks, Raw Amount
-    ArrayList<BlockPos> checkedChests;
     ArrayList<Pair<Vec3d, Pair<String, BlockPos>>> checkpoints;     // (GoalPos, (checkpointAction, targetBlock))
     ArrayList<File> startedFiles;
-    ArrayList<Integer> restockBacklogSlots;
-    ArrayList<Integer> depositBacklogSlots;
-    HashSet<BlockPos> fullDepositChests;                             // chests that ran out of room this batch
     private final ArrayDeque<String> pendingStepCommands = new ArrayDeque<>();
     File mapFolder;
     File mapFile;
@@ -592,6 +583,7 @@ public class StepCheckered extends Module {
 
     private final StepRenderer renderer = new StepRenderer(this);
     final StepMaster master = new StepMaster(this);
+    final RestockManager restock = new RestockManager(this);
 
     public StepCheckered() {
         super(Addon.CATEGORY, "step-checkered", "Uses the step-checker method to build colour-suppression maps.");
@@ -645,8 +637,8 @@ public class StepCheckered extends Module {
             : "\"x\":null,\"y\":null,\"z\":null";
         sb.append(',').append(pos);
         // Live diagnosis: the exact block the interaction retry loop is hammering on
-        if (lastInteractedChest != null) {
-            sb.append(",\"lastChest\":\"").append(lastInteractedChest.toShortString()).append('"');
+        if (restock.lastInteractedChest != null) {
+            sb.append(",\"lastChest\":\"").append(restock.lastInteractedChest.toShortString()).append('"');
             sb.append(",\"sneaking\":").append(mc.player != null && mc.player.isSneaking());
             sb.append(",\"screenOpen\":").append(mc.currentScreen != null);
         }
@@ -796,18 +788,18 @@ public class StepCheckered extends Module {
         materialDict = new HashMap<>();
         availableSlots = new ArrayList<>();
         availableHotBarSlots = new ArrayList<>();
-        restockList = new ArrayList<>();
+        restock.restockList = new ArrayList<>();
         toolSet = new HashSet<>();
-        checkedChests = new ArrayList<>();
+        restock.checkedChests = new ArrayList<>();
         checkpoints = new ArrayList<>();
         startedFiles = new ArrayList<>();
-        restockBacklogSlots = new ArrayList<>();
-        depositBacklogSlots = new ArrayList<>();
-        fullDepositChests = new HashSet<>();
+        restock.restockBacklogSlots = new ArrayList<>();
+        restock.depositBacklogSlots = new ArrayList<>();
+        restock.fullDepositChests = new HashSet<>();
         fullSweepActive = false;   // a module re-toggle must never inherit a dead reset
         lowerMapCorner = null;
         upperMapCorner = null;
-        lastInteractedChest = null;
+        restock.lastInteractedChest = null;
         nextBlockPos = null;
         cartographyTable = null;
         finishedMapChest = null;
@@ -817,10 +809,10 @@ public class StepCheckered extends Module {
         pendingRole = null;
         mapMaterialChests = new ArrayList<>();
         lastSwappedMaterial = null;
-        toBeHandledInvPacket = null;
-        closeNextInvPacket = false;
+        restock.toBeHandledInvPacket = null;
+        restock.closeNextInvPacket = false;
         timeoutTicks = 0;
-        interactTimeout = 0;
+        restock.interactTimeout = 0;
         toBeSwappedSlot = -1;
         heartbeatTicks = 0;
         pendingDisable = false;
@@ -1052,183 +1044,14 @@ public class StepCheckered extends Module {
         List<State> allowedStates = Arrays.asList(State.AwaitRestockResponse, State.AwaitMapChestResponse,
             State.AwaitFoodChestResponse, State.AwaitDepositResponse);
         if (allowedStates.contains(state)) {
-            toBeHandledInvPacket = packet;
+            restock.toBeHandledInvPacket = packet;
             timeoutTicks = preRestockDelay.get();
         }
     }
 
-    void handleInventoryPacket(InventoryS2CPacket packet) {
-        if (debugPrints.get()) info("Handling InvPacket for: " + state);
-        closeNextInvPacket = true;
-        switch (state) {
-            case AwaitRestockResponse:
-                handleRestockResponse(packet);
-                break;
-            case AwaitMapChestResponse:
-                int mapSlot = -1;
-                int paneSlot = -1;
-                //Search for map and glass pane
-                for (int slot = 0; slot < packet.contents().size() - 36; slot++) {
-                    ItemStack stack = packet.contents().get(slot);
-                    if (stack.getItem() == Items.MAP) mapSlot = slot;
-                    if (stack.getItem() == Items.GLASS_PANE) paneSlot = slot;
-                }
-                if (mapSlot == -1 || paneSlot == -1) {
-                    warning("Not enough Empty Maps/Glass Panes in Map Material Chest");
-                    return;
-                }
-                interactTimeout = 0;
-                timeoutTicks = postRestockDelay.get();
-                Utils.getOneItem(mapSlot, false, availableSlots, availableHotBarSlots, packet);
-                Utils.getOneItem(paneSlot, true, availableSlots, availableHotBarSlots, packet);
-                mc.player.getInventory().setSelectedSlot(availableHotBarSlots.get(0));
-                state = State.Walking;
-                break;
-            case AwaitFoodChestResponse:
-                interactTimeout = 0;
-                timeoutTicks = postRestockDelay.get();
-                // Take only what FITS in the offhand (user rule): offhand empty -> one
-                // full stack (= capacity); partially filled (<10 trigger) -> HALF a
-                // chest stack, which always fits beside the remainder. Never a second
-                // full stack on top of an existing one.
-                int offFood = offhandFoodCount();
-                for (int slot = 0; slot < packet.contents().size() - 36; slot++) {
-                    ItemStack stack = packet.contents().get(slot);
-                    if (!stack.isEmpty() && stack.contains(DataComponentTypes.FOOD)) {
-                        if (offFood == 0) {
-                            mc.interactionManager.clickSlot(packet.syncId(), slot, 0, SlotActionType.QUICK_MOVE, mc.player);
-                        } else {
-                            mc.interactionManager.clickSlot(packet.syncId(), slot, 1, SlotActionType.PICKUP, mc.player);
-                            mc.interactionManager.clickSlot(packet.syncId(), slot, 0, SlotActionType.PICKUP, mc.player);
-                        }
-                        break;
-                    }
-                }
-                state = State.Walking;
-                break;
-            case AwaitDepositResponse:
-                interactTimeout = 0;
-                // Queue EVERY carried stack that belongs in this chest (the chest must stock
-                // the item); the tick then deposits one per delay tick while the screen stays
-                // open - full-inventory syncs only arrive on open, so per-packet re-triggering
-                // stalls after the first stack
-                if (depositBacklogSlots.isEmpty()) {
-                    // Normal flow: backlog is empty at chest-open - build it from every
-                    // carried stack that belongs in this chest.
-                    for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
-                        ItemStack stack = packet.contents().get(slot);
-                        if (stack.isEmpty() || ToolUtils.isTool(stack) || stack.contains(DataComponentTypes.FOOD)) continue;
-                        ArrayList<Pair<BlockPos, Vec3d>> stocking = materialDict.get(stack.getItem());
-                        if (stocking == null || !containsChest(stocking, lastInteractedChest)) continue;
-                        depositBacklogSlots.add(slot);
-                    }
-                }
-                // else: PRE-FILLED backlog = the unneeded-material dump (depositUnneeded
-                // action) - keep exactly those slots, deposit nothing else.
-                if (depositBacklogSlots.isEmpty()) {
-                    // Nothing belongs in THIS chest: hop to the next correct one or continue
-                    Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
-                    if (nextDepositChest != null) queueDepositChestAtHead(nextDepositChest);
-                    timeoutTicks = postRestockDelay.get();
-                    state = State.Walking;
-                } else {
-                    timeoutTicks = invActionDelay.get();
-                }
-                break;
-        }
-    }
 
     /** Restock chest response: pickaxe parking (own-chest rule), then take stacks of
      *  the head restock entry (shuffled chest order; partial stacks make progress). */
-    private void handleRestockResponse(InventoryS2CPacket packet) {
-        interactTimeout = 0;
-        // TOOL RETURN (user rule 2026-10-20): used pickaxes go back to their OWN
-        // chest ONLY at this restock-phase visit, one deposit per sync - never
-        // mid-batch, never into a material chest. A pending take is a SWAP: the
-        // fetch only queues when the best carried pickaxe is below the buffer, so
-        // park ALL of them and take the fresh one below (the old deposit took only
-        // below-min-durability ones, letting replaced pickaxes ride along forever).
-        // With no take pending, keep exactly ONE pickaxe - the best - and return
-        // every spare (a sub-10-durability pickaxe is never the kept one: it is
-        // either a spare, or the sole pickaxe, in which case the 800-buffer fetch
-        // above has already queued its replacement).
-        if (isOpenChestAPickaxeChest()) {
-            boolean swapTake = !restockList.isEmpty() && restockList.get(0).getMiddle() > 0
-                && new ItemStack(restockList.get(0).getLeft()).isIn(ItemTags.PICKAXES);
-            int keepSlot = -1;
-            if (!swapTake) {
-                // Keep-best scan in screen-handler slot space (last 36 slots are
-                // the player inventory) - inventory indices don't map 1:1 here.
-                int keepRemaining = -1;
-                for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
-                    ItemStack invStack = packet.contents().get(slot);
-                    if (invStack.isIn(ItemTags.PICKAXES) && ToolUtils.getRemainingDamage(invStack) > keepRemaining) {
-                        keepSlot = slot;
-                        keepRemaining = ToolUtils.getRemainingDamage(invStack);
-                    }
-                }
-            }
-            for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
-                if (slot == keepSlot) continue;
-                ItemStack invStack = packet.contents().get(slot);
-                if (invStack.isIn(ItemTags.PICKAXES)) {
-                    mc.interactionManager.clickSlot(packet.syncId(), slot, 0, SlotActionType.QUICK_MOVE, mc.player);
-                    timeoutTicks = invActionDelay.get();
-                    return;
-                }
-            }
-        }
-        boolean foundMaterials = false;
-        List<Integer> slots = IntStream.rangeClosed(0, packet.contents().size() - 37)
-            .boxed()
-            .collect(Collectors.toList());
-        Collections.shuffle(slots);
-        for (int slot : slots) {
-            ItemStack stack = packet.contents().get(slot);
-
-            if (restockList.get(0).getMiddle() == 0) {
-                // Deposit-only pickaxe entry (0 stacks to take): spent once nothing
-                // is left to park here. A pending TAKE also reaches middle==0 while
-                // its backlog drains - the tick's drain ends that entry itself, so
-                // only advance when no backlog is in flight.
-                if (restockBacklogSlots.isEmpty()
-                    && new ItemStack(restockList.get(0).getLeft()).isIn(ItemTags.PICKAXES)) {
-                    endRestocking();
-                }
-                foundMaterials = true;
-                break;
-            }
-            // Mixed chests: only take stacks of the material currently being restocked.
-            // Partial stacks are fine - the remaining count is recomputed from the
-            // leftover stack size, so any stack size makes progress.
-            if (!stack.isEmpty() && stack.getItem().equals(restockList.get(0).getLeft())) {
-                //info("Taking Stack of " + restockList.get(0).getLeft().getName().getString());
-                foundMaterials = true;
-                int highestFreeSlot = Utils.findHighestFreeSlot(packet);
-                if (highestFreeSlot == -1) {
-                    // RECOVER instead of disable (live 2026-10-20: full inventory
-                    // of prior-run drops killed the run here): close the chest and
-                    // re-run the prep path - its dump now frees the excess slots.
-                    warning("§eInventory full at withdrawal - running the excess dump, then retrying the restock.");
-                    if (mc.player.currentScreenHandler != null) mc.player.closeHandledScreen();
-                    restockBacklogSlots.clear();
-                    timeoutTicks = postRestockDelay.get();
-                    pauseForRestockTrip(false);
-                    return;
-                }
-                restockBacklogSlots.add(slot);
-                Triple<Item, Integer, Integer> oldTriple = restockList.remove(0);
-                if (stack.isStackable()) {
-                    int remainingCount = oldTriple.getRight() - stack.getCount();
-                    int remainingStacks = Math.max(0, (int) Math.ceil(remainingCount / 64f));
-                    restockList.add(0, Triple.of(oldTriple.getLeft(), remainingStacks, remainingCount));
-                } else {
-                    restockList.add(0, Triple.of(oldTriple.getLeft(), oldTriple.getMiddle() - 1, oldTriple.getRight() - 64));
-                }
-            }
-        }
-        if (!foundMaterials) endRestocking();
-    }
 
 
     @EventHandler
@@ -1266,7 +1089,7 @@ public class StepCheckered extends Module {
 
         // Inventory truly out of space mid-break-all (partial-stack headroom included):
         // deposit the building blocks, then resume
-        if (breakStage == 4 && state.equals(State.Mining) && freeInventoryCapacity() == 0) {
+        if (breakStage == 4 && state.equals(State.Mining) && restock.freeInventoryCapacity() == 0) {
             pauseBreakAllForDeposit();
             return;
         }
@@ -1276,7 +1099,7 @@ public class StepCheckered extends Module {
         logTickDebug();
         sendSlaveHeartbeat();
 
-        tickInteractRetry();
+        restock.tickInteractRetry();
 
         updateTransitSpeed();
 
@@ -1288,9 +1111,9 @@ public class StepCheckered extends Module {
 
         if (consumeHotbarSwap()) return;
 
-        if (drainRestockBacklog()) return;
+        if (restock.drainRestockBacklog()) return;
 
-        if (drainDepositBacklog()) return;
+        if (restock.drainDepositBacklog()) return;
 
         armResetFeedTarget();
 
@@ -1298,7 +1121,7 @@ public class StepCheckered extends Module {
 
         pumpArmedBreakTarget();
 
-        if (processDeferredInventoryIO()) return;
+        if (restock.processDeferredInventoryIO()) return;
 
         if (!(state.equals(State.Walking) || state.equals(State.Mining))) return;
         if (checkpoints.isEmpty()) return;
@@ -1388,7 +1211,7 @@ public class StepCheckered extends Module {
             // to hotbar 7 (hotbar is 0-8; the old 'axe to 9' addressed main
             // inventory and crashed performSwap's setSelectedSlot). Both leave the
             // staging set until the next print pass. Best-first like the pickaxe.
-            ensurePickaxeSlot8();
+            restock.ensurePickaxeSlot8();
             availableHotBarSlots.remove(Integer.valueOf(8));
             {
                 int axeSlot = -1;
@@ -1454,20 +1277,11 @@ public class StepCheckered extends Module {
     }
 
     /** Chest/table interaction retry timer. */
-    private void tickInteractRetry() {
-        if (interactTimeout > 0) {
-            interactTimeout--;
-            if (interactTimeout == 0) {
-                info("Interaction timed out. Interacting again...");
-                interactWithBlock(lastInteractedChest);
-            }
-        }
-    }
 
     /** Pending on-demand hotbar swap (material found in the inventory, not hotbar). */
     private boolean consumeHotbarSwap() {
         if (toBeSwappedSlot == -1) return false;
-        swapIntoHotbar(toBeSwappedSlot);
+        restock.swapIntoHotbar(toBeSwappedSlot);
         toBeSwappedSlot = -1;
         if (postSwapDelay.get() != 0) {
             timeoutTicks = postSwapDelay.get();
@@ -1477,50 +1291,11 @@ public class StepCheckered extends Module {
     }
 
     /** Restock backlog: one chest-slot take per delay tick while the chest screen stays open. */
-    private boolean drainRestockBacklog() {
-        if (restockBacklogSlots.size() == 0) return false;
-        int slot = restockBacklogSlots.remove(0);
-        mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, slot, 1, SlotActionType.QUICK_MOVE, mc.player);
-        if (restockBacklogSlots.isEmpty()) {
-            if (state.equals(State.AwaitRestockResponse)) {
-                endRestocking();
-            }
-        } else {
-            timeoutTicks = invActionDelay.get();
-        }
-        return true;
-    }
 
     /** Deposit backlog: one matching stack per delay tick while the chest screen stays
      *  open; when it drains, hop to the next correct chest or continue the queued route.
      *  A chest with no room left for the item is marked full and the deposit reroutes
      *  to another registered chest. */
-    private boolean drainDepositBacklog() {
-        if (state != State.AwaitDepositResponse || depositBacklogSlots.isEmpty()) return false;
-        int slot = depositBacklogSlots.remove(0);
-        ItemStack pending = mc.player.currentScreenHandler.slots.get(slot).getStack();
-        if (pending.isEmpty()) return true;
-        if (!chestHasRoomFor(pending)) {
-            fullDepositChests.add(lastInteractedChest);
-            info("§eChest " + lastInteractedChest.toShortString() + " is full - depositing in another registered chest.");
-            Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
-            depositBacklogSlots.clear();
-            if (nextDepositChest != null) queueDepositChestAtHead(nextDepositChest);
-            timeoutTicks = postRestockDelay.get();
-            state = State.Walking;
-            return true;
-        }
-        mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, slot, 0, SlotActionType.QUICK_MOVE, mc.player);
-        if (depositBacklogSlots.isEmpty()) {
-            Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
-            if (nextDepositChest != null) queueDepositChestAtHead(nextDepositChest);
-            timeoutTicks = postRestockDelay.get();
-            state = State.Walking;
-        } else {
-            timeoutTicks = invActionDelay.get();
-        }
-        return true;
-    }
 
     /** Serpentine pass feed (RESET ladder): keep a break target armed from the segment
      *  around the bot so the pass breaks everything in interaction range wherever it
@@ -1652,20 +1427,6 @@ public class StepCheckered extends Module {
 
     /** Handle a pending block-entity interaction response packet, then any queued
      *  screen close. @return true when a packet was handled (tick stops). */
-    private boolean processDeferredInventoryIO() {
-        if (toBeHandledInvPacket != null) {
-            handleInventoryPacket(toBeHandledInvPacket);
-            toBeHandledInvPacket = null;
-            return true;
-        }
-        if (closeNextInvPacket) {
-            if (mc.currentScreen != null) {
-                mc.player.closeHandledScreen();
-            }
-            closeNextInvPacket = false;
-        }
-        return false;
-    }
 
     /** Checkpoint arrival: anti-stuck guard, the action dispatch, and the empty-queue
      *  fallbacks. @return true when the tick must stop; false when the queue still has
@@ -1712,28 +1473,28 @@ public class StepCheckered extends Module {
 
         switch (checkpointAction.getLeft()) {
             case "calculateRefill":
-                refillFromCurrentPlan();
+                restock.refillFromCurrentPlan();
                 return true;
             case "refill":
                 state = State.AwaitRestockResponse;
                 Utils.setForwardPressed(false);
-                interactWithBlock(checkpointAction.getRight());
+                restock.interactWithBlock(checkpointAction.getRight());
                 return true;
             case "foodChest":
                 state = State.AwaitFoodChestResponse;
                 Utils.setForwardPressed(false);
-                interactWithBlock(checkpointAction.getRight());
+                restock.interactWithBlock(checkpointAction.getRight());
                 return true;
             case "swapOffhand":
-                setupHands();
+                restock.setupHands();
                 break;
             case "batchBegin":
                 // Simple rule: no usable pickaxe in reserved slot 8/inventory -> walk to
                 // the restock station, get one, then continue. No failure path.
                 if (!mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) {
-                    movePickaxeToSlot8();
+                    restock.movePickaxeToSlot8();
                     if (!mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) {
-                        restockPickaxeTrip(goal);
+                        restock.restockPickaxeTrip(goal);
                         return true;
                     }
                 }
@@ -1761,12 +1522,12 @@ public class StepCheckered extends Module {
                 SlaveSystem.sendMessageToMaster("step:break2done:" + currentBatch);
                 return true;
             case "break2Resume":
-                ensurePickaxeSlot8();
+                restock.ensurePickaxeSlot8();
                 breakStage = 2;
                 state = State.Mining;
                 break;
             case "breakAllBegin":
-                ensurePickaxeSlot8();
+                restock.ensurePickaxeSlot8();
                 breakStage = 4;
                 state = State.Mining;
                 break;
@@ -1816,7 +1577,7 @@ public class StepCheckered extends Module {
             case "depositBuilding":
                 state = State.AwaitDepositResponse;
                 Utils.setForwardPressed(false);
-                interactWithBlock(checkpointAction.getRight());
+                restock.interactWithBlock(checkpointAction.getRight());
                 return true;
         }
         if (checkpoints.isEmpty()) {
@@ -1860,7 +1621,7 @@ public class StepCheckered extends Module {
      *  stragglers are chased through the hybrid Mining loop.
      *  @return true when the tick must stop; false = advance to batchExit. */
     private boolean handleBreakAllDoneArrival() {
-        ensurePickaxeSlot8();
+        restock.ensurePickaxeSlot8();
         breakStage = 4;
         state = State.Mining;
         int remainingBlocks = countRemainingPlanBlocks();
@@ -1895,7 +1656,7 @@ public class StepCheckered extends Module {
             info("§6[BREAKALL-VERIFY]§7 batch " + currentBatch + " pass end: blocks=" + remainingBlocks
                 + " items[ready=" + census[0] + " falling=" + census[1] + " pickupDelay=" + census[2]
                 + " owned=" + census[3] + "] pendBrk=" + pendBrk + " vanillaQ=" + vanillaQ
-                + (freeInventoryCapacity() == 0 ? " §cINV-FULL(item chase skipped)" : ""));
+                + (restock.freeInventoryCapacity() == 0 ? " §cINV-FULL(item chase skipped)" : ""));
         }
         BlockPos straggler = nearestRemainingPlanBlock();
         int totalDrops = census[0] + census[1] + census[2];
@@ -1976,10 +1737,10 @@ public class StepCheckered extends Module {
                 if (dist < blockDist) { blockDist = dist; nearestBlock = pos; }
             }
         }
-        ItemEntity nearestItem = freeInventoryCapacity() > 0 ? findNearestGroundItem(3) : null;
+        ItemEntity nearestItem = restock.freeInventoryCapacity() > 0 ? findNearestGroundItem(3) : null;
         double itemDist = nearestItem != null
             ? mc.player.getEyePos().distanceTo(nearestItem.getEntityPos()) : Double.MAX_VALUE;
-        if (sweepBudget > 0 && freeInventoryCapacity() > 0) {
+        if (sweepBudget > 0 && restock.freeInventoryCapacity() > 0) {
             if (nearestBlock != null && (nearestItem == null || blockDist <= itemDist)) {
                 checkpoints.addFirst(new Pair(nearestBlock.toCenterPos(), new Pair("sweepTick", null)));
                 breakStage = 4;
@@ -1994,7 +1755,7 @@ public class StepCheckered extends Module {
         // name the reason — the finishBatch gate re-verifies and takes over.
         if (nearestBlock != null || nearestItem != null) {
             info("§6[SWEEP-VERIFY]§7 batch " + currentBatch + " sweep pass ending early: "
-                + (freeInventoryCapacity() == 0 ? "inventory full" : "budget exhausted")
+                + (restock.freeInventoryCapacity() == 0 ? "inventory full" : "budget exhausted")
                 + " with " + (nearestBlock != null ? "blocks " : "") + (nearestItem != null ? "+ items " : "")
                 + "still visible - exit gate will re-verify.");
         }
@@ -2030,7 +1791,7 @@ public class StepCheckered extends Module {
         if (!ladderPick.isIn(ItemTags.PICKAXES)) {
             // Worn pickaxes keep working mid-run (exchange only at the pre-batch
             // restock) - fetch only when none is left at all
-            movePickaxeToSlot8();
+            restock.movePickaxeToSlot8();
             if (!mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) {
                 pauseForRestockTrip(true);
                 return true;
@@ -2045,8 +1806,8 @@ public class StepCheckered extends Module {
         // direction, including outside the print box at its edges.
         int ix0 = lx0 - RESET_ITEM_MARGIN, ix1 = lx1 + RESET_ITEM_MARGIN;
         int iz0 = lz0 - RESET_ITEM_MARGIN, iz1 = lz1 + RESET_ITEM_MARGIN;
-        if (freeInventoryCapacity() == 0 && findNearestItemInArea(ix0, ix1, iz0, iz1) != null) {
-            Pair<BlockPos, Vec3d> ladderChest = getBestDepositChest();
+        if (restock.freeInventoryCapacity() == 0 && findNearestItemInArea(ix0, ix1, iz0, iz1) != null) {
+            Pair<BlockPos, Vec3d> ladderChest = restock.getBestDepositChest();
             if (ladderChest != null) {
                 checkpoints.clear();
                 checkpoints.add(new Pair(ladderChest.getRight(), new Pair("depositBuilding", ladderChest.getLeft())));
@@ -2059,7 +1820,7 @@ public class StepCheckered extends Module {
             }
         }
         BlockPos lTarget = findNearestBlockInArea(lx0, lx1, lz0, lz1);
-        ItemEntity lItem = freeInventoryCapacity() > 0 ? findNearestItemInArea(ix0, ix1, iz0, iz1) : null;
+        ItemEntity lItem = restock.freeInventoryCapacity() > 0 ? findNearestItemInArea(ix0, ix1, iz0, iz1) : null;
         // RESET-VERIFY census: everything the CLEAN verdict is about to be based on,
         // including content the filtered scans above cannot see.
         int[] census = itemCensusInArea(ix0, ix1, iz0, iz1);
@@ -2098,7 +1859,7 @@ public class StepCheckered extends Module {
                 + " §fblocks=" + (lTarget != null ? "1+ @" + (lTarget.getX() - lowerMapCorner.getX()) + "," + (lTarget.getY() - lowerMapCorner.getY()) + "," + (lTarget.getZ() - lowerMapCorner.getZ()) : "0")
                 + " §7items+m" + RESET_ITEM_MARGIN + "[ready=" + census[0] + " falling=" + census[1] + " pickupDelay=" + census[2] + " owned=" + census[3] + "]"
                 + " §3pendBrk=" + pendBrk + " vanillaQ=" + vanilla
-                + (freeInventoryCapacity() == 0 ? " §cINV-FULL(item scan skipped)" : ""));
+                + (restock.freeInventoryCapacity() == 0 ? " §cINV-FULL(item scan skipped)" : ""));
         }
         if (lTarget == null && lItem == null) {
             if (census[1] + census[2] > 0) {
@@ -2207,7 +1968,7 @@ public class StepCheckered extends Module {
         ArrayList<Item> bringOrder = new ArrayList<>();
         ArrayList<Integer> bringZs = new ArrayList<>();
         for (Map.Entry<Item, Integer> fe : firstUseZ.entrySet()) {
-            if (!isItemInHotbar(fe.getKey())) { bringOrder.add(fe.getKey()); bringZs.add(fe.getValue()); }
+            if (!restock.isItemInHotbar(fe.getKey())) { bringOrder.add(fe.getKey()); bringZs.add(fe.getValue()); }
         }
         for (int a = 0; a < bringOrder.size(); a++) {
             for (int b = a + 1; b < bringOrder.size(); b++) {
@@ -2278,7 +2039,7 @@ public class StepCheckered extends Module {
             // Mid-run a worn pickaxe keeps swinging (exchanges happen ONLY at the
             // pre-batch restock) - reaching here means it is GONE (broke). Arm any
             // carried one; with none left the fetch trip is the only recovery.
-            movePickaxeToSlot8();
+            restock.movePickaxeToSlot8();
             if (!mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) {
                 pauseForRestockTrip(true);
             }
@@ -2299,152 +2060,16 @@ public class StepCheckered extends Module {
 
     // Restocking
 
-    Pair<BlockPos, Vec3d> getBestChest(Item item) {
-        ArrayList<Pair<BlockPos, Vec3d>> list = new ArrayList<>();
-        if (item.equals(Items.CARTOGRAPHY_TABLE)) {
-            list = mapMaterialChests;
-        } else if (materialDict.containsKey(item)) {
-            list = materialDict.get(item);
-        } else {
-            warning("No chest found for " + item.getName().getString());
-            toggle();
-            return new Pair<>(new BlockPos(0, 0, 0), new Vec3d(0, 0, 0));
-        }
-        ArrayList<Pair<BlockPos, Vec3d>> bestList = new ArrayList<>();
-        // Lowest chest as 1. criterion (fixed preference since the legacy layer engine went away)
-        for (Pair<BlockPos, Vec3d> p : list) {
-            //Skip chests that have already been checked
-            if (checkedChests.contains(p.getLeft())) continue;
-            if (bestList.isEmpty() || bestList.getFirst().getLeft().getY() >= p.getLeft().getY()) {   // prefer the LOWEST chest (layer preference is fixed since the legacy engine went away)
-                // Remove all previous results if new one is truly better
-                if (!bestList.isEmpty() && bestList.getFirst().getLeft().getY() != p.getLeft().getY()) {
-                    bestList.clear();
-                }
-                bestList.add(p);
-            }
-        }
-        if (bestList.isEmpty()) {
-            if (checkedChests.isEmpty()) {
-                // The source list itself has no usable chest - retrying cannot help (was: infinite recursion)
-                warning("No available chest found for " + item.getName().getString());
-                toggle();
-                return new Pair<>(new BlockPos(0, 0, 0), new Vec3d(0, 0, 0));
-            }
-            checkedChests.clear();
-            return getBestChest(item);
-        }
-        // Get nearest chest as 2. criteria
-        Vec3d bestPos = null;
-        BlockPos bestChestPos = null;
-        for (Pair<BlockPos, Vec3d> p : bestList) {
-            //Skip chests that have already been checked
-            if (checkedChests.contains(p.getLeft())) continue;
-            if (bestPos == null || PlayerUtils.distanceTo(p.getRight()) < PlayerUtils.distanceTo(bestPos)) {
-                bestPos = p.getRight();
-                bestChestPos = p.getLeft();
-            }
-        }
-        return new Pair(bestChestPos, bestPos);
-    }
 
-    private void refillBuildingInventory(HashMap<Item, Integer> invMaterial) {
-        //Fills restockList with required build materials
-        restockList.clear();
-        HashMap<Item, Integer> requiredItems = getRequiredItems();
-        for (Item item : invMaterial.keySet()) {
-            int oldAmount = requiredItems.remove(item);
-            requiredItems.put(item, oldAmount - invMaterial.get(item));
-        }
-
-        for (Item item : requiredItems.keySet()) {
-            if (requiredItems.get(item) <= 0) continue;
-            int stacks = (int) Math.ceil((float) requiredItems.get(item) / 64f);
-            if(debugPrints.get()) info("Restocking §a" + stacks + " stacks " + item.getName().getString() + " (" + requiredItems.get(item) + ")");
-            restockList.add(0, Triple.of(item, stacks, requiredItems.get(item)));
-        }
-        addClosestRestockCheckpoint();
-    }
 
     /** Compute what the current plan still needs, drop what is in the way, and queue the
      *  refill trip - the ONE entry point shared by the calculateRefill checkpoint, batch
      *  prep, and the mid-print supply run. */
-    private void refillFromCurrentPlan() {
-        HashMap<Item, Integer> requiredItems = getRequiredItems();
-        Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInfo =
-            Utils.getInvInformation(requiredItems, availableSlots);
-        refillBuildingInventory(invInfo.getRight());
-    }
 
-    private void addClosestRestockCheckpoint() {
-        //Determine closest restock chest for material in restock list
-        if (restockList.isEmpty()) return;
-        double smallestDistance = Double.MAX_VALUE;
-        Triple<Item, Integer, Integer> closestEntry = null;
-        Pair<BlockPos, Vec3d> restockPos = null;
-        for (Triple<Item, Integer, Integer> entry : restockList) {
-            Pair<BlockPos, Vec3d> bestRestockPos = getBestChest(entry.getLeft());
-            if (bestRestockPos.getLeft() == null) {
-                warning("No chest found for " + entry.getLeft().getName().getString());
-                toggle();
-                return;
-            }
-            double chestDistance = PlayerUtils.distanceTo(bestRestockPos.getRight());
-            if (chestDistance < smallestDistance) {
-                smallestDistance = chestDistance;
-                closestEntry = entry;
-                restockPos = bestRestockPos;
-            }
-        }
-        //Set closest material as first and as checkpoint
-        restockList.remove(closestEntry);
-        restockList.addFirst(closestEntry);
-        checkpoints.addFirst(new Pair(restockPos.getRight(), new Pair("refill", restockPos.getLeft())));
-    }
 
-    private void endRestocking() {
-        if (restockList.get(0).getMiddle() > 0) {
-            checkedChests.add(lastInteractedChest);
-            // Stop the re-search cycle once every chest stocking this item has been tried
-            List<Pair<BlockPos, Vec3d>> stockingChests =
-                materialDict.getOrDefault(restockList.get(0).getLeft(), new ArrayList<>());
-            int untriedChests = 0;
-            for (Pair<BlockPos, Vec3d> p : stockingChests) {
-                if (!checkedChests.contains(p.getLeft())) untriedChests++;
-            }
-            if (untriedChests == 0) {
-                error("No registered chest has enough " + restockList.get(0).getLeft().getName().getString()
-                    + " (need " + restockList.get(0).getMiddle() + " more). Restock the chests and restart the module.");
-                toggle();
-                return;
-            }
-            warning("Not all necessary stacks restocked. Searching for another chest stocking "
-                + restockList.get(0).getLeft().getName().getString() + "...");
-            //Search for the next best chest that still stocks the item currently being restocked
-            Pair<BlockPos, Vec3d> bestRestockPos = getBestChest(restockList.get(0).getLeft());
-            checkpoints.addFirst(new Pair<>(bestRestockPos.getRight(), new Pair<>("refill", bestRestockPos.getLeft())));
-        } else {
-            checkedChests.clear();
-            restockList.remove(0);
-            addClosestRestockCheckpoint();
-        }
-        timeoutTicks = postRestockDelay.get();
-        state = State.Walking;
-    }
 
     // Block Interactions
 
-    void interactWithBlock(BlockPos chestPos) {
-        Utils.setForwardPressed(false);
-        mc.player.setYaw((float) Rotations.getYaw(chestPos.toCenterPos()));
-        mc.player.setPitch((float) Rotations.getPitch(chestPos.toCenterPos()));
-
-        BlockHitResult hitResult = new BlockHitResult(chestPos.toCenterPos(), Utils.getInteractionSide(chestPos), chestPos, false);
-        BlockUtils.interact(hitResult, Hand.MAIN_HAND, true);
-
-        //Set timeout for chest interaction
-        interactTimeout = retryInteractTimer.get();
-        lastInteractedChest = chestPos;
-    }
 
     /** ADAPTIVE PACE GOVERNOR - the single decision point for holding the bot's walk
      *  while work remains in reach. One method, two modes (never duplicated at call
@@ -2466,7 +2091,7 @@ public class StepCheckered extends Module {
             BlockPos placeNow = getNextBatchPlacementPos();
             if (placeNow != null && placementAttempts.getOrDefault(placeNow, 0) < 5) {
                 Block planned = currentBuildPlan.get(placeNow);
-                if (planned != null && isMaterialCarried(planned.asItem())) {
+                if (planned != null && restock.isMaterialCarried(planned.asItem())) {
                     placeHoldTicks++;
                     if (placeHoldTicks > 100) {
                         placementAttempts.put(placeNow, 5);   // force-release: treat as capped
@@ -2609,22 +2234,8 @@ public class StepCheckered extends Module {
     }
 
     /** Is any of this building material currently carried (hotbar or main inventory)? */
-    private boolean isMaterialCarried(Item needed) {
-        for (int slot : availableSlots) {
-            if (!mc.player.getInventory().getStack(slot).isEmpty()
-                && mc.player.getInventory().getStack(slot).getItem().equals(needed)) return true;
-        }
-        return false;
-    }
 
     /** Is this item currently held in one of the staging hotbar slots? */
-    private boolean isItemInHotbar(Item item) {
-        for (int slot : availableHotBarSlots) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (!stack.isEmpty() && stack.getItem().equals(item)) return true;
-        }
-        return false;
-    }
 
     /** @return 1 = placement sent (hotbar hit), 0 = swap pending, -1 = material missing
      *  (swap/restock already triggered). The multi-place loop uses the code to keep
@@ -2714,7 +2325,7 @@ public class StepCheckered extends Module {
             warning("The lower map area has not been selected.");
             return false;
         }
-        if (availableSlots.isEmpty() && !setupSlots()) return false;
+        if (availableSlots.isEmpty() && !restock.setupSlots()) return false;
         return true;
     }
 
@@ -2907,7 +2518,7 @@ public class StepCheckered extends Module {
             int preSwapped = 0;
             int slotCursor = 0;
             for (Item comingItem : coming) {
-                if (isItemInHotbar(comingItem)) continue;
+                if (restock.isItemInHotbar(comingItem)) continue;
                 int srcSlot = -1;
                 for (int is = 9; is < 36 && srcSlot == -1; is++) {
                     ItemStack isStack = mc.player.getInventory().getStack(is);
@@ -2955,13 +2566,13 @@ public class StepCheckered extends Module {
      * then append their print route.  Every trip remains on the north corridor.
      */
     private void queueStepBuildPreparation(double stagingX) {
-        refillFromCurrentPlan();
-        boolean materialRestockQueued = !restockList.isEmpty();
+        restock.refillFromCurrentPlan();
+        boolean materialRestockQueued = !restock.restockList.isEmpty();
 
         // UNNEEDED-MATERIAL DUMP (user rule, 2026-10-20), inlined body-only (hotswap-
         // safe): deposit carried building materials that NO remaining batch (or the
         // closing) will ever place - leftovers from finished batches otherwise squat on
-        // slots for the rest of the run. Pre-fills depositBacklogSlots (the deposit
+        // slots for the rest of the run. Pre-fills restock.depositBacklogSlots (the deposit
         // handler treats a pre-filled backlog at chest-open as a filtered dump) and
         // rides the SAME north-corridor trip, before the first refill checkpoint.
         if (lowerMapCorner != null && stepLayers != null && currentBatch >= 0) {
@@ -3010,10 +2621,10 @@ public class StepCheckered extends Module {
                 }
             }
             if (unneededItems != null) {
-                Pair<BlockPos, Vec3d> dumpChest = getBestDepositChest();
+                Pair<BlockPos, Vec3d> dumpChest = restock.getBestDepositChest();
                 if (dumpChest != null) {
-                    depositBacklogSlots.clear();
-                    depositBacklogSlots.addAll(dumpSlots);
+                    restock.depositBacklogSlots.clear();
+                    restock.depositBacklogSlots.addAll(dumpSlots);
                     StringBuilder dumpNames = new StringBuilder();
                     for (Item dn : unneededItems) { if (dumpNames.length() > 0) dumpNames.append(", "); dumpNames.append(dn.getName().getString()); }
                     info("§7Prep dump: depositing materials no future batch uses (" + dumpNames + ").");
@@ -3031,28 +2642,28 @@ public class StepCheckered extends Module {
         // (strictly below, not at the touch). Never mid-run: a worn pickaxe keeps
         // swinging until it breaks; the only mid-run trip left is fetching a
         // replacement after a pickaxe is genuinely gone.
-        int pickSlot = findPickaxeSlot();
+        int pickSlot = restock.findPickaxeSlot();
         int pickRemaining = pickSlot >= 0 ? ToolUtils.getRemainingDamage(mc.player.getInventory().getStack(pickSlot)) : 0;
         if (pickSlot < 0 || pickRemaining < minDurability.get()) {
-            Item pickaxe = findRegisteredPickaxeItem();
+            Item pickaxe = restock.findRegisteredPickaxeItem();
             if (pickaxe != null) {
                 info("§7Pickaxe " + (pickSlot < 0 ? "missing" : "at " + pickRemaining + " durability")
                     + " - exchanging at the batch-prep trip (min-durability " + minDurability.get() + ").");
-                restockList.add(Triple.of(pickaxe, 1, 1));
+                restock.restockList.add(Triple.of(pickaxe, 1, 1));
                 // If materials already have a chest at the head, endRestocking() will promote
                 // this entry after them.  With no material restock, add its first chest now.
-                if (!materialRestockQueued) addClosestRestockCheckpoint();
+                if (!materialRestockQueued) restock.addClosestRestockCheckpoint();
             }
-        } else if (countPickaxes() > 1) {
+        } else if (restock.countPickaxes() > 1) {
             // ONE-PICKAXE INVARIANT (user rule 2026-10-20: exactly one pickaxe in the
             // inventory): the best pickaxe survives the batch, but stale spares would ride
             // along forever - queue a deposit-only pickaxe-chest visit (0 stacks = take
             // nothing, park the spares at the chest).
-            Item pickaxe = findRegisteredPickaxeItem();
+            Item pickaxe = restock.findRegisteredPickaxeItem();
             if (pickaxe != null) {
-                info("§7" + (countPickaxes() - 1) + " spare pickaxe(s) carried - depositing them at the batch-prep trip.");
-                restockList.add(Triple.of(pickaxe, 0, 0));
-                if (!materialRestockQueued) addClosestRestockCheckpoint();
+                info("§7" + (restock.countPickaxes() - 1) + " spare pickaxe(s) carried - depositing them at the batch-prep trip.");
+                restock.restockList.add(Triple.of(pickaxe, 0, 0));
+                if (!materialRestockQueued) restock.addClosestRestockCheckpoint();
             }
         }
         // BEST-TOOL PREP — AXE with the PICKAXE'S predictive rule (user rule, live
@@ -3086,7 +2697,7 @@ public class StepCheckered extends Module {
                     }
                     if (axe != null) {
                         info("§7Axe missing - fetching one at the batch-prep trip.");
-                        restockList.add(Triple.of(axe.getItem(), 1, 1));
+                        restock.restockList.add(Triple.of(axe.getItem(), 1, 1));
                     }
                 } else if (axeCarried > 1) {
                     // ONE-AXE INVARIANT (mirrors the pickaxe's): the best axe survives;
@@ -3103,15 +2714,15 @@ public class StepCheckered extends Module {
                     if (spareAxe != null && bestAxeRemaining >= minDurability.get()) {
                         info("§7" + (axeCarried - 1) + " spare axe(s) carried (best at " + bestAxeRemaining
                             + " durability, above min " + minDurability.get() + ") - depositing spares, NO new axe fetched.");
-                        restockList.add(Triple.of(spareAxe, 0, 0));
-                        if (!materialRestockQueued) addClosestRestockCheckpoint();
+                        restock.restockList.add(Triple.of(spareAxe, 0, 0));
+                        if (!materialRestockQueued) restock.addClosestRestockCheckpoint();
                     }
                 }
             }
         }
         // FOOD (user rule): fetch ONLY when the OFFHAND stack is below 10 pieces, and
         // take only what fits in the offhand (never a second full stack on top of one).
-        if (foodChest != null && offhandFoodCount() < 10) {
+        if (foodChest != null && restock.offhandFoodCount() < 10) {
             checkpoints.add(new Pair(foodChest.getRight(), new Pair("foodChest", foodChest.getLeft())));
         }
         double northZ = lowerMapCorner.getZ() - 2;
@@ -3232,7 +2843,7 @@ public class StepCheckered extends Module {
                     // directly from whatever state the slave was left in.
                     removePendingStepCommand();
                     checkpoints.clear();
-                    ensurePickaxeSlot8();
+                    restock.ensurePickaxeSlot8();
                     breakStage = 2;
                     state = State.Mining;
                     resumeBatchRoute(2);
@@ -3371,7 +2982,7 @@ public class StepCheckered extends Module {
         // the whole queue and were consumed at the reset START, so when the ladder
         // finished at the SOUTH end the bare deposit checkpoint was next and the bot
         // beelined diagonally to the north chest, queue=2 in the log).
-        Pair<BlockPos, Vec3d> doneChest = getBestDepositChest();
+        Pair<BlockPos, Vec3d> doneChest = restock.getBestDepositChest();
         double corridorZ = lowerMapCorner.getZ() - 2;
         double y = lowerMapCorner.getY();
         if (doneChest != null) {
@@ -3493,9 +3104,9 @@ public class StepCheckered extends Module {
         // Force-clear ALL active state — any phase the slave was in is now dead
         checkpoints.clear();
         printRepairPending = false;
-        depositBacklogSlots.clear();
-        restockBacklogSlots.clear();
-        restockList.clear();
+        restock.depositBacklogSlots.clear();
+        restock.restockBacklogSlots.clear();
+        restock.restockList.clear();
         batchPassRetries = 0;
         currentBuildPlan = null;
         breakStage = 0;
@@ -3509,12 +3120,12 @@ public class StepCheckered extends Module {
         sweepWaitRounds = 0;
         sweepWaitLogged = false;
         sweepReArmSig = null;
-        toBeHandledInvPacket = null;
-        closeNextInvPacket = false;
+        restock.toBeHandledInvPacket = null;
+        restock.closeNextInvPacket = false;
         toBeSwappedSlot = -1;
         fullSweepActive = false;
         timeoutTicks = 0;
-        interactTimeout = 0;
+        restock.interactTimeout = 0;
         Utils.setForwardPressed(false);
         Utils.setSneakPressed(false);
 
@@ -3894,7 +3505,7 @@ public class StepCheckered extends Module {
         double startZ = lowerMapCorner.getZ() - 2;
         double farZ = lowerMapCorner.getZ() + 128.7;
 
-        Pair<BlockPos, Vec3d> chest = getBestDepositChest();
+        Pair<BlockPos, Vec3d> chest = restock.getBestDepositChest();
         checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), startZ), new Pair("breakAllBegin", null)));
         checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("breakAllDone", null)));
         checkpoints.add(new Pair(new Vec3d(walkX, lowerMapCorner.getY(), farZ), new Pair("batchExit", null)));
@@ -3911,93 +3522,16 @@ public class StepCheckered extends Module {
 
     /** A chest to deposit building blocks into: one already stocking a held material, else
      *  the nearest registered material chest. */
-    private Pair<BlockPos, Vec3d> getBestDepositChest() {
-        Pair<BlockPos, Vec3d> best = null;
-        double bestDist = Double.MAX_VALUE;
-        for (Item item : materialDict.keySet()) {
-            boolean carrying = false;
-            for (int slot = 0; slot < 36; slot++) {
-                ItemStack stack = mc.player.getInventory().getStack(slot);
-                if (!stack.isEmpty() && stack.getItem().equals(item)) { carrying = true; break; }
-            }
-            if (!carrying) continue;
-            for (Pair<BlockPos, Vec3d> chest : materialDict.get(item)) {
-                double dist = PlayerUtils.distanceTo(chest.getRight());
-                if (dist < bestDist) { bestDist = dist; best = chest; }
-            }
-        }
-        if (best != null) return best;
-        for (ArrayList<Pair<BlockPos, Vec3d>> chests : materialDict.values()) {
-            for (Pair<BlockPos, Vec3d> chest : chests) {
-                double dist = PlayerUtils.distanceTo(chest.getRight());
-                if (dist < bestDist) { bestDist = dist; best = chest; }
-            }
-        }
-        return best;
-    }
 
     /** Queue the given chest at the HEAD of the route as the next deposit stop. */
-    private void queueDepositChestAtHead(Pair<BlockPos, Vec3d> chest) {
-        checkpoints.add(0, new Pair(chest.getRight(), new Pair("depositBuilding", chest.getLeft())));
-    }
 
-    private boolean containsChest(ArrayList<Pair<BlockPos, Vec3d>> chests, BlockPos pos) {
-        for (Pair<BlockPos, Vec3d> chest : chests) {
-            if (chest.getLeft().equals(pos)) return true;
-        }
-        return false;
-    }
 
     /** Does the OPEN chest have room for this stack (empty slot or mergeable partial)? */
-    private boolean chestHasRoomFor(ItemStack stack) {
-        if (stack.isEmpty()) return true;
-        int chestSlots = mc.player.currentScreenHandler.slots.size() - 36;
-        for (int i = 0; i < chestSlots; i++) {
-            ItemStack chestStack = mc.player.currentScreenHandler.slots.get(i).getStack();
-            if (chestStack.isEmpty()) return true;
-            if (chestStack.isStackable() && chestStack.getItem().equals(stack.getItem())
-                && chestStack.getCount() < chestStack.getMaxCount()) return true;
-        }
-        return false;
-    }
 
     /** A DIFFERENT chest for the remaining carried materials, nearest first: prefers a chest
      *  that stocks a carried item; falls back to ANY registered chest not marked full - and
      *  registers that fallback chest as a new stocking location for the item (remembered for
      *  the rest of the run, so future deposits/restocks use it too). */
-    private Pair<BlockPos, Vec3d> getNextDepositChest() {
-        ArrayList<Item> carried = new ArrayList<>();
-        for (int slot = 0; slot < 36; slot++) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (stack.isEmpty() || ToolUtils.isTool(stack) || stack.contains(DataComponentTypes.FOOD)) continue;
-            if (materialDict.containsKey(stack.getItem()) && !carried.contains(stack.getItem())) carried.add(stack.getItem());
-        }
-        Pair<BlockPos, Vec3d> best = null;
-        double bestDist = Double.MAX_VALUE;
-        for (Item item : carried) {
-            for (Pair<BlockPos, Vec3d> chest : materialDict.get(item)) {
-                if (lastInteractedChest != null && chest.getLeft().equals(lastInteractedChest)) continue;
-                if (fullDepositChests.contains(chest.getLeft())) continue;
-                double dist = PlayerUtils.distanceTo(chest.getRight());
-                if (dist < bestDist) { bestDist = dist; best = chest; }
-            }
-        }
-        if (best != null) return best;
-        // Fallback: any registered chest with (hopefully) space - remember it for the item
-        for (Item item : carried) {
-            for (ArrayList<Pair<BlockPos, Vec3d>> chests : materialDict.values()) {
-                for (Pair<BlockPos, Vec3d> chest : chests) {
-                    if (fullDepositChests.contains(chest.getLeft())) continue;
-                    if (!containsChest(materialDict.getOrDefault(item, new ArrayList<>()), chest.getLeft())) {
-                        materialDict.computeIfAbsent(item, k -> new ArrayList<>()).add(chest);
-                        info("§7Registered " + chest.getLeft().toShortString() + " as a new location for " + item.getName().getString() + ".");
-                    }
-                    return chest;
-                }
-            }
-        }
-        return null;
-    }
 
     /** Mid-run supply trip: exit north from whatever lane the bot is on, refill at the chest
      *  station (materials while printing; a pickaxe when it broke/went missing), then resume
@@ -4012,7 +3546,7 @@ public class StepCheckered extends Module {
             new Vec3d(currentWalkLaneX(), lowerMapCorner.getY(), lowerMapCorner.getZ() - 2), new Pair("sprint", null)));
     }
 
-    private void pauseForRestockTrip(boolean needPickaxe) {
+    void pauseForRestockTrip(boolean needPickaxe) {
         // Cooldown: prevent the supply-run trigger from re-firing every tick while the
         // bot is still Walking toward the chest (tryPlacingBlock sees no materials →
         // calls this again → clears the route → loops forever without moving)
@@ -4025,16 +3559,16 @@ public class StepCheckered extends Module {
         checkpoints.clear();
 
         if (savedStage == 0) {
-            refillFromCurrentPlan();
+            restock.refillFromCurrentPlan();
         }
-        if (needPickaxe && !hasAnyPickaxe() && !toolSet.isEmpty()) {
+        if (needPickaxe && !restock.hasAnyPickaxe() && !toolSet.isEmpty()) {
             for (ItemStack tool : toolSet) {
                 if (tool.isIn(ItemTags.PICKAXES)) {
-                    restockList.add(Triple.of(tool.getItem(), 1, 1));
+                    restock.restockList.add(Triple.of(tool.getItem(), 1, 1));
                     // Without a chest at the head of the queue the trip never visits one:
                     // the emergency "restock" walked the corridor, resumed breaking with
                     // the same worn pickaxe and re-triggered every cooldown (observed loop)
-                    if (restockList.size() == 1) addClosestRestockCheckpoint();
+                    if (restock.restockList.size() == 1) restock.addClosestRestockCheckpoint();
                     break;
                 }
             }
@@ -4114,7 +3648,7 @@ public class StepCheckered extends Module {
         checkpoints.clear();
         // Explicit order: chest visit -> north re-entry on the batch lane -> resumed
         // route; exit legs prepended last (north on the lane, then the corridor).
-        Pair<BlockPos, Vec3d> chest = getBestDepositChest();
+        Pair<BlockPos, Vec3d> chest = restock.getBestDepositChest();
         if (chest != null) {
             checkpoints.add(new Pair(chest.getRight(), new Pair("depositBuilding", chest.getLeft())));
         }
@@ -4177,8 +3711,8 @@ public class StepCheckered extends Module {
         }
         // Inventory full with content remaining: deposit first, then re-verify —
         // otherwise every sweepTick re-arm exits instantly and burns all retries.
-        if (freeInventoryCapacity() == 0 && (groundItems > 0 || inFlight > 0)) {
-            Pair<BlockPos, Vec3d> depositChest = getBestDepositChest();
+        if (restock.freeInventoryCapacity() == 0 && (groundItems > 0 || inFlight > 0)) {
+            Pair<BlockPos, Vec3d> depositChest = restock.getBestDepositChest();
             if (depositChest != null) {
                 checkpoints.clear();
                 checkpoints.add(new Pair(depositChest.getRight(), new Pair("depositBuilding", depositChest.getLeft())));
@@ -4344,281 +3878,47 @@ public class StepCheckered extends Module {
     }
 
     /** Pieces of food currently in the OFFHAND stack (0 if it holds something else). */
-    private int offhandFoodCount() {
-        ItemStack off = mc.player.getOffHandStack();
-        if (off.isEmpty() || !off.contains(DataComponentTypes.FOOD)) return 0;
-        return off.getCount();
-    }
 
     /** Finds the pickaxe with the HIGHEST remaining durability in the inventory (no other
      *  tool qualifies); -1 if none. Best-first, not first-found: the prep check must
      *  measure the best pickaxe and slot 8 must arm the freshest one - first-found armed
      *  stale pickaxes while fresh ones sat deeper in the inventory, re-triggering a fetch
      *  every batch prep (live 2026-10-20: five pickaxes accumulated). */
-    private int findPickaxeSlot() {
-        int bestSlot = -1;
-        for (int slot = 0; slot < 36; slot++) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (stack.isEmpty() || !stack.isIn(ItemTags.PICKAXES)) continue;
-            if (bestSlot == -1 || ToolUtils.getRemainingDamage(stack) > ToolUtils.getRemainingDamage(mc.player.getInventory().getStack(bestSlot))) bestSlot = slot;
-        }
-        return bestSlot;
-    }
 
-    private int countPickaxes() {
-        int count = 0;
-        for (int slot = 0; slot < 36; slot++) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (!stack.isEmpty() && stack.isIn(ItemTags.PICKAXES)) count++;
-        }
-        return count;
-    }
 
     /** True when the chest currently being interacted with is registered as stocking a
      *  pickaxe - the only chest a used pickaxe may be parked into. */
-    private boolean isOpenChestAPickaxeChest() {
-        if (lastInteractedChest == null) return false;
-        for (HashMap.Entry<Item, ArrayList<Pair<BlockPos, Vec3d>>> entry : materialDict.entrySet()) {
-            if (!new ItemStack(entry.getKey()).isIn(ItemTags.PICKAXES)) continue;
-            if (containsChest(entry.getValue(), lastInteractedChest)) return true;
-        }
-        return false;
-    }
 
     /** True when ANY pickaxe is carried (slot 8 or anywhere in the inventory) - worn
      *  ones count too: exchanges happen only at the pre-batch restock, so mid-run a
      *  worn pickaxe is still the tool in hand (user rule, 2026-10-20). */
-    private boolean hasAnyPickaxe() {
-        if (mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) return true;
-        for (int slot = 0; slot < 36; slot++) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (!stack.isEmpty() && stack.isIn(ItemTags.PICKAXES)) return true;
-        }
-        return false;
-    }
 
     /** Any registered pickaxe: from the tool set or any material-chest registration. */
-    private Item findRegisteredPickaxeItem() {
-        for (ItemStack tool : toolSet) {
-            if (tool.isIn(ItemTags.PICKAXES)) return tool.getItem();
-        }
-        for (Item item : materialDict.keySet()) {
-            if (new ItemStack(item).isIn(ItemTags.PICKAXES)) return item;
-        }
-        return null;
-    }
 
     /** Walk to the restock station's pickaxe chest, take one pickaxe, then come back to the
      *  staging checkpoint and continue. No failure path - the chest is registered. */
-    private void restockPickaxeTrip(Vec3d stagingPos) {
-        info("§eNo pickaxe - fetching one from the restock station.");
-        Item pickaxe = findRegisteredPickaxeItem();
-        if (pickaxe == null) {
-            warning("No pickaxe registered in any chest - continuing without one.");
-            return;
-        }
-        Pair<BlockPos, Vec3d> chest = getBestChest(pickaxe);
-        if (chest.getLeft() == null || chest.getLeft().equals(BlockPos.ORIGIN)) {
-            warning("No chest stocks " + pickaxe.getName().getString() + " - cannot fetch a pickaxe.");
-            return;
-        }
-        restockList.add(Triple.of(pickaxe, 1, 1));
-        checkpoints.add(0, new Pair(new Vec3d(stagingPos.x, stagingPos.y, stagingPos.z), new Pair("batchBegin", null)));
-        checkpoints.add(0, new Pair(chest.getRight(), new Pair("refill", chest.getLeft())));
-        state = State.Walking;
-    }
 
     /** Pickaxe into its reserved hotbar slot 8 (from wherever it is in the inventory). */
-    private void movePickaxeToSlot8() {
-        if (mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) return;
-        int slot = findPickaxeSlot();
-        if (slot == -1) return;
-        Utils.performSwap(slot, 8);
-        info("Pickaxe moved to slot 8.");
-    }
 
     /** A food stack into the offhand (eaten from there); swaps out whatever it holds. */
-    private void moveFoodToOffhand() {
-        if (mc.player.getOffHandStack().contains(DataComponentTypes.FOOD)) return;
-        for (int slot = 0; slot < 36; slot++) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (!stack.isEmpty() && stack.contains(DataComponentTypes.FOOD)) {
-                int screenSlot = slot < 9 ? 36 + slot : slot;
-                mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, screenSlot, 40, SlotActionType.SWAP, mc.player);
-                info("Food to the offhand.");
-                return;
-            }
-        }
-    }
 
     /** Hand setup at the batch staging: pickaxe into reserved slot 8, food into the offhand,
      *  main hand free for placing. */
-    private void setupHands() {
-        movePickaxeToSlot8();
-        moveFoodToOffhand();
-    }
 
     /** Ensures the reserved pickaxe slot 8 is filled before a breaking pass (the mining
      *  branch selects it directly). */
-    private void ensurePickaxeSlot8() {
-        movePickaxeToSlot8();
-    }
 
     // Inventory Management
 
-    private boolean setupSlots() {
-        availableSlots = Utils.getAvailableSlots(materialDict);
-        // Hotbar slot 8 is RESERVED for the pickaxe - never used for materials or swaps
-        availableSlots.remove(Integer.valueOf(8));
-        for (int slot : availableSlots) {
-            if (slot < 9) {
-                availableHotBarSlots.add(slot);
-            }
-        }
-        if (debugPrints.get()) info("Inventory slots available for building: " + availableSlots);
-        if (availableHotBarSlots.isEmpty()) {
-            warning("No free slots found in hot-bar!");
-            availableSlots.clear();
-            toggle();
-            return false;
-        }
-        if (availableSlots.size() < 2) {
-            warning("You need at least 2 free inventory slots!");
-            availableSlots.clear();
-            toggle();
-            return false;
-        }
-        return true;
-    }
 
-    private HashMap<Item, Integer> getRequiredItems() {
-        //Calculate the next items to restock: count one per still-missing plan block
-        //(live world truth), capped by the available inventory slots
-        HashMap<Item, Integer> requiredItems = new HashMap<>();
-        if (currentBuildPlan == null) return requiredItems;
-        for (Map.Entry<BlockPos, Block> entry : currentBuildPlan.entrySet()) {
-            if (!miningBlockState(entry.getKey()).isAir()) continue;
-            Item material = entry.getValue().asItem();
-            int oldCount = requiredItems.getOrDefault(material, 0);
-            requiredItems.put(material, oldCount + 1);
-            if (Utils.stacksRequired(requiredItems.values()) > availableSlots.size()) {
-                requiredItems.put(material, oldCount);
-            }
-        }
-        return requiredItems;
-    }
 
-    private void swapIntoHotbar(int slot) {
-        Map<Item, Integer> itemSlot = new HashMap<>();
-        Map<Item, Integer> itemDistance = new HashMap<>();
-        Map<Item, Integer> itemFrequency = new HashMap<>();
-
-        int targetSlot = availableHotBarSlots.get(0);
-
-        // Scan hotbar
-        for (int hotbarSlot : availableHotBarSlots) {
-            ItemStack stack = mc.player.getInventory().getStack(hotbarSlot);
-            if (!stack.isEmpty()) {
-                Item item = stack.getItem();
-                itemSlot.put(item, hotbarSlot);
-                itemDistance.put(item, -1); // -1 = never used
-                itemFrequency.put(item, 0);
-            } else {
-                targetSlot = hotbarSlot;
-                break;
-            }
-        }
-
-        // PRIORITY 1: empty slot → instant choice
-        if (mc.player.getInventory().getStack(targetSlot).isEmpty()) {
-            Utils.performSwap(slot, targetSlot);
-            return;
-        }
-
-        // Get blocks until next use of items in hotbar
-        AtomicReference<Integer> blockCounter = new AtomicReference<>(0);
-        forEachMapBlock((x, z, y, blockState, block) -> {
-            if (!Utils.isInInterval(workingInterval, x)) return true;
-            blockCounter.set(blockCounter.get() + 1);
-
-            if (blockState.isAir() || block == null) return true;
-            Item item = block.asItem();
-
-            if (itemDistance.containsKey(item) &&
-                itemDistance.get(item) == -1) {
-                itemDistance.put(item, blockCounter.get());
-            }
-            return true;
-        });
-
-        // Count frequency of items in hotbar
-        for (int hotbarSlot : availableHotBarSlots) {
-            ItemStack stack = mc.player.getInventory().getStack(hotbarSlot);
-            if (!stack.isEmpty()) {
-                Item item = stack.getItem();
-                itemFrequency.put(item, itemFrequency.get(item) + 1);
-            }
-        }
-
-        // Choose best candidate
-        Item bestItem = null;
-        int bestDistance = -2; // lower than -1
-        int bestFrequency = -1;
-
-        for (Item item : itemSlot.keySet()) {
-            int distance = itemDistance.get(item); // -1 = never used
-            int frequency = itemFrequency.get(item);
-
-            boolean better = false;
-
-            // PRIORITY 2: never used (-1)
-            if (distance == -1 && bestDistance != -1) {
-                better = true;
-            }
-            // PRIORITY 3: hotbar frequency
-            else if (frequency > bestFrequency) {
-                better = true;
-            }
-            // PRIORITY 4: distance to next use
-            else if (frequency == bestFrequency && distance > bestDistance && bestDistance != -1) {
-                better = true;
-            }
-
-            if (better) {
-                bestItem = item;
-                bestDistance = distance;
-                bestFrequency = frequency;
-            }
-        }
-
-        if (bestItem != null) {
-            targetSlot = itemSlot.get(bestItem);
-        }
-
-        Utils.performSwap(slot, targetSlot);
-    }
 
     /** Total free item capacity across the inventory: empty slots count as a full stack each,
      *  partial stacks count their remaining headroom. Deposit trips only fire at ZERO -
      *  merging collected drops into partial stacks is free space and must not trigger them. */
-    private int freeInventoryCapacity() {
-        int capacity = 0;
-        for (int slot = 0; slot < 36; slot++) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (stack.isEmpty()) { capacity += 64; continue; }
-            if (stack.isStackable()) capacity += stack.getMaxCount() - stack.getCount();
-        }
-        return capacity;
-    }
 
-    private boolean isInventoryFull() {
-        for (int slot : availableSlots) {
-            if (mc.player.getInventory().getStack(slot).isEmpty()) return false;
-        }
-        return true;
-    }
 
-    /** Working interval bookkeeping (swapIntoHotbar's eviction heuristic reads it). */
+    /** Working interval bookkeeping (restock.swapIntoHotbar's eviction heuristic reads it). */
     private void setInterval(Pair<Integer, Integer> interval) {
         if (debugPrints.get()) info("set interval to " + interval.getLeft() + " " + interval.getRight());
         workingInterval = interval;
@@ -4980,24 +4280,6 @@ public class StepCheckered extends Module {
     /** Walks the map area's coordinate domain (working interval, 129 rows, y 0-1) in
      *  placement order. The step-checker engine has no cached layer content - the
      *  desiredBlock argument is always null; actions read the live world state. */
-    private void forEachMapBlock(MapBlockAction action) {
-        for (int x = workingInterval.getLeft(); x <= workingInterval.getRight(); x += linesPerRun) {
-            for (int z = 0; z < 129; z++) {
-                for (int lineBonus = 0; lineBonus < linesPerRun; lineBonus++) {
-                    int adjustedX = x + lineBonus;
-                    if (!Utils.isInInterval(workingInterval, adjustedX)) break;
-                    for (int y = 0; y < 2; y++) {
-                        BlockPos pos = lowerMapCorner.add(adjustedX, y, z);
-                        BlockState state = mc.world.getBlockState(pos);
-                        if (!action.accept(adjustedX, z, y, state, null)) {
-                            // Stop future iterations if false is returned
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     @FunctionalInterface
     private interface MapBlockAction {

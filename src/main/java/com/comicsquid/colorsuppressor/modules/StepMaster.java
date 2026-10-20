@@ -169,7 +169,7 @@ final class StepMaster {
             beginStepMapFill();
         } else {
             // No map in inventory: walk to the map chest and fetch one
-            Pair<BlockPos, Vec3d> mapChest = mod.getBestChest(Items.CARTOGRAPHY_TABLE);
+            Pair<BlockPos, Vec3d> mapChest = mod.restock.getBestChest(Items.CARTOGRAPHY_TABLE);
             if (mapChest != null && mapChest.getLeft() != null) {
                 stepMasterStage = StepMasterStage.FETCH_MAP;
                 stepMasterWaitTicks = 0;
@@ -494,19 +494,19 @@ final class StepMaster {
         };
         if (waitSignal != null) stepWaitTick(waitSignal);
         // Process any pending chest-inventory response FIRST - the step scheduler's early
-        // return skips the legacy mod.toBeHandledInvPacket block, so without this the master
+        // return skips the legacy mod.restock.toBeHandledInvPacket block, so without this the master
         // opens a chest and never takes the items (the "empty map not withdrawn" bug)
-        if (mod.toBeHandledInvPacket != null) {
+        if (mod.restock.toBeHandledInvPacket != null) {
             if (mod.timeoutTicks > 0) {
                 mod.timeoutTicks--;
                 Utils.setForwardPressed(false);
                 return;
             }
-            mod.handleInventoryPacket(mod.toBeHandledInvPacket);
-            mod.toBeHandledInvPacket = null;
-            if (mod.closeNextInvPacket) {
+            mod.restock.handleInventoryPacket(mod.restock.toBeHandledInvPacket);
+            mod.restock.toBeHandledInvPacket = null;
+            if (mod.restock.closeNextInvPacket) {
                 if (mc.currentScreen != null) mc.player.closeHandledScreen();
-                mod.closeNextInvPacket = false;
+                mod.restock.closeNextInvPacket = false;
             }
             return;
         }
@@ -774,10 +774,10 @@ final class StepMaster {
                 // After the map is taken, tickStepMaster sees FETCH_MAP + an empty map and
                 // chains to beginStepMapFill (walk to the fill spot and use it).
                 if (stepMasterStage == StepMasterStage.FETCH_MAP) {
-                    Pair<BlockPos, Vec3d> chest = mod.getBestChest(Items.CARTOGRAPHY_TABLE);
+                    Pair<BlockPos, Vec3d> chest = mod.restock.getBestChest(Items.CARTOGRAPHY_TABLE);
                     if (chest != null && chest.getLeft() != null) {
                         mod.state = State.AwaitMapChestResponse;
-                        mod.interactWithBlock(chest.getLeft());
+                        mod.restock.interactWithBlock(chest.getLeft());
                     } else {
                         abortStepMaster("map chest not found");
                     }
