@@ -665,7 +665,7 @@ public class StepCheckered extends Module implements MapPrinter {
         "mineBegin", "mineEnd", "batchBegin", "printDone", "printDone2",
         "awaitBreak2", "break2Done", "breakAllBegin", "breakAllDone", "stepClosingReady", "stepClosingWait",
         "stepClosingDone", "batchExit", "sweepTick", "fullSweepStart", "fullSweepCenter", "fullSweepTick",
-        "fullSweepDone", "resetStation", "resetPass", "verifyWalk");
+        "fullSweepDone", "resetStation", "resetPass");
     private static final int STEP_DWELL_TICKS = 80;
 
     public StepCheckered() {
@@ -2348,50 +2348,6 @@ public class StepCheckered extends Module implements MapPrinter {
                         checkpoints.addFirst(new Pair(new Vec3d(lItem.getX(), lItem.getY(), lItem.getZ()), new Pair("resetStation", null)));
                         state = State.Mining;  // Mining: feed stays active, blocks in path get broken
                     }
-                    return;
-                }
-                case "verifyWalk": {
-                    // Centre-walk station: whole box is in render distance from here.
-                    resetLadderCol = 32;   // verify phase - interrupts resume the walk
-                    ItemStack vwPick = mc.player.getInventory().getStack(8);
-                    if (!vwPick.isIn(ItemTags.PICKAXES) || ToolUtils.getRemainingDamage(vwPick) < minDurability.get()) {
-                        if (!hasGoodPickaxe()) { pauseForRestockTrip(true); return; }
-                        movePickaxeToSlot8();
-                    }
-                    // SCOPED scan (user rule): only the PRINTED columns (+1 safety col
-                    // east) are checked - never the whole map. Batches print west->east,
-                    // so the scope start is always col 0.
-                    int scopeEndX = Math.min(127, 4 * (Math.min(31, resetLadderEndCol) + 1) + 3);
-                    int[] found = printBoxContentRange(0, scopeEndX);
-                    int[] boxCensus = itemCensusInArea(lowerMapCorner.getX() - RESET_ITEM_MARGIN,
-                        lowerMapCorner.getX() + scopeEndX + RESET_ITEM_MARGIN,
-                        lowerMapCorner.getZ() - 1 - RESET_ITEM_MARGIN, lowerMapCorner.getZ() + 127 + RESET_ITEM_MARGIN);
-                    info("§6[RESET-VERIFY]§7 verify station z=" + (mc.player.getBlockZ() - lowerMapCorner.getZ())
-                        + ": blocks/ready-items scan cols 0-" + (scopeEndX / 4) + " " + (found != null ? "FOUND cols " + found[0] + "-" + found[1] : "clean")
-                        + " §7scope+m" + RESET_ITEM_MARGIN + " item census[ready=" + boxCensus[0] + " falling=" + boxCensus[1]
-                        + " pickupDelay=" + boxCensus[2] + " owned=" + boxCensus[3] + "]");
-                    if (found != null) {
-                        // Content identified: ladder-sweep exactly those columns, then
-                        // the centre walk runs again from the top - complete only on a
-                        // fully clean walk
-                        resetLadderCol = found[0];
-                        resetLadderEndCol = found[1];
-                        resetLadderSeg = 0;
-                        info("§eVerify walk found content in cols " + found[0] + "-" + found[1] + " - ladder sweep, then re-verify.");
-                        checkpoints.clear();
-                        queueResetLadder(found[0], 0);   // appends the verify walk again
-                        prependNorthCorridor(checkpoints.getFirst().getLeft().x);
-                        state = State.Mining;
-                        breakStage = 4;
-                        return;
-                    }
-                    if (boxCensus[0] + boxCensus[1] + boxCensus[2] > 0) {
-                        warning("§6[RESET-VERIFY]§e verify station passed but " + (boxCensus[0] + boxCensus[1] + boxCensus[2])
-                            + " drops are on/in flight over the box (ready=" + boxCensus[0] + " falling=" + boxCensus[1]
-                            + " pickupDelay=" + boxCensus[2] + ") - the block scan cannot see "
-                            + (boxCensus[1] + boxCensus[2]) + " of them (filtered).");
-                    }
-                    // Clean station: queue advances (next station or deposit + complete)
                     return;
                 }
                 case "fullSweepDone":
@@ -4442,91 +4398,28 @@ public class StepCheckered extends Module implements MapPrinter {
                 checkpoints.add(new Pair(new Vec3d(sx, lowerMapCorner.getY(), sz), new Pair("resetPass", anchor)));
             }
         }
-        // Final verification: the centre walk (whole box enters render distance)
+        // Reset finish: deposit + park at the north staging point
         queueVerifyWalk();
     }
 
-    /** Appends the FINAL verification: a walk down the map's centre column (x = corner+66)
-     *  with a whole-box content scan at each of the 5 stations, ending in deposit +
-     *  complete. Any finding re-scopes a ladder sweep (see the verifyWalk handler). */
+    /** Appends the RESET FINISH (user rule, 2026-10-20): NO verify-walk stations -
+     *  the ladder's per-segment gates already confirm every segment clean (census with
+     *  the bounce margins) before it advances, so a separate verification walk is
+     *  redundant checkpoints. After the ladder: deposit the collected blocks, then the
+     *  slave PARKS at the north staging point where every run starts. Exit north via
+     *  the corridor (never a diagonal beeline across the box). */
     private void queueVerifyWalk() {
-        // Stations sit on the SCOPED columns' centre line (not the whole-box x=66):
-        // the walk only needs render distance over the printed columns.
-        double centreX = lowerMapCorner.getX() + (4.0 * resetLadderCol + 4.0 * resetLadderEndCol + 3.0) / 2.0;
-        Vec3d lastStation = null;
-        for (int seg = 0; seg < RESET_SEG_CENTER_Z.length; seg++) {
-            double wz = lowerMapCorner.getZ() + RESET_SEG_CENTER_Z[seg] + 0.5;
-            lastStation = new Vec3d(centreX, lowerMapCorner.getY(), wz);
-            checkpoints.add(new Pair(lastStation, new Pair("verifyWalk", null)));
-        }
         Pair<BlockPos, Vec3d> doneChest = getBestDepositChest();
         if (doneChest != null) {
             checkpoints.add(new Pair(doneChest.getRight(), new Pair("depositBuilding", doneChest.getLeft())));
         }
-        checkpoints.add(new Pair(lastStation, new Pair("fullSweepDone", null)));
+        Vec3d park = new Vec3d(lowerMapCorner.getX() + 2.5, lowerMapCorner.getY(), lowerMapCorner.getZ() - 2);
+        checkpoints.add(new Pair(park, new Pair("fullSweepDone", null)));
+        prependNorthCorridor(doneChest != null ? doneChest.getRight().x : park.x);
     }
 
-    /** {minCol, maxCol} of columns containing content within the given BLOCK-x window
-     *  (items use the +-4 bounce margin), or null when the window is completely empty.
-     *  Scope +-1 col around the printed batches: the RESET never walks or scans the
-     *  whole map (user rule, 2026-10-20). */
-    private int[] printBoxContentRange(int x0, int x1) {
-        int min = Integer.MAX_VALUE, max = Integer.MIN_VALUE;
-        for (int x = Math.max(0, x0); x <= Math.min(127, x1); x++) {
-            for (int z = -1; z < 128; z++) {
-                for (int y = 0; y <= 3; y++) {
-                    if (!miningBlockState(new BlockPos(lowerMapCorner.getX() + x,
-                        lowerMapCorner.getY() + y, lowerMapCorner.getZ() + z)).isAir()) {
-                        min = Math.min(min, x / 4); max = Math.max(max, x / 4);
-                        break;
-                    }
-                }
-            }
-        }
-        for (Entity entity : mc.world.getEntities()) {
-            if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!itemEntity.groundCollision || itemEntity.cannotPickup() || itemEntity.getOwner() != null) continue;
-            if (itemEntity.getX() < lowerMapCorner.getX() + Math.max(0, x0) - RESET_ITEM_MARGIN
-                || itemEntity.getX() > lowerMapCorner.getX() + Math.min(127, x1) + RESET_ITEM_MARGIN) continue;
-            if (itemEntity.getZ() < lowerMapCorner.getZ() - 1 - RESET_ITEM_MARGIN || itemEntity.getZ() > lowerMapCorner.getZ() + 127 + RESET_ITEM_MARGIN) continue;
-            if (itemEntity.getY() < lowerMapCorner.getY() - 3 || itemEntity.getY() > lowerMapCorner.getY() + 5) continue;
-            int col = Math.max(0, Math.min(31, (int) Math.floor(itemEntity.getX() - lowerMapCorner.getX()) / 4));
-            min = Math.min(min, col); max = Math.max(max, col);
-        }
-        return min == Integer.MAX_VALUE ? null : new int[]{min, max};
-    }
-
-    /** Whole-box scan: {minCol, maxCol} of columns containing any block or ground drop,
-     *  or null when the print box is completely empty. */
-    private int[] printBoxContentRange() {
-        int min = Integer.MAX_VALUE, max = Integer.MIN_VALUE;
-        for (int x = 0; x < 128; x++) {
-            for (int z = -1; z < 128; z++) {
-                for (int y = 0; y <= 3; y++) {
-                    if (!miningBlockState(new BlockPos(lowerMapCorner.getX() + x,
-                        lowerMapCorner.getY() + y, lowerMapCorner.getZ() + z)).isAir()) {
-                        min = Math.min(min, x / 4); max = Math.max(max, x / 4);
-                        break;
-                    }
-                }
-            }
-        }
-        for (Entity entity : mc.world.getEntities()) {
-            if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!itemEntity.groundCollision || itemEntity.cannotPickup() || itemEntity.getOwner() != null) continue;
-            // ITEM MARGIN: drops skid outside the box at its edges — scan the margin band
-            // too, but clamp the re-scoped ladder to columns 0-31: the boundary columns'
-            // own ±RESET_ITEM_MARGIN arrival scans reach these drops, so the walk never
-            // has to route outside the print box.
-            if (itemEntity.getX() < lowerMapCorner.getX() - RESET_ITEM_MARGIN || itemEntity.getX() > lowerMapCorner.getX() + 127 + RESET_ITEM_MARGIN) continue;
-            if (itemEntity.getZ() < lowerMapCorner.getZ() - 1 - RESET_ITEM_MARGIN || itemEntity.getZ() > lowerMapCorner.getZ() + 127 + RESET_ITEM_MARGIN) continue;
-            if (itemEntity.getY() < lowerMapCorner.getY() - 3 || itemEntity.getY() > lowerMapCorner.getY() + 5) continue;
-            int col = Math.max(0, Math.min(31, (int) Math.floor(itemEntity.getX() - lowerMapCorner.getX()) / 4));
-            min = Math.min(min, col); max = Math.max(max, col);
-        }
-        return min == Integer.MAX_VALUE ? null : new int[]{min, max};
-    }
-
+    
+    
     private int resetZToSeg(int relZ) {
         for (int seg = RESET_SEG_START.length - 1; seg >= 0; seg--) if (relZ >= RESET_SEG_START[seg]) return seg;
         return 0;
