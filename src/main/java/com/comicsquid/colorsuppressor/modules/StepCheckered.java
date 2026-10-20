@@ -6248,13 +6248,15 @@ public class StepCheckered extends Module implements MapPrinter {
         };
         table.row();
 
-        // ---- START ALL button: starts the run on BOTH bots simultaneously ----
-        // The master begins its lifecycle (map fill + checkpoint walks) and the slave
-        // enters standby ready for the master's TCP commands. Both modules must be
-        // enabled and the slave must be registered via TCP.
-        WButton startAllButton = table.add(theme.button("§aSTART ALL")).widget();
+        // ---- Start All / Resume All button: starts OR resumes the run on BOTH bots ----
+        // Fresh runs begin at start-batch; when the progress file exists the run
+        // resumes at the in-progress batch with the same pinned map (crash/restart
+        // recovery). The master begins its lifecycle and the slave enters standby
+        // ready for the master's TCP commands.
+        WButton startAllButton = table.add(theme.button("§aStart All / Resume All")).widget();
         startAllButton.action = () -> {
-            info("§aSTART ALL pressed.");
+            int resume = cachedResumeBatch > 0 ? cachedResumeBatch : loadStepProgress();
+            info("§aSTART ALL pressed" + (resume > 0 ? " - resuming from batch " + resume : "") + ".");
             if (!isActive()) {
                 info("§7Enabling the module first...");
                 toggle();
