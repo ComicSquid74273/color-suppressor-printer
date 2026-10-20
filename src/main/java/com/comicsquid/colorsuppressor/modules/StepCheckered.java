@@ -568,6 +568,7 @@ public class StepCheckered extends Module implements MapPrinter {
     String lastMasterCpLog;                                         // dedup for the always-on master checkpoint log
     int stepSavedProgressMapId = -1;                                // map id persisted with the progress file (crash/restart resume)
     long stepBatchStartMs, stepPhaseStartMs;                        // per-batch phase timing (logged at completion)
+    int cachedResumeBatch = -1;                                     // in-memory mirror of the progress file's batch (idle render + resume UI)
     long stepBuildMs, stepW1Ms, stepBreak2Ms, stepW2Ms, stepBreakAllMs;
     String resetStallSig;                                           // reset arrival stall detector: last arrival state signature
     int resetStallRounds;
@@ -864,6 +865,7 @@ public class StepCheckered extends Module implements MapPrinter {
     @Override
     public void onActivate() {
         lastTickTime = System.currentTimeMillis();
+        cachedResumeBatch = loadStepProgress();   // idle render + resume show where the run actually is
         if (!activationReset.get() && checkpoints != null) {
             return;
         }
@@ -3251,6 +3253,7 @@ public class StepCheckered extends Module implements MapPrinter {
             java.io.FileWriter writer = new java.io.FileWriter(file);
             writer.write("{\"batch\":" + batch + ",\"mapId\":" + stepWorkingMapId + "}\n");
             writer.close();
+            cachedResumeBatch = batch;
         } catch (Exception e) {
             if (debugPrints.get()) warning("Could not save step progress: " + e.getMessage());
         }
@@ -3288,6 +3291,7 @@ public class StepCheckered extends Module implements MapPrinter {
     }
 
     private void clearStepProgress() {
+        cachedResumeBatch = -1;
         try {
             stepProgressFile().delete();
         } catch (Exception ignored) {
@@ -5353,7 +5357,12 @@ public class StepCheckered extends Module implements MapPrinter {
     /** The batch the renderer shows: the ACTIVE batch while a run is in progress,
      *  otherwise the manually selected render-batch setting (preview mode). */
     private int effectiveRenderBatch() {
-        return currentBatch >= 0 ? currentBatch : renderBatch.get();
+        if (currentBatch >= 0) return currentBatch;
+        // No active run: render the SAVED PROGRESS batch (where the run actually is /
+        // will resume), not the manual preview default - live complaint 2026-10-20:
+        // after re-enable the render showed batch 0 until START ALL armed the run.
+        if (cachedResumeBatch > 0) return Math.min(62, cachedResumeBatch);
+        return renderBatch.get();
     }
             /** Shared: nearest ground-collided pickup-able ItemEntity near the player, within the
      *  print box plus a margin (items bounce outside the exact box when blocks break).
