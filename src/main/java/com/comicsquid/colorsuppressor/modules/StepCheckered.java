@@ -2844,22 +2844,6 @@ public class StepCheckered extends Module implements MapPrinter {
                 }
             }
             placeHoldTicks = 0;
-        } else if (state.equals(State.Mining) && breakStage != 0 && currentBuildPlan != null
-            && !checkpoints.isEmpty()) {
-            if (breakHoldSuppression > 0) {
-                breakHoldSuppression--;
-            } else if (getNextBatchBreakPos() != null) {
-                breakHoldTicks++;
-                if (breakHoldTicks > 200) {
-                    breakHoldSuppression = 200;
-                    breakHoldTicks = 0;
-                    warning("§eBreak pace watchdog: held 10s on an unbroken block - advancing past it.");
-                    return false;
-                }
-                return true;
-            } else {
-                breakHoldTicks = 0;
-            }
         } else {
             placeHoldTicks = 0;
             breakHoldTicks = 0;
