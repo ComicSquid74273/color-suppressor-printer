@@ -2546,45 +2546,60 @@ public class StepCheckered extends Module implements MapPrinter {
         // upcoming set; the first missing material swaps in from the inventory,
         // evicting an EMPTY slot if one exists, else a slot not in the set.
         if (state.equals(State.Walking) && breakStage == 0 && currentBuildPlan != null && rateTick == 10) {
-            java.util.LinkedHashSet<Item> upcoming = new java.util.LinkedHashSet<>();
-            int kept = 0;
+            // FIRST-USE-Z LOOKAHEAD (v3, live 2026-10-21: v1/v2 built 'upcoming' from
+            // HashMap iteration order = RANDOM blocks, thrashing the same material in and
+            // out - 'Green Terracotta into slot 0' 3x in the log). Correct algorithm:
+            // walking order is N->S, so scan the plan's z-WINDOW AHEAD [botZ-2, botZ+24]
+            // and record each material's FIRST-USE z. Bring in the missing material with
+            // the SMALLEST first-use z; evict the hotbar resident whose first-use z is
+            // the LARGEST (absent from the window = infinity). Optimal single-swap policy.
+            java.util.HashMap<Item, Integer> firstUseZ = new java.util.HashMap<>();
+            int botZNow = mc.player.getBlockZ();
             for (Map.Entry<BlockPos, Block> ue : currentBuildPlan.entrySet()) {
-                if (kept >= 12) break;
                 BlockPos up = ue.getKey();
+                int uz = up.getZ();
+                if (uz < botZNow - 2 || uz > botZNow + 24) continue;   // the walking window
                 if (miningBlockState(up).isAir()) continue;
-                if (up.getZ() < mc.player.getBlockZ()) continue;   // ahead only (N->S)
-                upcoming.add(ue.getValue().asItem());
-                kept++;
+                Item uItem = ue.getValue().asItem();
+                Integer prev = firstUseZ.get(uItem);
+                if (prev == null || uz < prev) firstUseZ.put(uItem, uz);
             }
-            for (Item upItem : upcoming) {
+            // pick the missing upcoming material with the smallest first-use z
+            Item bringIn = null;
+            int bringInZ = Integer.MAX_VALUE;
+            for (java.util.Map.Entry<Item, Integer> fe : firstUseZ.entrySet()) {
                 boolean inHotbar = false;
                 for (int hs : availableHotBarSlots) {
                     ItemStack hStack = mc.player.getInventory().getStack(hs);
-                    if (!hStack.isEmpty() && hStack.getItem().equals(upItem)) { inHotbar = true; break; }
+                    if (!hStack.isEmpty() && hStack.getItem().equals(fe.getKey())) { inHotbar = true; break; }
                 }
                 if (inHotbar) continue;
+                if (fe.getValue() < bringInZ) { bringInZ = fe.getValue(); bringIn = fe.getKey(); }
+            }
+            if (bringIn != null) {
                 int srcSlot = -1;
                 for (int is = 9; is < 36 && srcSlot == -1; is++) {
                     ItemStack iStack = mc.player.getInventory().getStack(is);
-                    if (!iStack.isEmpty() && iStack.getItem().equals(upItem)) srcSlot = is;
+                    if (!iStack.isEmpty() && iStack.getItem().equals(bringIn)) srcSlot = is;
                 }
-                if (srcSlot == -1) continue;
-                int evictSlot = -1;
-                int evictFallback = -1;
-                for (int hs : availableHotBarSlots) {
-                    ItemStack eStack = mc.player.getInventory().getStack(hs);
-                    if (eStack.isEmpty()) { evictSlot = hs; break; }
-                    boolean eNeeded = false;
-                    for (Item otherUp : upcoming) {
-                        if (eStack.getItem().equals(otherUp)) { eNeeded = true; break; }
+                if (srcSlot != -1) {
+                    // evict the resident with the LARGEST first-use z (empty slot wins instantly)
+                    int evictSlot = -1;
+                    int worstZ = Integer.MIN_VALUE;
+                    for (int hs : availableHotBarSlots) {
+                        ItemStack eStack = mc.player.getInventory().getStack(hs);
+                        if (eStack.isEmpty()) { evictSlot = hs; worstZ = Integer.MAX_VALUE; break; }
+                        Integer eZ = firstUseZ.get(eStack.getItem());
+                        int eDist = (eZ == null) ? Integer.MAX_VALUE : eZ;
+                        if (eDist > worstZ) { worstZ = eDist; evictSlot = hs; }
                     }
-                    if (!eNeeded && evictFallback == -1) evictFallback = hs;
+                    // never evict a resident that is needed SOONER than the bring-in
+                    if (evictSlot != -1 && worstZ >= bringInZ) {
+                        Utils.performSwap(srcSlot, evictSlot);
+                        info("§7Hotbar rolling: §f" + bringIn.getName().getString() + "§7 swapped in (slot " + evictSlot
+                            + ", first use ~" + (bringInZ - botZNow) + " rows ahead).");
+                    }
                 }
-                if (evictSlot == -1) evictSlot = evictFallback;
-                if (evictSlot == -1) break;
-                Utils.performSwap(srcSlot, evictSlot);
-                info("§7Hotbar rolling: §f" + upItem.getName().getString() + "§7 swapped in (slot " + evictSlot + ").");
-                break;   // one swap per check - never stalls the pass
             }
         }
         // Range gate uses EYE distance - the same metric the target pickers use. A
