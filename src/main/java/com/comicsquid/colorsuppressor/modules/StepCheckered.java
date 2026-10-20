@@ -5029,10 +5029,9 @@ public class StepCheckered extends Module implements MapPrinter {
      *  south along the lane. Without this, the bot beelined diagonally from the north
      *  chest straight across the printed box to the route's first (mid/south) position
      *  (user callout, live 2026-10-20). */
-    private void prependNorthReEntry() {
-        if (checkpoints.isEmpty()) return;
-        double laneX = checkpoints.getFirst().getLeft().x;
-        checkpoints.addFirst(new Pair(new Vec3d(laneX, lowerMapCorner.getY(), lowerMapCorner.getZ() - 2), new Pair("sprint", null)));
+    private void insertNorthReEntry(int index) {
+        checkpoints.add(Math.max(0, Math.min(index, checkpoints.size())), new Pair(
+            new Vec3d(currentWalkLaneX(), lowerMapCorner.getY(), lowerMapCorner.getZ() - 2), new Pair("sprint", null)));
     }
 
     private void pauseForRestockTrip(boolean needPickaxe) {
@@ -5066,7 +5065,7 @@ public class StepCheckered extends Module implements MapPrinter {
         }
         if (fullSweepActive) {
             // RESET interrupted by the emergency: resume the LADDER at the current
-            // station (or the final verify once the ladder is done) - never a batch route
+            // station - never a batch route
             checkpoints.clear();
             if (resetLadderCol < 32) {
                 queueResetLadder(resetLadderCol, resetLadderSeg);
@@ -5074,10 +5073,15 @@ public class StepCheckered extends Module implements MapPrinter {
                 queueVerifyWalk();
             }
         } else {
-            resumeBatchRoute(savedStage);
+            int chestSectionSize = checkpoints.size();   // chest trip queued above
+            resumeBatchRoute(savedStage);                // route appended at the tail
+            // Re-entry BETWEEN chest and route: corridor back to the batch lane's
+            // north staging, then south along the lane (head-insertion landed it
+            // BEFORE the chest visit and the return leg stayed a diagonal beeline -
+            // live 2026-10-20 mid-print emergency restock).
+            insertNorthReEntry(chestSectionSize);
         }
-        // Re-enter through the north checkpoint, then exit north via the corridor
-        prependNorthReEntry();
+        // Exit north via the corridor (head legs)
         prependNorthCorridor(checkpoints.isEmpty() ? lowerMapCorner.getX() + 2.5 : checkpoints.getFirst().getLeft().x);
         state = State.Walking;
         Utils.setForwardPressed(false);
@@ -5132,15 +5136,15 @@ public class StepCheckered extends Module implements MapPrinter {
         info("§eInventory full - depositing building blocks before continuing the break.");
         breakStage = 0;
         checkpoints.clear();
-        resumeBatchRoute(4);
-        prependNorthReEntry();
+        // Explicit order: chest visit -> north re-entry on the batch lane -> resumed
+        // route; exit legs prepended last (north on the lane, then the corridor).
         Pair<BlockPos, Vec3d> chest = getBestDepositChest();
         if (chest != null) {
-            checkpoints.addFirst(new Pair(chest.getRight(), new Pair("depositBuilding", chest.getLeft())));
-            prependNorthCorridor(chest.getRight().x);
-        } else {
-            prependNorthCorridor(checkpoints.isEmpty() ? lowerMapCorner.getX() + 2.5 : checkpoints.getFirst().getLeft().x);
+            checkpoints.add(new Pair(chest.getRight(), new Pair("depositBuilding", chest.getLeft())));
         }
+        insertNorthReEntry(checkpoints.size());
+        resumeBatchRoute(4);
+        prependNorthCorridor(chest != null ? chest.getRight().x : currentWalkLaneX());
         state = State.Walking;
     }
 
