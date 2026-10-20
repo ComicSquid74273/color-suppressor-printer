@@ -577,7 +577,8 @@ public class StepCheckered extends Module implements MapPrinter {
     int stepSavedProgressMapId = -1;                                // map id persisted with the progress file (crash/restart resume)
     long stepBatchStartMs, stepPhaseStartMs;                        // per-batch phase timing (logged at completion)
     int cachedResumeBatch = -1;
-    int mapHoldWarnCooldown;                                        // throttle for the map-hold guard warning                                     // in-memory mirror of the progress file's batch (idle render + resume UI)
+    int mapHoldWarnCooldown;                                        // throttle for the map-hold guard warning
+    int resetPendingScope = -2;                                     // persisted RESET scope (-2 unread, -1 none, >=0 resume)                                     // in-memory mirror of the progress file's batch (idle render + resume UI)
     long stepBuildMs, stepW1Ms, stepBreak2Ms, stepW2Ms, stepBreakAllMs;
     String resetStallSig;                                           // reset arrival stall detector: last arrival state signature
     int resetStallRounds;
@@ -1002,6 +1003,7 @@ public class StepCheckered extends Module implements MapPrinter {
             return;
         }
         cachedResumeBatch = loadStepProgress();   // idle render + resume show where the run actually is
+        resetPendingScope = loadResetPending();
 
         if (!prepareNextMapFile()) return;
         info("§aBuilding: §b" + mapFile.getName());
@@ -1432,6 +1434,23 @@ public class StepCheckered extends Module implements MapPrinter {
         }
 
         if (SlaveSystem.isSlave) {
+            // RESET RESUME (user rule): a disable/crash mid-RESET must not skip it.
+            // Standing by with a persisted reset scope -> re-arm the scoped ladder.
+            if (resetPendingScope >= 0 && state == State.StandBy && checkpoints.isEmpty()
+                && lowerMapCorner != null && !fullSweepActive) {
+                int scope = resetPendingScope;
+                info("§eRESET pending (scope cols 0-" + scope + ") - resuming the reset after re-enable.");
+                resetLadderEndCol = Math.min(31, Math.max(0, scope));
+                resetLadderCol = 0;
+                resetLadderSeg = mc.player.getBlockZ() - lowerMapCorner.getZ() > 64 ? 4
+                    : (mc.player.getBlockZ() - lowerMapCorner.getZ() > 26 ? 2 : 0);
+                fullSweepBudget = 600;
+                queueResetLadder(resetLadderCol, 0);
+                prependNorthCorridor(checkpoints.getFirst().getLeft().x);
+                state = State.Mining;
+                breakStage = 4;
+                return;
+            }
             processPendingStepCommands();
         } else if (stepMasterStage != StepMasterStage.IDLE) {
             tickStepMaster();
@@ -2382,6 +2401,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 }
                 case "fullSweepDone":
                     fullSweepActive = false;
+                    clearResetPending();   // the RESET survived to completion
                     state = State.StandBy;
                     Utils.setForwardPressed(false);
                     SlaveSystem.sendMessageToMaster("step:done:" + Math.max(currentBatch, 0));
@@ -3225,6 +3245,45 @@ public class StepCheckered extends Module implements MapPrinter {
 
     private File stepProgressFile() {
         return new File(new File(mapFolder, "_configs"), "step_checkered_progress.json");
+    }
+
+    /** RESET-IN-FLIGHT persistence: a module disable/crash mid-RESET must RESUME the
+     *  reset on re-enable (user rule, 2026-10-20: "disable+re-enable after RESET ALL
+     *  skipped the reset instead of completing it"). The scope is written when the
+     *  ladder arms and deleted when it completes (or a new run supersedes it). */
+    private File stepResetPendingFile() {
+        return new File(new File(mapFolder, "_configs"), "step_checkered_reset.json");
+    }
+
+    private void saveResetPending(int scopeCol) {
+        try {
+            stepResetPendingFile().getParentFile().mkdirs();
+            java.io.FileWriter writer = new java.io.FileWriter(stepResetPendingFile());
+            writer.write("{\"scope\":" + scopeCol + "}\n");
+            writer.close();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private int loadResetPending() {
+        try {
+            File file = stepResetPendingFile();
+            if (!file.exists() || mapFolder == null) return -1;
+            String json = new String(java.nio.file.Files.readAllBytes(file.toPath()));
+            int start = json.indexOf("\"scope\":") + 9;
+            int end = json.indexOf("}", start);
+            return Integer.parseInt(json.substring(start, end).trim());
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private void clearResetPending() {
+        resetPendingScope = -1;
+        try {
+            if (mapFolder != null) stepResetPendingFile().delete();
+        } catch (Exception ignored) {
+        }
     }
 
     /** mmm? no - XmYYs style for the per-batch phase timing summary. */
@@ -4240,6 +4299,7 @@ public class StepCheckered extends Module implements MapPrinter {
         batchPassRetries = 0;
         placementAttempts.clear();
         collectSkips.clear();
+        clearResetPending();   // a new run supersedes any interrupted reset
         sweepReArmSig = null;
         sweepWaitRounds = 0;
         sweepWaitLogged = false;
@@ -4367,6 +4427,7 @@ public class StepCheckered extends Module implements MapPrinter {
                 batchPassRetries = 0;
                 placementAttempts.clear();
                 collectSkips.clear();
+                clearResetPending();
                 sweepReArmSig = null;
                 sweepWaitRounds = 0;
                 sweepWaitLogged = false;
@@ -4507,6 +4568,7 @@ public class StepCheckered extends Module implements MapPrinter {
         breakStage = 0;
         printRepairPending = false;
         placementAttempts.clear();
+        clearResetPending();
         // A new run kills any leftover RESET state - a stale fullSweepActive here made
         // the first mid-run supply run resurrect the dead reset ladder over the priming
         fullSweepActive = false;
@@ -4725,6 +4787,8 @@ public class StepCheckered extends Module implements MapPrinter {
         int scopeCol = Math.min(31, Math.max(liveBatch, Math.max(0, progressBatch)) + 1);
         resetLadderEndCol = scopeCol;
         resetLadderCol = 0;   // batches print west->east: everything up to the scope col
+        resetPendingScope = scopeCol;
+        saveResetPending(scopeCol);   // survive disable/crash: re-enable resumes the reset
         info("§7RESET scoped to cols 0-" + scopeCol + " (live batch " + liveBatch
             + ", progress batch " + progressBatch + ") - no whole-map pass.");
         // Start from the segment closest to the bot's current position (not always 0):
