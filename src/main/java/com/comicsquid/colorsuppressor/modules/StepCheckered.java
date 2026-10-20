@@ -3593,41 +3593,38 @@ public class StepCheckered extends Module implements MapPrinter {
                     info("§aBatch 0: floor recorded - tops half requested.");
                     return;
                 }
-                // Standard flow (doc §4 steps 2-3-5): W1 recorded the batch -> W2
-                // returns IMMEDIATELY on the SAME LANE (the suppression return). The
-                // master NEVER walks further east than the recording lane while
-                // holding the map - the east hop to 2k+129 happens only AFTER both
-                // walks, as the stationary wait (doc §5: "never move the master over
-                // earlier recorded lanes - lanes within ~125.5 re-record as terrain";
-                // the east-lane return wiped every completed pair, live-measured
-                // 2026-10-20 via mapPixels).
+                // Standard flow: walk 1 recorded the batch -> break(2) NOW. W2 (the
+                // S->N suppression walk) waits until the slave COMPLETES break(2)
+                // (user rule, live 2026-10-20): safe because W2 rides the EAST lane
+                // 2k+129 - 127.5+ blocks from the west tops, beyond dominant record
+                // range - so the already-recorded west pixels cannot be re-recorded.
                 stepStowMap();
                 stepW1Ms = System.currentTimeMillis() - stepPhaseStartMs;
                 stepPhaseStartMs = System.currentTimeMillis();
-                stepMasterStage = StepMasterStage.BATCH_WALK_B;
-                stepStartSweep(2 * stepMasterBatch + 127, 4, 0);   // W2: SAME lane, S->N
-                info("§aBatch " + stepMasterBatch + ": walk 1 complete - W2 suppression return on the same lane.");
+                stepMasterBreak2Sent = true;
+                stepSendToSlave("break2");
+                stepMasterStage = StepMasterStage.WAIT_BREAK_2;
+                stepMasterWaitTicks = 0;
+                stepQueueWaitHere("stepBreak2Point");
+                info("§aBatch " + stepMasterBatch + ": walk 1 complete - break(2) requested; W2 follows its completion.");
             }
             case BATCH_WALK_B -> {
-                // W2 COMPLETE (same-lane return done). Batch 0 split: NO break(2) -
-                // breakall directly. Standard flow (doc §4 step 4): break(2) comes
-                // AFTER both walks - request it now, wait for break2done at the
-                // east-hopped wait position (cp(k+2), the frozen zone).
+                // W2 COMPLETE (and break(2) already completed before W2 started).
+                // Batch 0 split flow: NO break(2) exists - breakall directly.
+                // Standard flow: break2done has arrived (W2 was gated on it), so
+                // break-all is requested immediately.
                 stepStowMap();
                 stepW2Ms = System.currentTimeMillis() - stepPhaseStartMs;
                 stepPhaseStartMs = System.currentTimeMillis();
+                stepMasterStage = StepMasterStage.WAIT_BREAK_ALL;
+                stepMasterWaitTicks = 0;
                 boolean batch0Split = stepMasterBatch == 0 && batch0SplitBuild.get() && stepMasterBreak2Sent;
-                if (batch0Split && !stepMasterBreakAllSent) {
+                if ((batch0Split || stepSlaveBreak2DoneBatch == stepMasterBatch) && !stepMasterBreakAllSent) {
                     stepMasterBreakAllSent = true;
-                    stepMasterStage = StepMasterStage.WAIT_BREAK_ALL;
-                    stepMasterWaitTicks = 0;
                     stepSendToSlave("breakall");
-                    info("§aBatch " + stepMasterBatch + ": both walks complete - break-all requested.");
+                    info("§aBatch " + stepMasterBatch + ": W2 complete - break-all requested.");
                 } else {
-                    stepMasterStage = StepMasterStage.WAIT_BREAK_2;
-                    stepMasterWaitTicks = 0;
-                    stepQueueWaitHere("stepBreak2Point");
-                    info("§aBatch " + stepMasterBatch + ": both walks complete - break(2) requested next.");
+                    requeueStepWait(stepMasterBatch + 2, "stepBreakAllPoint");
                 }
             }
             case CLOSING_WALK -> {
@@ -3783,18 +3780,20 @@ public class StepCheckered extends Module implements MapPrinter {
         // S->N from that end and ends north, where the next batch's W1 starts.
         switch (stepMasterStage) {
             case WAIT_BREAK_2 -> {
-                // break(2) in progress (both walks are DONE - W2 ran right after W1
-                // on the same lane). On break2done: break-all.
+                // break(2) in progress. Sent at W1's completion (fallback: here).
+                // When the slave reports break2done, W2 (the S->N suppression walk)
+                // starts - NEVER before break(2) completes (user rule, live 2026-10-20).
                 if (!stepMasterBreak2Sent) {
                     stepMasterBreak2Sent = true;
                     stepSendToSlave("break2");
-                    info("§aBatch " + stepMasterBatch + ": break(2) requested (after both walks).");
+                    info("§aBatch " + stepMasterBatch + ": break(2) requested.");
                 } else if (stepSlaveBreak2DoneBatch == stepMasterBatch) {
                     stepBreak2Ms = System.currentTimeMillis() - stepPhaseStartMs;
                     stepPhaseStartMs = System.currentTimeMillis();
-                    stepMasterStage = StepMasterStage.WAIT_BREAK_ALL;
-                    stepMasterWaitTicks = 0;
-                    stepQueueWaitHere("stepBreakAllPoint");
+                    stepMasterStage = StepMasterStage.BATCH_WALK_B;
+                    int w2Lane = 2 * (stepMasterBatch + 1) + 127;
+                    stepStartSweep(w2Lane, 4, 0);   // W2: fixed S->N
+                    info("§aBatch " + stepMasterBatch + ": break(2) complete - W2 suppression walk starting.");
                 }
             }
             case WAIT_BATCH_BUILD -> {
