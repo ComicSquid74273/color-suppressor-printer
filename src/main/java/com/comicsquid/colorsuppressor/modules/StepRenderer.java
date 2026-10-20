@@ -40,9 +40,9 @@ final class StepRenderer {
         long now = System.currentTimeMillis();
         if (now - resumeCacheReadAt > 2000) {
             resumeCacheReadAt = now;
-            mod.cachedResumeBatch = mod.loadStepProgress();
+            mod.master.cachedResumeBatch = mod.master.loadStepProgress();
         }
-        if (mod.cachedResumeBatch > 0) return Math.min(62, mod.cachedResumeBatch);
+        if (mod.master.cachedResumeBatch > 0) return Math.min(62, mod.master.cachedResumeBatch);
         return mod.renderBatch.get();
     }
 
@@ -105,11 +105,11 @@ final class StepRenderer {
             // x~98 showed up during every batch and looked like a stray checkpoint.)
             ArrayList<Vec3d> specialPoints = new ArrayList<>();
             if (mod.cartographyTable != null
-                && (mod.stepMasterStage == StepCheckered.StepMasterStage.CLOSING_WALK
-                    || mod.stepMasterStage == StepCheckered.StepMasterStage.WAIT_CLOSING_BREAK
-                    || mod.stepMasterStage == StepCheckered.StepMasterStage.READY_TO_LOCK
-                    || mod.stepMasterStage == StepCheckered.StepMasterStage.LOCK_WALK
-                    || mod.stepMasterStage == StepCheckered.StepMasterStage.LOCKING)) {
+                && (mod.master.stepMasterStage == StepMasterStage.CLOSING_WALK
+                    || mod.master.stepMasterStage == StepMasterStage.WAIT_CLOSING_BREAK
+                    || mod.master.stepMasterStage == StepMasterStage.READY_TO_LOCK
+                    || mod.master.stepMasterStage == StepMasterStage.LOCK_WALK
+                    || mod.master.stepMasterStage == StepMasterStage.LOCKING)) {
                 specialPoints.add(mod.cartographyTable.getRight());
             }
             for (Vec3d point : specialPoints) {
