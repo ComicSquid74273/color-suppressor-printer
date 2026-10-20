@@ -567,6 +567,8 @@ public class StepCheckered extends Module implements MapPrinter {
     boolean breakSweepActedThisTick;                                // the Mining-state break loop already sent packets this tick
     String lastMasterCpLog;                                         // dedup for the always-on master checkpoint log
     int stepSavedProgressMapId = -1;                                // map id persisted with the progress file (crash/restart resume)
+    long stepBatchStartMs, stepPhaseStartMs;                        // per-batch phase timing (logged at completion)
+    long stepBuildMs, stepW1Ms, stepBreak2Ms, stepW2Ms, stepBreakAllMs;
     String resetStallSig;                                           // reset arrival stall detector: last arrival state signature
     int resetStallRounds;
     int sweepWaitRounds;                                            // batch sweep: consecutive in-flight-drop dwell arrivals
@@ -3236,6 +3238,12 @@ public class StepCheckered extends Module implements MapPrinter {
         return new File(new File(mapFolder, "_configs"), "step_checkered_progress.json");
     }
 
+    /** mmm? no - XmYYs style for the per-batch phase timing summary. */
+    private String fmtMs(long ms) {
+        long sec = Math.max(0, ms / 1000);
+        return (sec / 60) + "m" + String.format("%02ds", sec % 60);
+    }
+
     private void saveStepProgress(int batch) {
         try {
             File file = stepProgressFile();
@@ -3362,6 +3370,9 @@ public class StepCheckered extends Module implements MapPrinter {
             return;
         }
         stepMasterBatch = batch;
+        stepBatchStartMs = System.currentTimeMillis();
+        stepPhaseStartMs = stepBatchStartMs;
+        stepBuildMs = stepW1Ms = stepBreak2Ms = stepW2Ms = stepBreakAllMs = 0;
         // PERSISTENCE: "batch k is in progress" is written on every batch start, so a
         // crash/restart/disable at ANY point resumes by re-running exactly this batch
         // (with the map id re-pinned from the file). Only RESET deletes the file.
@@ -3488,6 +3499,8 @@ public class StepCheckered extends Module implements MapPrinter {
                 // 2k+129 - 127.5+ blocks from the west tops, beyond dominant record
                 // range - so the already-recorded west pixels cannot be re-recorded.
                 stepStowMap();
+                stepW1Ms = System.currentTimeMillis() - stepPhaseStartMs;
+                stepPhaseStartMs = System.currentTimeMillis();
                 stepMasterBreak2Sent = true;
                 stepSendToSlave("break2");
                 stepMasterStage = StepMasterStage.WAIT_BREAK_2;
@@ -3501,6 +3514,8 @@ public class StepCheckered extends Module implements MapPrinter {
                 // Standard flow: break2done has arrived (W2 was gated on it), so
                 // break-all is requested immediately.
                 stepStowMap();
+                stepW2Ms = System.currentTimeMillis() - stepPhaseStartMs;
+                stepPhaseStartMs = System.currentTimeMillis();
                 stepMasterStage = StepMasterStage.WAIT_BREAK_ALL;
                 stepMasterWaitTicks = 0;
                 boolean batch0Split = stepMasterBatch == 0 && batch0SplitBuild.get() && stepMasterBreak2Sent;
@@ -3672,6 +3687,8 @@ public class StepCheckered extends Module implements MapPrinter {
                     stepSendToSlave("break2");
                     info("§aBatch " + stepMasterBatch + ": break(2) requested.");
                 } else if (stepSlaveBreak2DoneBatch == stepMasterBatch) {
+                    stepBreak2Ms = System.currentTimeMillis() - stepPhaseStartMs;
+                    stepPhaseStartMs = System.currentTimeMillis();
                     stepMasterStage = StepMasterStage.BATCH_WALK_B;
                     int w2Lane = 2 * (stepMasterBatch + 1) + 127;
                     stepStartSweep(w2Lane, 4, 0);   // W2: fixed S->N
@@ -3680,6 +3697,8 @@ public class StepCheckered extends Module implements MapPrinter {
             }
             case WAIT_BATCH_BUILD -> {
                 if (stepSlaveReadyBatch == stepMasterBatch) {
+                    stepBuildMs = System.currentTimeMillis() - stepPhaseStartMs;
+                    stepPhaseStartMs = System.currentTimeMillis();
                     stepMasterStage = StepMasterStage.BATCH_WALK_A;
                     // Split mode only: batch 0's W1 rides lane 125 (floor record); every
                     // other case uses the standard lane 2k+127.
@@ -3720,6 +3739,13 @@ public class StepCheckered extends Module implements MapPrinter {
             && stepSlaveDoneBatch == stepMasterBatch) {
             int completedBatch = stepMasterBatch;
             stepSlaveDoneBatch = -1;
+            stepBreakAllMs = System.currentTimeMillis() - stepPhaseStartMs;
+            info("§6[BATCH-TIME]§7 batch " + completedBatch + ": total §f" + fmtMs(System.currentTimeMillis() - stepBatchStartMs)
+                + "§7 | build §f" + fmtMs(stepBuildMs)
+                + "§7 | W1 §f" + fmtMs(stepW1Ms)
+                + "§7 | break(2) §f" + fmtMs(stepBreak2Ms)
+                + "§7 | W2 §f" + fmtMs(stepW2Ms)
+                + "§7 | break-all+collect §f" + fmtMs(stepBreakAllMs));
             if (completedBatch < 62) {
                 beginStepBatch(completedBatch + 1);
             } else {
