@@ -92,14 +92,8 @@ final class StepMaster {
         stepMasterBreak2Sent = false;
         stepMasterBreakAllSent = false;
         stepMasterCloseBreakSent = false;
-        maps.stepWorkingMapId = -1;
-        maps.stepMapSwapPending = false;
-        maps.stepMapSwapAge = 0;
-        lock.stepLockStep = -1;
-        lock.stepLockDelay = 0;
-        maps.controlHoldActive = false;
-        maps.controlSwapPending = false;
-        maps.controlUseCooldown = 0;
+        maps.resetForActivation();
+        lock.resetForActivation();
         lastMasterCpLog = null;
         stepSavedProgressMapId = -1;
         cachedResumeBatch = -1;
@@ -124,12 +118,13 @@ final class StepMaster {
         stepMasterBreak2Sent = false;
         stepMasterBreakAllSent = false;
         stepMasterCloseBreakSent = false;
+        maps.resetForActivation();
+        lock.resetForActivation();
         stepSlaveReadyBatch = -1;
         stepSlaveBreak2DoneBatch = -1;
         stepSlaveDoneBatch = -1;
         stepSlaveReadyClosing = false;
         stepSlaveClosingDone = false;
-        maps.stepMapSwapPending = false;
         maps.stepStowMap();
 
         if (maps.stepFindWorkingMapSlot() >= 0) {
@@ -197,7 +192,6 @@ final class StepMaster {
         mod.checkpoints.clear();
         mod.state = State.StandBy;
         maps.stepStowMap();
-        maps.stepWorkingMapId = -1;
         Utils.setForwardPressed(false);
         mod.info("§aReset complete. Enable the module again to start a fresh run.");
     }
