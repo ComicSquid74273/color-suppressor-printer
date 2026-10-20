@@ -1820,9 +1820,14 @@ public class StepCheckered extends Module implements MapPrinter {
                     confirmedThisTick++;
                     vanillaBreakRetries.remove(pending);
                 } else if (ticksLeft <= 0) {
-                    // fastBreak failed — this block needs multi-tick mining.
-                    // Flag for vanilla breaking (handles concrete/terracotta/deepslate).
-                    needsVanillaBreak.add(pending);
+                    // fastBreak failed — multi-tick block. Vanilla progress REQUIRES the
+                    // block in server reach: at speed-hack pace the bot outruns the echo
+                    // and expired blocks behind it could never progress (live 2026-10-21:
+                    // 51 blocks frozen in vanillaQ). Still-in-reach -> vanilla; behind
+                    // the bot -> drop it, the breakAllDone gate chases it on foot.
+                    if (mc.player.getEyePos().distanceTo(pending.toCenterPos()) <= 4.4) {
+                        needsVanillaBreak.add(pending);
+                    }
                     int retries = vanillaBreakRetries.getOrDefault(pending, 0) + 1;
                     vanillaBreakRetries.put(pending, retries);
                     if (retries == 4) {
@@ -2923,8 +2928,9 @@ public class StepCheckered extends Module implements MapPrinter {
         // Round-robining several vanilla targets per tick = nothing ever breaks (live
         // 2026-10-20 batch 13: 68 blocks frozen 80s "trying to break"). ONE vanilla
         // target at a time, held across ticks until air; everything else fastBreak.
-        if (vanillaStickyTarget != null && miningBlockState(vanillaStickyTarget).isAir()) {
-            vanillaStickyTarget = null;
+        if (vanillaStickyTarget != null && (miningBlockState(vanillaStickyTarget).isAir()
+            || mc.player.getEyePos().distanceTo(vanillaStickyTarget.toCenterPos()) > 4.4)) {
+            vanillaStickyTarget = null;   // broke, or the bot outran it - never freeze the queue on it
         }
         int sent = 0;
         boolean vanillaSentThisTick = false;
@@ -5360,7 +5366,12 @@ public class StepCheckered extends Module implements MapPrinter {
         }
         boolean printing = state == State.Walking && breakStage == 0 && currentBuildPlan != null
             && !checkpoints.isEmpty() && ALLOW_PLACE_ACTIONS.contains(checkpoints.getFirst().getRight().getLeft());
-        boolean breaking = state == State.Mining;
+        // BREAK PASSES NEVER SPEED-HACK (live 2026-10-21: at 7.12 bps the bot outruns
+        // the server's echo AND reach — breaks expire out-of-reach into a frozen vanilla
+        // queue (51 blocks stuck) and the server rubber-bands the movement itself. The
+        // math cap is 30 bps / 5.25 blocks-per-row = 5.7 bps max useful pace; sprint
+        // (~5.6) sits just under it).
+        boolean breaking = state == State.Mining || (breakStage != 0 && state != State.StandBy);
         boolean want = !printing && !breaking && state != State.StandBy;
         if (want != transitSpeedOn) setTransitSpeed(want);
     }
