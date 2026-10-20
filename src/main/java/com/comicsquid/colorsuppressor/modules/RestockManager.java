@@ -449,7 +449,7 @@ final class RestockManager {
                     if (mc.player.currentScreenHandler != null) mc.player.closeHandledScreen();
                     restockBacklogSlots.clear();
                     mod.timeoutTicks = mod.postRestockDelay.get();
-                    mod.pauseForRestockTrip(false);
+                    mod.slave.pauseForRestockTrip(false);
                     return;
                 }
                 restockBacklogSlots.add(slot);
