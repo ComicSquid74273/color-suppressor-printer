@@ -2890,11 +2890,12 @@ public class StepCheckered extends Module implements MapPrinter {
             }
             if (breakTarget == null) break;                       // no more distinct candidates
             attempted.add(breakTarget);
-            // NEAREST-FIRST (user rule, live 2026-10-20): a range-failing candidate
-            // must not abort the tick's whole send batch — skip it and let the picker
-            // hand back the next nearest in-range block. The pickers are already
-            // distance-sorted, so most iterations land on the ~1-2-block nearest.
-            if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) continue;
+            // NEAREST-FIRST + SERVER-REACH (user rule): pickers are distance-sorted
+            // (nearest land first, farthest still sent when in range). Clamp the send
+            // range to the SERVER's survival reach (~4.5) - client range 5.0 sends at
+            // 4.5-5.0 get silently rejected, which starved the rate and caused the
+            // rare stuck (block 'trying to break but nothing happens').
+            if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > Math.min(interactionRange.get(), 4.4)) continue;
             if (breakPending.containsKey(breakTarget)) continue;  // awaiting server confirm - next distinct
             boolean needsVanilla = needsVanillaBreak.contains(breakTarget);
             if (needsVanilla) {
@@ -4459,6 +4460,51 @@ public class StepCheckered extends Module implements MapPrinter {
         // actual batch route is appended only after preparation is complete.
         queueStepBuildPreparation(walkX);
 
+        // HOTBAR LOOKAHEAD (user rule, live 2026-10-21): pre-arrange the hotbar with
+        // the FIRST distinct materials of this batch's plan (walking order), so the
+        // print pass rarely stalls on mid-run swaps - the old on-demand one-slot
+        // swapping was the print delay. Runs before the route; one swap per material.
+        {
+            java.util.LinkedHashSet<Item> coming = new java.util.LinkedHashSet<>();
+            for (Map.Entry<BlockPos, Block> le : currentBuildPlan.entrySet()) {
+                if (coming.size() >= availableHotBarSlots.size()) break;
+                coming.add(le.getValue().asItem());
+            }
+            int preSwapped = 0;
+            int slotCursor = 0;
+            for (Item comingItem : coming) {
+                boolean alreadyHotbar = false;
+                for (int hs : availableHotBarSlots) {
+                    ItemStack hsStack = mc.player.getInventory().getStack(hs);
+                    if (!hsStack.isEmpty() && hsStack.getItem().equals(comingItem)) { alreadyHotbar = true; break; }
+                }
+                if (alreadyHotbar) continue;
+                int srcSlot = -1;
+                for (int is = 9; is < 36 && srcSlot == -1; is++) {
+                    ItemStack isStack = mc.player.getInventory().getStack(is);
+                    if (!isStack.isEmpty() && isStack.getItem().equals(comingItem)) srcSlot = is;
+                }
+                if (srcSlot == -1) continue;
+                while (slotCursor < availableHotBarSlots.size()) {
+                    int dest = availableHotBarSlots.get(slotCursor);
+                    slotCursor++;
+                    ItemStack destStack = mc.player.getInventory().getStack(dest);
+                    if (destStack.isEmpty() || destStack.getItem().equals(comingItem)) {
+                        Utils.performSwap(srcSlot, dest);
+                        preSwapped++;
+                        break;
+                    }
+                    // skip slots holding other needed materials
+                    boolean destNeeded = false;
+                    for (Item otherComing : coming) {
+                        if (!destStack.isEmpty() && destStack.getItem().equals(otherComing)) { destNeeded = true; break; }
+                    }
+                    if (!destNeeded) { Utils.performSwap(srcSlot, dest); preSwapped++; break; }
+                }
+            }
+            if (preSwapped > 0) info("§7Hotbar lookahead: pre-arranged " + preSwapped + " material slots for the print pass.");
+        }
+
         // FIXED CYCLE (user rule, live 2026-10-20): every batch runs the same
         // directions - print N->S, break(2) S->N, break-all N->S (forced in
         // startBreakAll), collection S->N - ending each batch at the north end where
@@ -5847,6 +5893,7 @@ public class StepCheckered extends Module implements MapPrinter {
         for (BlockPos pos : currentBuildPlan.keySet()) {
             if (miningBlockState(pos).isAir()) continue;
             if (exclude.contains(pos)) continue;
+            if (breakPending.containsKey(pos)) continue;   // awaiting server confirm - not sendable
             if (break2Only && (pos.getX() >= westX + 2 || pos.getY() < lowerMapCorner.getY() + 2)) continue;
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist > interactionRange.get()) continue;
