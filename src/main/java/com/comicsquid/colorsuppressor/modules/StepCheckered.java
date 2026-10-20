@@ -667,6 +667,9 @@ public class StepCheckered extends Module implements MapPrinter {
         "stepClosingDone", "batchExit", "sweepTick", "fullSweepStart", "fullSweepCenter", "fullSweepTick",
         "fullSweepDone", "resetStation", "resetPass");
     private static final int STEP_DWELL_TICKS = 80;
+    /** Pickaxe durability that must remain at batch start for the pickaxe to survive a
+     *  full batch's breaking (print repairs + break(2) + break-all + stragglers). */
+    private static final int PREP_PICKAXE_BUFFER = 800;
 
     public StepCheckered() {
         super(Addon.CATEGORY, "step-checkered", "Uses the step-checker method to build colour-suppression maps.");
@@ -1296,11 +1299,20 @@ public class StepCheckered extends Module implements MapPrinter {
             case AwaitFoodChestResponse:
                 interactTimeout = 0;
                 timeoutTicks = postRestockDelay.get();
-                // Take one stack of whatever food the chest holds
+                // Take only what FITS in the offhand (user rule): offhand empty -> one
+                // full stack (= capacity); partially filled (<10 trigger) -> HALF a
+                // chest stack, which always fits beside the remainder. Never a second
+                // full stack on top of an existing one.
+                int offFood = offhandFoodCount();
                 for (int slot = 0; slot < packet.contents().size() - 36; slot++) {
                     ItemStack stack = packet.contents().get(slot);
                     if (!stack.isEmpty() && stack.contains(DataComponentTypes.FOOD)) {
-                        mc.interactionManager.clickSlot(packet.syncId(), slot, 0, SlotActionType.QUICK_MOVE, mc.player);
+                        if (offFood == 0) {
+                            mc.interactionManager.clickSlot(packet.syncId(), slot, 0, SlotActionType.QUICK_MOVE, mc.player);
+                        } else {
+                            mc.interactionManager.clickSlot(packet.syncId(), slot, 1, SlotActionType.PICKUP, mc.player);
+                            mc.interactionManager.clickSlot(packet.syncId(), slot, 0, SlotActionType.PICKUP, mc.player);
+                        }
                         break;
                     }
                 }
@@ -4176,16 +4188,26 @@ public class StepCheckered extends Module implements MapPrinter {
         refillBuildingInventory(invInfo.getRight());
         boolean materialRestockQueued = !restockList.isEmpty();
 
-        if (!hasGoodPickaxe()) {
+        // PICKAXE: replace PREDICTIVELY here - a pickaxe that cannot survive a full
+        // batch's breaking (~800 blocks worst case incl. stragglers) is swapped at this
+        // trip, so a mid-batch death never triggers an emergency run (user rule,
+        // 2026-10-20: "emergency restock is for emergency").
+        int pickSlot = findPickaxeSlot();
+        int pickRemaining = pickSlot >= 0 ? ToolUtils.getRemainingDamage(mc.player.getInventory().getStack(pickSlot)) : 0;
+        if (pickSlot < 0 || pickRemaining < Math.max(minDurability.get(), PREP_PICKAXE_BUFFER)) {
             Item pickaxe = findRegisteredPickaxeItem();
             if (pickaxe != null) {
+                info("§7Pickaxe " + (pickSlot < 0 ? "missing" : "at " + pickRemaining + " durability")
+                    + " - replacing at the batch-prep trip (buffer " + PREP_PICKAXE_BUFFER + ").");
                 restockList.add(Triple.of(pickaxe, 1, 1));
                 // If materials already have a chest at the head, endRestocking() will promote
                 // this entry after them.  With no material restock, add its first chest now.
                 if (!materialRestockQueued) addClosestRestockCheckpoint();
             }
         }
-        if (!hasFoodInInventory() && foodChest != null) {
+        // FOOD (user rule): fetch ONLY when the OFFHAND stack is below 10 pieces, and
+        // take only what fits in the offhand (never a second full stack on top of one).
+        if (foodChest != null && offhandFoodCount() < 10) {
             checkpoints.add(new Pair(foodChest.getRight(), new Pair("foodChest", foodChest.getLeft())));
         }
         double northZ = lowerMapCorner.getZ() - 2;
@@ -5402,6 +5424,13 @@ public class StepCheckered extends Module implements MapPrinter {
         return best;
     }
 
+    /** Pieces of food currently in the OFFHAND stack (0 if it holds something else). */
+    private int offhandFoodCount() {
+        ItemStack off = mc.player.getOffHandStack();
+        if (off.isEmpty() || !off.contains(DataComponentTypes.FOOD)) return 0;
+        return off.getCount();
+    }
+
     private boolean hasFoodInInventory() {
         for (int slot = 0; slot < 36; slot++) {
             ItemStack stack = mc.player.getInventory().getStack(slot);
@@ -5457,7 +5486,10 @@ public class StepCheckered extends Module implements MapPrinter {
             return;
         }
         Pair<BlockPos, Vec3d> chest = getBestChest(pickaxe);
-        if (chest.getLeft() == null) return;
+        if (chest.getLeft() == null || chest.getLeft().equals(BlockPos.ORIGIN)) {
+            warning("No chest stocks " + pickaxe.getName().getString() + " - cannot fetch a pickaxe.");
+            return;
+        }
         restockList.add(Triple.of(pickaxe, 1, 1));
         checkpoints.add(0, new Pair(new Vec3d(stagingPos.x, stagingPos.y, stagingPos.z), new Pair("batchBegin", null)));
         checkpoints.add(0, new Pair(chest.getRight(), new Pair("refill", chest.getLeft())));
