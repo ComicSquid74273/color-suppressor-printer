@@ -92,6 +92,20 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-10-20 (p) — RESET scoped to the PRINTED batches (progress-driven, no whole-map pass)
+User: "we now know what batch was printed — in RESET, instead of walking and
+rendering the whole map to find what to clear, only do it for the printed batches."
+- **Scope sources**: max(live in-memory batch, progress-file batch) + 1 safety col
+  east, clamped 0-31; batches print west→east so the scope always starts at col 0.
+  Logged at RESET entry: "RESET scoped to cols 0-N (live batch X, progress batch Y)".
+- **Ladder** already covered the scope; it now starts at col 0 explicitly.
+- **Verify walk scoped too**: stations sit on the SCOPED columns' centre line (not
+  the fixed whole-box x=66), the content scan uses the new
+  `printBoxContentRange(x0, x1)` window (printed cols + 1 east, items with the ±4
+  bounce margin), and the item census is scoped to the same window. After a re-scope
+  the stations re-centre on the found range. No whole-map walk or scan remains in
+  RESET. Boundary finds still re-ladder via the existing found[] path.
+
 ### 2026-10-20 (o) — DURABLE PROGRESS: crash/restart/disable resume with the SAME map
 User: "whenever bot crashes, restarts, pauses or disables, progress must be saved and
 only reset by RESET ALL." The progress file (`_configs/step_checkered_progress.json`)

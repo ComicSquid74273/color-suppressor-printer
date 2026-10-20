@@ -2354,12 +2354,17 @@ public class StepCheckered extends Module implements MapPrinter {
                         if (!hasGoodPickaxe()) { pauseForRestockTrip(true); return; }
                         movePickaxeToSlot8();
                     }
-                    int[] found = printBoxContentRange();
-                    int[] boxCensus = itemCensusInArea(lowerMapCorner.getX() - RESET_ITEM_MARGIN, lowerMapCorner.getX() + 127 + RESET_ITEM_MARGIN,
+                    // SCOPED scan (user rule): only the PRINTED columns (+1 safety col
+                    // east) are checked - never the whole map. Batches print west->east,
+                    // so the scope start is always col 0.
+                    int scopeEndX = Math.min(127, 4 * (Math.min(31, resetLadderEndCol) + 1) + 3);
+                    int[] found = printBoxContentRange(0, scopeEndX);
+                    int[] boxCensus = itemCensusInArea(lowerMapCorner.getX() - RESET_ITEM_MARGIN,
+                        lowerMapCorner.getX() + scopeEndX + RESET_ITEM_MARGIN,
                         lowerMapCorner.getZ() - 1 - RESET_ITEM_MARGIN, lowerMapCorner.getZ() + 127 + RESET_ITEM_MARGIN);
                     info("§6[RESET-VERIFY]§7 verify station z=" + (mc.player.getBlockZ() - lowerMapCorner.getZ())
-                        + ": blocks/ready-items scan " + (found != null ? "FOUND cols " + found[0] + "-" + found[1] : "clean")
-                        + " §7box+m" + RESET_ITEM_MARGIN + " item census[ready=" + boxCensus[0] + " falling=" + boxCensus[1]
+                        + ": blocks/ready-items scan cols 0-" + (scopeEndX / 4) + " " + (found != null ? "FOUND cols " + found[0] + "-" + found[1] : "clean")
+                        + " §7scope+m" + RESET_ITEM_MARGIN + " item census[ready=" + boxCensus[0] + " falling=" + boxCensus[1]
                         + " pickupDelay=" + boxCensus[2] + " owned=" + boxCensus[3] + "]");
                     if (found != null) {
                         // Content identified: ladder-sweep exactly those columns, then
@@ -4415,10 +4420,13 @@ public class StepCheckered extends Module implements MapPrinter {
      *  with a whole-box content scan at each of the 5 stations, ending in deposit +
      *  complete. Any finding re-scopes a ladder sweep (see the verifyWalk handler). */
     private void queueVerifyWalk() {
+        // Stations sit on the SCOPED columns' centre line (not the whole-box x=66):
+        // the walk only needs render distance over the printed columns.
+        double centreX = lowerMapCorner.getX() + (4.0 * resetLadderCol + 4.0 * resetLadderEndCol + 3.0) / 2.0;
         Vec3d lastStation = null;
         for (int seg = 0; seg < RESET_SEG_CENTER_Z.length; seg++) {
             double wz = lowerMapCorner.getZ() + RESET_SEG_CENTER_Z[seg] + 0.5;
-            lastStation = new Vec3d(lowerMapCorner.getX() + 66.0, lowerMapCorner.getY(), wz);
+            lastStation = new Vec3d(centreX, lowerMapCorner.getY(), wz);
             checkpoints.add(new Pair(lastStation, new Pair("verifyWalk", null)));
         }
         Pair<BlockPos, Vec3d> doneChest = getBestDepositChest();
@@ -4426,6 +4434,36 @@ public class StepCheckered extends Module implements MapPrinter {
             checkpoints.add(new Pair(doneChest.getRight(), new Pair("depositBuilding", doneChest.getLeft())));
         }
         checkpoints.add(new Pair(lastStation, new Pair("fullSweepDone", null)));
+    }
+
+    /** {minCol, maxCol} of columns containing content within the given BLOCK-x window
+     *  (items use the +-4 bounce margin), or null when the window is completely empty.
+     *  Scope +-1 col around the printed batches: the RESET never walks or scans the
+     *  whole map (user rule, 2026-10-20). */
+    private int[] printBoxContentRange(int x0, int x1) {
+        int min = Integer.MAX_VALUE, max = Integer.MIN_VALUE;
+        for (int x = Math.max(0, x0); x <= Math.min(127, x1); x++) {
+            for (int z = -1; z < 128; z++) {
+                for (int y = 0; y <= 3; y++) {
+                    if (!miningBlockState(new BlockPos(lowerMapCorner.getX() + x,
+                        lowerMapCorner.getY() + y, lowerMapCorner.getZ() + z)).isAir()) {
+                        min = Math.min(min, x / 4); max = Math.max(max, x / 4);
+                        break;
+                    }
+                }
+            }
+        }
+        for (Entity entity : mc.world.getEntities()) {
+            if (!(entity instanceof ItemEntity itemEntity)) continue;
+            if (!itemEntity.groundCollision || itemEntity.cannotPickup() || itemEntity.getOwner() != null) continue;
+            if (itemEntity.getX() < lowerMapCorner.getX() + Math.max(0, x0) - RESET_ITEM_MARGIN
+                || itemEntity.getX() > lowerMapCorner.getX() + Math.min(127, x1) + RESET_ITEM_MARGIN) continue;
+            if (itemEntity.getZ() < lowerMapCorner.getZ() - 1 - RESET_ITEM_MARGIN || itemEntity.getZ() > lowerMapCorner.getZ() + 127 + RESET_ITEM_MARGIN) continue;
+            if (itemEntity.getY() < lowerMapCorner.getY() - 3 || itemEntity.getY() > lowerMapCorner.getY() + 5) continue;
+            int col = Math.max(0, Math.min(31, (int) Math.floor(itemEntity.getX() - lowerMapCorner.getX()) / 4));
+            min = Math.min(min, col); max = Math.max(max, col);
+        }
+        return min == Integer.MAX_VALUE ? null : new int[]{min, max};
     }
 
     /** Whole-box scan: {minCol, maxCol} of columns containing any block or ground drop,
@@ -4594,10 +4632,18 @@ public class StepCheckered extends Module implements MapPrinter {
         // built (or the last one) plus one safety column west for its borrow leftovers.
         // One batch window = exactly one 4-lane ladder column. The two-vantage verify
         // after the ladder still covers the whole box as the backstop for older strays.
-        int scopeCol = currentBatch >= 0 && currentBatch <= 31 ? currentBatch : Math.max(0, Math.min(31, currentBatch));
-        if (currentBatch == -1) scopeCol = 0;          // priming window = lanes 0-3
+        // PROGRESS-DRIVEN SCOPE (user rule, 2026-10-20): only the PRINTED batches are
+        // cleared - the ladder AND the verify walk stay inside them (+1 safety col
+        // east for borrow/drop bounce). Sources: the live in-memory batch (a running
+        // flow) and the shared progress file (a crashed/restarted run - batches 0..k
+        // printed = ladder cols 0..k). No whole-map walks or scans.
+        int progressBatch = loadStepProgress();   // shared _configs file; -1-safe on the slave
+        int liveBatch = currentBatch >= 0 ? currentBatch : 0;
+        int scopeCol = Math.min(31, Math.max(liveBatch, Math.max(0, progressBatch)) + 1);
         resetLadderEndCol = scopeCol;
-        resetLadderCol = Math.max(0, scopeCol - 1);
+        resetLadderCol = 0;   // batches print west->east: everything up to the scope col
+        info("§7RESET scoped to cols 0-" + scopeCol + " (live batch " + liveBatch
+            + ", progress batch " + progressBatch + ") - no whole-map pass.");
         // Start from the segment closest to the bot's current position (not always 0):
         // the bot might be at the south end after a print pass — walking to segment 0
         // (north) wastes transit time. Snake direction adapts per column anyway.
