@@ -473,6 +473,14 @@ public class StepCheckered extends Module implements MapPrinter {
         .build()
     );
 
+    private final Setting<Boolean> renderMasterArea = sgRender.add(new BoolSetting.Builder()
+        .name("render-master-area")
+        .description("Draws the MASTER AREA bounding box (x 124..255, z 12..117 around the platform lattice) and the single ENTRY/EXIT GATE (north-west platform 125,14) in the special-checkpoints color. Inside the box the master moves only along lattice lines; it enters/exits only through the gate.")
+        .defaultValue(true)
+        .visible(() -> render.get())
+        .build()
+    );
+
     private final Setting<SettingColor> nextCheckpointsColor = sgRender.add(new ColorSetting.Builder()
         .name("next-checkpoints-color")
         .description("Color for the 5 checkpoints of the rendered batch's sweep lane (follows render-batch).")
@@ -6431,6 +6439,17 @@ public class StepCheckered extends Module implements MapPrinter {
                     event.renderer.box(entry.getKey(), renderColor, renderColor, ShapeMode.Lines, 0);
                 }
             }
+        }
+
+        if (renderMasterArea.get() && lowerMapCorner != null) {
+            // MASTER AREA bounding box + the single entry/exit GATE (user rule)
+            double ax0 = lowerMapCorner.getX() + MASTER_AREA_X0, ax1 = lowerMapCorner.getX() + MASTER_AREA_X1;
+            double az0 = lowerMapCorner.getZ() + MASTER_AREA_Z0, az1 = lowerMapCorner.getZ() + MASTER_AREA_Z1;
+            double ay = lowerMapCorner.getY();
+            event.renderer.box(ax0, ay - 1, az0, ax1, ay, az1, specialCheckpointsColor.get(), specialCheckpointsColor.get(), ShapeMode.Lines, 0);
+            // The GATE: north-west platform (125,14), drawn solid + a pillar so it stands out
+            double gx = lowerMapCorner.getX() + 125, gz = lowerMapCorner.getZ() + 14;
+            event.renderer.box(gx, ay - 2, gz, gx + 1, ay + 2, gz + 1, specialCheckpointsColor.get(), specialCheckpointsColor.get(), ShapeMode.Both, 0);
         }
 
         if (renderCheckpointGrid.get() && lowerMapCorner != null) {
