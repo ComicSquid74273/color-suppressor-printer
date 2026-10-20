@@ -2543,6 +2543,50 @@ public class StepCheckered extends Module implements MapPrinter {
 
         if (state.equals(State.Walking)) {
             if (breakStage == 0 && currentBuildPlan != null) {
+                // ROLLING HOTBAR LOOKAHEAD (user rule: "always, for the whole batch, not
+                // just at start"): once per second (rateTick mid-window), ensure the
+                // NEXT distinct materials ahead (walking order) are hotbar-present — swap
+                // the first missing one in from the inventory, evicting a hotbar slot
+                // whose material is NOT upcoming. Eliminates mid-run swap stalls.
+                if (rateTick == 10) {
+                    java.util.LinkedHashSet<Item> upcoming = new java.util.LinkedHashSet<>();
+                    int kept = 0;
+                    for (Map.Entry<BlockPos, Block> ue : currentBuildPlan.entrySet()) {
+                        if (kept >= 12) break;
+                        BlockPos up = ue.getKey();
+                        if (miningBlockState(up).isAir()) continue;
+                        if (up.getZ() < mc.player.getBlockZ()) continue;   // ahead only (N->S)
+                        upcoming.add(ue.getValue().asItem());
+                        kept++;
+                    }
+                    for (Item upItem : upcoming) {
+                        boolean inHotbar = false;
+                        for (int hs : availableHotBarSlots) {
+                            ItemStack hStack = mc.player.getInventory().getStack(hs);
+                            if (!hStack.isEmpty() && hStack.getItem().equals(upItem)) { inHotbar = true; break; }
+                        }
+                        if (inHotbar) continue;
+                        int srcSlot = -1;
+                        for (int is = 9; is < 36 && srcSlot == -1; is++) {
+                            ItemStack iStack = mc.player.getInventory().getStack(is);
+                            if (!iStack.isEmpty() && iStack.getItem().equals(upItem)) srcSlot = is;
+                        }
+                        if (srcSlot == -1) continue;
+                        int evictSlot = -1;
+                        for (int hs : availableHotBarSlots) {
+                            ItemStack eStack = mc.player.getInventory().getStack(hs);
+                            if (eStack.isEmpty()) { evictSlot = hs; break; }
+                            boolean eNeeded = false;
+                            for (Item otherUp : upcoming) {
+                                if (eStack.getItem().equals(otherUp)) { eNeeded = true; break; }
+                            }
+                            if (!eNeeded) { evictSlot = hs; break; }
+                        }
+                        if (evictSlot == -1) break;
+                        Utils.performSwap(srcSlot, evictSlot);
+                        break;   // one swap per check - never stalls the pass
+                    }
+                }
                 // DISTINCT-POSITION MULTI-PLACE (user target: 25-30 places/s). The old
                 // loop stopped after one place: the client cannot see the server's
                 // placement echo for 1-2 ticks, so the air-check always failed and
@@ -2969,7 +3013,7 @@ public class StepCheckered extends Module implements MapPrinter {
         } else {
             ((com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager) mc.interactionManager).fastBreak(target);
             mc.player.swingHand(Hand.MAIN_HAND);
-            breakPending.put(target, 4);   // 4-tick window: Folia's block-update echo can lag 2-3 ticks
+            breakPending.put(target, 6);   // 4-tick window: Folia's block-update echo can lag 2-3 ticks
         }
     }
 
@@ -4629,25 +4673,37 @@ public class StepCheckered extends Module implements MapPrinter {
                 if (!materialRestockQueued) addClosestRestockCheckpoint();
             }
         }
-        // BEST-TOOL PREP: when the batch palette contains wood-class blocks (planks/
-        // hyphae need an AXE — a pickaxe takes ~60 ticks/block), make sure an axe is
-        // carried. Only fetches when none is in the inventory (one, from tool chests).
-        if (currentBuildPlan != null && !carriesAxe()) {
+        // BEST-TOOL PREP — AXE with the PICKAXE'S predictive rule (user rule, live
+        // 2026-10-21: "same stock restock as pickaxe - never exchange or withdraw
+        // until min-durability is reached"): only when the batch has axe-class blocks
+        // AND the best carried axe is missing or BELOW min-durability. A worn-but-present
+        // axe above threshold is KEPT (no withdrawal); below threshold it is exchanged.
+        if (currentBuildPlan != null) {
             boolean needsWoodTool = false;
             for (Block b : currentBuildPlan.values()) {
                 if (b.getDefaultState().isIn(net.minecraft.registry.tag.BlockTags.AXE_MINEABLE)) { needsWoodTool = true; break; }
             }
             if (needsWoodTool) {
-                ItemStack axe = null;
-                float axeSpeed = -1;
-                for (ItemStack tool : toolSet) {
-                    if (!tool.isIn(ItemTags.AXES)) continue;
-                    float sp = tool.getMiningSpeedMultiplier(net.minecraft.block.Blocks.OAK_PLANKS.getDefaultState());
-                    if (sp > axeSpeed) { axeSpeed = sp; axe = tool; }
+                int bestAxeRemaining = -1;
+                for (int aSlot = 0; aSlot < 36; aSlot++) {
+                    ItemStack aStack = mc.player.getInventory().getStack(aSlot);
+                    if (!aStack.isEmpty() && aStack.isIn(ItemTags.AXES)) {
+                        bestAxeRemaining = Math.max(bestAxeRemaining, ToolUtils.getRemainingDamage(aStack));
+                    }
                 }
-                if (axe != null) {
-                    info("§7Batch palette has axe-class blocks - fetching an axe at the prep trip.");
-                    restockList.add(Triple.of(axe.getItem(), 1, 1));
+                if (bestAxeRemaining < minDurability.get()) {
+                    ItemStack axe = null;
+                    float axeSpeed = -1;
+                    for (ItemStack tool : toolSet) {
+                        if (!tool.isIn(ItemTags.AXES)) continue;
+                        float sp = tool.getMiningSpeedMultiplier(net.minecraft.block.Blocks.OAK_PLANKS.getDefaultState());
+                        if (sp > axeSpeed) { axeSpeed = sp; axe = tool; }
+                    }
+                    if (axe != null) {
+                        info("§7Axe " + (bestAxeRemaining < 0 ? "missing" : "at " + bestAxeRemaining + " durability")
+                            + " - exchanging at the batch-prep trip (min-durability " + minDurability.get() + ").");
+                        restockList.add(Triple.of(axe.getItem(), 1, 1));
+                    }
                 }
             }
         }
