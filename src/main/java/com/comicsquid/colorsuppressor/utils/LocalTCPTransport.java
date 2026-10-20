@@ -71,19 +71,6 @@ public final class LocalTCPTransport {
         }
     }
 
-    public static void sendToAllSlaves(String payload) {
-        if (payload == null || payload.isBlank()) return;
-        List<Socket> sockets;
-        synchronized (SOCKET_LOCK) {
-            sockets = new ArrayList<>(slaveSockets);
-        }
-        for (Socket socket : sockets) {
-            if (socket != null && !socket.isClosed()) {
-                writeLine(socket, payload);
-            }
-        }
-    }
-
     public static void sendToSlave(String username, String payload) {
         if (username == null || username.isBlank() || payload == null || payload.isBlank()) return;
 
