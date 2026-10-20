@@ -4279,16 +4279,42 @@ public class StepCheckered extends Module implements MapPrinter {
                     return;
                 }
                 if (currentBuildPlan != null && currentBatch == batch) {
+                    // MASTER-CRASH RESYNC: the plan already exists but the master
+                    // resumed batch k and re-sent the command - re-arm the route from
+                    // here (idempotent: the print pass world-verifies standing blocks).
+                    // Without this the slave sat in its await state consuming the
+                    // command while the master waited for a ready:k that never re-fired.
                     removePendingStepCommand();
+                    checkpoints.clear();
+                    resumeBatchRoute(0);
+                    insertNorthReEntry(0);
+                    prependNorthCorridor(currentWalkLaneX());
+                    state = State.Walking;
+                    info("§eBatch " + batch + " re-armed by repeated build command (master resync).");
                 } else if (state == State.StandBy || currentBuildPlan == null) {
                     removePendingStepCommand();
                     beginBatch(batch);
+                } else if (currentBatch != batch) {
+                    removePendingStepCommand();
+                    info("§7Stale build:" + batch + " dropped (working batch " + currentBatch + ").");
                 }
             }
             case "break2" -> {
                 if (state == State.AwaitBreakPermission2) {
                     removePendingStepCommand();
                     break2Permitted = true;
+                } else if (currentBuildPlan != null) {
+                    // MASTER-CRASH RESYNC: break(2) is un-numbered - arm the phase
+                    // directly from whatever state the slave was left in.
+                    removePendingStepCommand();
+                    checkpoints.clear();
+                    ensurePickaxeSlot8();
+                    breakStage = 2;
+                    state = State.Mining;
+                    resumeBatchRoute(2);
+                    insertNorthReEntry(0);
+                    prependNorthCorridor(currentWalkLaneX());
+                    info("§eBatch " + currentBatch + " break(2) armed by command (master resync).");
                 }
             }
             case "breakall" -> {
@@ -4304,6 +4330,12 @@ public class StepCheckered extends Module implements MapPrinter {
                 if (state == State.AwaitBreakPermissionAll) {
                     removePendingStepCommand();
                     breakAllPermitted = true;
+                } else if (currentBuildPlan != null) {
+                    // MASTER-CRASH RESYNC: break-all is un-numbered - arm directly.
+                    removePendingStepCommand();
+                    checkpoints.clear();
+                    startBreakAll();
+                    info("§eBatch " + currentBatch + " break-all armed by command (master resync).");
                 }
             }
             case "close" -> {
