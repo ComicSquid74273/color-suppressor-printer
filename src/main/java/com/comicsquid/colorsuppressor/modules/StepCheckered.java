@@ -2533,6 +2533,55 @@ public class StepCheckered extends Module implements MapPrinter {
                 : breakStage != 0 ? getNextBatchBreakPos() : getNextMiningPos();
         }
 
+        // ROLLING HOTBAR LOOKAHEAD (user rule: "always, for the whole batch, not
+        // just at start") - runs BEFORE the range gate (v2 fix, live 2026-10-21: the
+        // first version sat after it and was unreachable exactly when a swap was
+        // needed - nothing placeable in range = return before the check). Once per
+        // second: the next 12 unplaced blocks ahead (walking order) define the
+        // upcoming set; the first missing material swaps in from the inventory,
+        // evicting an EMPTY slot if one exists, else a slot not in the set.
+        if (state.equals(State.Walking) && breakStage == 0 && currentBuildPlan != null && rateTick == 10) {
+            java.util.LinkedHashSet<Item> upcoming = new java.util.LinkedHashSet<>();
+            int kept = 0;
+            for (Map.Entry<BlockPos, Block> ue : currentBuildPlan.entrySet()) {
+                if (kept >= 12) break;
+                BlockPos up = ue.getKey();
+                if (miningBlockState(up).isAir()) continue;
+                if (up.getZ() < mc.player.getBlockZ()) continue;   // ahead only (N->S)
+                upcoming.add(ue.getValue().asItem());
+                kept++;
+            }
+            for (Item upItem : upcoming) {
+                boolean inHotbar = false;
+                for (int hs : availableHotBarSlots) {
+                    ItemStack hStack = mc.player.getInventory().getStack(hs);
+                    if (!hStack.isEmpty() && hStack.getItem().equals(upItem)) { inHotbar = true; break; }
+                }
+                if (inHotbar) continue;
+                int srcSlot = -1;
+                for (int is = 9; is < 36 && srcSlot == -1; is++) {
+                    ItemStack iStack = mc.player.getInventory().getStack(is);
+                    if (!iStack.isEmpty() && iStack.getItem().equals(upItem)) srcSlot = is;
+                }
+                if (srcSlot == -1) continue;
+                int evictSlot = -1;
+                int evictFallback = -1;
+                for (int hs : availableHotBarSlots) {
+                    ItemStack eStack = mc.player.getInventory().getStack(hs);
+                    if (eStack.isEmpty()) { evictSlot = hs; break; }
+                    boolean eNeeded = false;
+                    for (Item otherUp : upcoming) {
+                        if (eStack.getItem().equals(otherUp)) { eNeeded = true; break; }
+                    }
+                    if (!eNeeded && evictFallback == -1) evictFallback = hs;
+                }
+                if (evictSlot == -1) evictSlot = evictFallback;
+                if (evictSlot == -1) break;
+                Utils.performSwap(srcSlot, evictSlot);
+                info("§7Hotbar rolling: §f" + upItem.getName().getString() + "§7 swapped in (slot " + evictSlot + ").");
+                break;   // one swap per check - never stalls the pass
+            }
+        }
         // Range gate uses EYE distance - the same metric the target pickers use. A
         // feet-based 3D check here rejects upper-layer blocks (y+2.5 above the feet)
         // that the picker armed: the adaptive print pace then held the bot on a target
@@ -2543,50 +2592,6 @@ public class StepCheckered extends Module implements MapPrinter {
 
         if (state.equals(State.Walking)) {
             if (breakStage == 0 && currentBuildPlan != null) {
-                // ROLLING HOTBAR LOOKAHEAD (user rule: "always, for the whole batch, not
-                // just at start"): once per second (rateTick mid-window), ensure the
-                // NEXT distinct materials ahead (walking order) are hotbar-present — swap
-                // the first missing one in from the inventory, evicting a hotbar slot
-                // whose material is NOT upcoming. Eliminates mid-run swap stalls.
-                if (rateTick == 10) {
-                    java.util.LinkedHashSet<Item> upcoming = new java.util.LinkedHashSet<>();
-                    int kept = 0;
-                    for (Map.Entry<BlockPos, Block> ue : currentBuildPlan.entrySet()) {
-                        if (kept >= 12) break;
-                        BlockPos up = ue.getKey();
-                        if (miningBlockState(up).isAir()) continue;
-                        if (up.getZ() < mc.player.getBlockZ()) continue;   // ahead only (N->S)
-                        upcoming.add(ue.getValue().asItem());
-                        kept++;
-                    }
-                    for (Item upItem : upcoming) {
-                        boolean inHotbar = false;
-                        for (int hs : availableHotBarSlots) {
-                            ItemStack hStack = mc.player.getInventory().getStack(hs);
-                            if (!hStack.isEmpty() && hStack.getItem().equals(upItem)) { inHotbar = true; break; }
-                        }
-                        if (inHotbar) continue;
-                        int srcSlot = -1;
-                        for (int is = 9; is < 36 && srcSlot == -1; is++) {
-                            ItemStack iStack = mc.player.getInventory().getStack(is);
-                            if (!iStack.isEmpty() && iStack.getItem().equals(upItem)) srcSlot = is;
-                        }
-                        if (srcSlot == -1) continue;
-                        int evictSlot = -1;
-                        for (int hs : availableHotBarSlots) {
-                            ItemStack eStack = mc.player.getInventory().getStack(hs);
-                            if (eStack.isEmpty()) { evictSlot = hs; break; }
-                            boolean eNeeded = false;
-                            for (Item otherUp : upcoming) {
-                                if (eStack.getItem().equals(otherUp)) { eNeeded = true; break; }
-                            }
-                            if (!eNeeded) { evictSlot = hs; break; }
-                        }
-                        if (evictSlot == -1) break;
-                        Utils.performSwap(srcSlot, evictSlot);
-                        break;   // one swap per check - never stalls the pass
-                    }
-                }
                 // DISTINCT-POSITION MULTI-PLACE (user target: 25-30 places/s). The old
                 // loop stopped after one place: the client cannot see the server's
                 // placement echo for 1-2 ticks, so the air-check always failed and
