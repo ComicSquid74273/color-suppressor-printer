@@ -4631,13 +4631,22 @@ public class StepCheckered extends Module implements MapPrinter {
      *  slave PARKS at the north staging point where every run starts. Exit north via
      *  the corridor (never a diagonal beeline across the box). */
     private void queueVerifyWalk() {
+        // The finish block is APPENDED with its own corridor legs INSIDE it (live-
+        // caught 2026-10-20: a prepend here ran at LADDER-BUILD time - its legs led
+        // the whole queue and were consumed at the reset START, so when the ladder
+        // finished at the SOUTH end the bare deposit checkpoint was next and the bot
+        // beelined diagonally to the north chest, queue=2 in the log).
         Pair<BlockPos, Vec3d> doneChest = getBestDepositChest();
+        double corridorZ = lowerMapCorner.getZ() - 2;
+        double y = lowerMapCorner.getY();
         if (doneChest != null) {
+            double lastLadderX = checkpoints.isEmpty() ? lowerMapCorner.getX() + 2.5 : checkpoints.getLast().getLeft().x;
+            checkpoints.add(new Pair(new Vec3d(lastLadderX, y, corridorZ), new Pair("sprint", null)));       // exit north on the final column
+            checkpoints.add(new Pair(new Vec3d(doneChest.getRight().x, y, corridorZ), new Pair("sprint", null)));   // corridor to the chest
             checkpoints.add(new Pair(doneChest.getRight(), new Pair("depositBuilding", doneChest.getLeft())));
         }
-        Vec3d park = new Vec3d(lowerMapCorner.getX() + 2.5, lowerMapCorner.getY(), lowerMapCorner.getZ() - 2);
+        Vec3d park = new Vec3d(lowerMapCorner.getX() + 2.5, y, corridorZ);
         checkpoints.add(new Pair(park, new Pair("fullSweepDone", null)));
-        prependNorthCorridor(doneChest != null ? doneChest.getRight().x : park.x);
     }
 
     
