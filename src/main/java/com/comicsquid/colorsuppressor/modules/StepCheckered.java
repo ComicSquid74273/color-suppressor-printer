@@ -2877,7 +2877,7 @@ public class StepCheckered extends Module implements MapPrinter {
         }
         int sent = 0;
         boolean vanillaSentThisTick = false;
-        for (int pick = 0; pick < maxSends * 3 && sent < maxSends; pick++) {
+        for (int pick = 0; pick < maxSends * 6 && sent < maxSends; pick++) {
             BlockPos breakTarget;
             if (pick == 0 && nextBlockPos != null && !attempted.contains(nextBlockPos)) {
                 breakTarget = nextBlockPos;
@@ -2888,7 +2888,11 @@ public class StepCheckered extends Module implements MapPrinter {
             }
             if (breakTarget == null) break;                       // no more distinct candidates
             attempted.add(breakTarget);
-            if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) break;
+            // NEAREST-FIRST (user rule, live 2026-10-20): a range-failing candidate
+            // must not abort the tick's whole send batch — skip it and let the picker
+            // hand back the next nearest in-range block. The pickers are already
+            // distance-sorted, so most iterations land on the ~1-2-block nearest.
+            if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > interactionRange.get()) continue;
             if (breakPending.containsKey(breakTarget)) continue;  // awaiting server confirm - next distinct
             boolean needsVanilla = needsVanillaBreak.contains(breakTarget);
             if (needsVanilla) {
