@@ -92,6 +92,104 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-10-21 (p) — AUTO-SPEED option: Meteor's Speed module plainly on for the whole run (user request)
+New "auto-speed" bool in the General group, **default ON**. While the module is
+active it keeps Meteor's Speed module ENABLED exactly as the user's own profile
+has it — no writes to speed-mode/vanilla-speed/timer — and pins our sprint-mode
+to plain Always on the first session tick (never Dynamic). Per user: "enable
+the speed module, set sprint as Always, don't change anything like dynamic
+sprint or else."
+
+- **Hub** (`StepCheckered.autoSpeedTick`, first thing in onTick so both roles
+  and both bots get it): session-start pins sprint-mode -> Always, then
+  re-asserts Speed enabled every tick (self-heals a stray manual disable).
+  Option OFF mid-run disables the module we enabled (a selected Dynamic mode
+  re-takes it the same tick — no blip). Module deactivation still kills Speed
+  through the existing onDeactivate -> setTransitSpeed(false).
+- **Dynamic rider stands down** (`SlaveEngine.updateTransitSpeed`): with the
+  option on it retires any live transit session WITHOUT disabling Speed and
+  never rides phases. Option off = exactly the old behavior (Dynamic manages
+  Speed on transit legs; manual Speed untouched).
+- Note: always-on Speed means break passes run speed-hacked again — the
+  reach-gated expiry + auto-unstick fixes carry that; the pending breaking
+  rework (approach-to-1-block, burst-all-in-reach) is the durable answer.
+- Structural change (new setting + field + method) → RESTART-deploy required,
+  hotswap cannot carry it. UNTESTED on the server — pending user go-ahead.
+
+### 2026-10-21 (o) — AWAIT-RESTOCK FREEZE: lost-sync self-heal for tool parking (live 06:54, batch 9, user screenshot)
+Evidence: batch 9 prep queued 13 materials + "2 spare pickaxe(s) carried -
+depositing them" (the user had re-added spare tools). The refill drain ran
+normally (~1 entry/s, silent pops — the checkpoint dbg only prints on ACTION
+change, so a same-chest drain shows no queue lines), then at 06:54:01 one
+handler round ended WITHOUT setting Walking and the bot froze in
+AwaitRestockResponse for 2.5 min until the user toggled off. That round was a
+TOOL PARKING click: parking deposits ONE tool per chest-open and returns,
+waiting for the server's post-click inventory sync to drive the next round.
+If that sync is lost (screen-close race: processDeferredInventoryIO closes the
+chest one tick after handling, and a click landing after the close produces no
+sync), NOTHING re-opens the chest — handleRestockResponse's entry zeroes
+interactTimeout, so the retry watchdog is disarmed. Pre-existing fragility in
+the pickaxe parking; the axe parking (j) doubled the one-click rounds and the
+every-prep tool entries widened the race window. FIX (RestockManager, both
+parking blocks, body-only): after each parking click, RE-ARM
+interactTimeout = retryInteractTimer (80t vs 2t dwell — no overlap). Sync
+arrives → next round (zeroes it again, as before); sync lost → tickInteractRetry
+re-opens the chest after 4s and the dance continues. The take path needs no
+arm (restockBacklog drain is tick-driven, not sync-driven). Build green; NOT
+deployed — awaiting go-ahead.
+
+### 2026-10-21 (n) — ECHO CHECKPOINTS: master trails the slave's passes, walk at echo k+1 / hold at echo k+2 (user design)
+Removes the two dead full-waits: print→ready→W1 (58s+33s serial) and break2→
+break2done→W2 (35s+34s). Design (user, verbatim intent): the slave ECHOES 5
+equally spaced travel-fraction points per shadowed pass — fire-and-forget, the
+slave NEVER waits on them; the echo counts accumulate on the master (monotonic
+max — "already crossed" knowledge that never regresses). First cut used mating
+distance 2 for everything; the user tightened it the same day (slave is fast):
+the master STARTS WALKING when the slave crosses echo 1, and HOLDS the map at
+station k only when the slave crosses echo k+2. Walking early is pixel-free
+(map-stowed transit, the live-proven hold guard) — only the dwell-HOLD records.
+
+- **Slave** (`SlaveEngine.tickEchoCheckpoints`, called from the slave tick):
+  thresholds {26, 52, 77, 103} rows of travel from the pass entry edge (print
+  N→S from row 0, break(2) S→N from row 127 — the FIXED CYCLE makes directions
+  static) = 4 echoes per pass. Pure position math, no latch — crash/resume
+  safe; guarded to in-box positions so supply/emergency/prep trips north never
+  fire progress; counters reset at pass boundaries (breakStage/batch change);
+  straggler sweep-backs only lower traveled so they can never fire an unearned
+  echo. Batch 0 split-build sends NO build echoes (its W1 records the floor
+  half and must stay ready-gated). Messages: `step:echo:build:<batch>:<k>` /
+  `step:echo:break2:<batch>:<k>`.
+- **Master**: hub switch validates batch (stale echoes dropped) and max-merges
+  counts (`StepCheckered.onStepSlaveMessage` case "echo"). Launch: W1 on build
+  echo 1/4 OR ready; W2 on break2 echo 1/4 OR break2done (StepMaster
+  WAIT_BATCH_BUILD / WAIT_BREAK_2). Walk level: `stepQueueSweep` feeds stations
+  ONE at a time via `stepFeedSweepStations` — a station enters the queue only
+  when `stepWalkReleased(ordinal)` = echo ≥ ordinal+1, so the master never
+  walks to an unreleased station. Hold level: the walker's arrival block PEEKS
+  before popping — an arrived station whose `stepHoldReleased(ordinal)` = echo
+  ≥ ordinal+2 hasn't landed stays QUEUED (not consumed), the master stands on
+  it with the map stowed and the station dispatches the tick its echo lands;
+  the queued head also blocks feeding the next station, so no dwell is skipped.
+- **Safety margin** (kernel doc §3): every hold keeps the slave one travel
+  checkpoint (~26 rows) ahead of the master's ±14–15-row record band → ≥ ~21
+  rows of slack at every hold (station 1: band edge ~29 vs slave at row 52;
+  binding cases 21–24). Echo max is 4, so stations 4–5 hold only on pass-done —
+  station 5's band touches the last rows = exactly the old full-build
+  semantics. Gate A (breakall after W2 complete) untouched; completion is
+  tagged `stepDwellFinal` (queue-emptiness no longer means "sweep over").
+- **Degradation**: ready/break2done still arrive and still release everything —
+  no echoes (bug, resume, stale jar) = exactly the old full-wait flow. Gated
+  standing counts the SAME stepWaitTick heartbeat (30s) / 10-minute abort as
+  named waits — a dead slave trips the timeout, no silent hang.
+- NOT changed: all routes/checkpoints/stations/dwells/hold-stow discipline,
+  closing walk (releases unconditionally), priming, RESET, collect/deposit,
+  batch-0 split choreography, Gates A/B. [BATCH-TIME] "build"/"break(2)" phase
+  metrics now mean time-to-launch (overlap-inclusive) — re-baseline after deploy.
+- Structural change (new fields/methods) → RESTART-deploy required, hotswap
+  cannot carry it. UNTESTED on the server — pending restart-deploy + pxwatch
+  verification of the first shadowed batches. Expected: W1 ~91s → ~69s,
+  break2+W2 ~69s → ~42s (re-measure from [BATCH-TIME]).
+
 ### 2026-10-21 (m) — CONFIRM WINDOW 6→10 ticks: echo-lag double-swings + the lone pass straggler
 Evidence the ABORT recipe worked (slave restarted 05:56 on the new jar): [RATE]
 confirm ratio jumped from 1-16 of 20-36 sent to **27 of 28** — the server now

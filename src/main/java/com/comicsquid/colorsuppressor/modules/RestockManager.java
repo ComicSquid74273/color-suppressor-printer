@@ -409,6 +409,14 @@ final class RestockManager {
                 if (invStack.isIn(ItemTags.PICKAXES)) {
                     mc.interactionManager.clickSlot(packet.syncId(), slot, 0, SlotActionType.QUICK_MOVE, mc.player);
                     mod.timeoutTicks = mod.invActionDelay.get();
+                    // LOST-SYNC SELF-HEAL (live 06:54, batch 9): this return waits for
+                    // the server's post-click inventory sync to drive the next parking
+                    // round - but the entry of this method zeroes interactTimeout, so
+                    // if that sync is lost (screen-close race on Folia) NOBODY ever
+                    // re-opens the chest and the bot freezes in AwaitRestockResponse
+                    // forever. Re-arm the retry: sync arrives -> next round (zeroes it
+                    // again); no sync -> tickInteractRetry re-opens the chest.
+                    interactTimeout = mod.retryInteractTimer.get();
                     return;
                 }
             }
@@ -438,6 +446,7 @@ final class RestockManager {
                 if (invStack.isIn(ItemTags.AXES)) {
                     mc.interactionManager.clickSlot(packet.syncId(), slot, 0, SlotActionType.QUICK_MOVE, mc.player);
                     mod.timeoutTicks = mod.invActionDelay.get();
+                    interactTimeout = mod.retryInteractTimer.get();   // lost-sync self-heal (see pickaxe parking)
                     return;
                 }
             }

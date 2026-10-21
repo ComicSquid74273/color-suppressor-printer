@@ -130,6 +130,17 @@ public class StepCheckered extends Module {
         .build()
     );
 
+    /** auto-speed (user request, 2026-10-21): plainly enable Meteor's Speed module
+     *  for the whole run - no dynamic per-phase riding - and leave the module's own
+     *  settings (mode/speed/timer) exactly as the user's profile has them. Pins
+     *  sprint-mode to Always on session start so the Dynamic rider never engages. */
+    final Setting<Boolean> autoSpeed = sgGeneral.add(new BoolSetting.Builder()
+        .name("auto-speed")
+        .description("Enable Meteor's Speed module for the whole run (your own Speed settings ride untouched) and sprint plainly (Always). Off = manual / Dynamic transit control.")
+        .defaultValue(true)
+        .build()
+    );
+
     final Setting<Boolean> activationReset = sgGeneral.add(new BoolSetting.Builder()
         .name("activation-reset")
         .description("Disable if the bot should continue after reconnecting to the server.")
@@ -489,6 +500,7 @@ public class StepCheckered extends Module {
     int breakStage;                                                  // 0 = printing, 2 = break(2), 4 = break-all
     volatile boolean startBuildingRequested;                         // START ALL deferred trigger
     boolean fullSweepActive;                                         // full-area RESET sweep in progress
+    boolean autoSpeedSession;                                        // auto-speed owns the Speed module this run
     // RESET ladder (checkpoint batches): 32 four-lane columns x 5 z-segments; each
     // segment is broken + picked to 100% and CONFIRMED by a bounded scan before the
     // ladder advances. Columns snake (N->S, S->N) so station moves stay short.
@@ -714,6 +726,27 @@ public class StepCheckered extends Module {
                 Integer batch = slave.parseStepBatch(parts.length > 1 ? parts[1] : null);
                 if (batch != null) master.stepSlaveDoneBatch = batch;
             }
+            case "echo" -> {
+                // step:echo:<phase>:<batch>:<count> - slave pass progress for the
+                // sweep station gate (user design, 2026-10-21). Validated against
+                // the CURRENT batch (a stale echo from a previous pass is dropped)
+                // and max-merged so a lagged duplicate can never regress a release.
+                if (parts.length >= 4) {
+                    Integer batch = slave.parseStepBatch(parts[2]);
+                    int count;
+                    try {
+                        count = Integer.parseInt(parts[3]);
+                    } catch (NumberFormatException e) {
+                        count = 0;
+                    }
+                    if (batch == null || count < 1 || count > 5 || batch != master.stepEchoBatch) return;
+                    if ("build".equals(parts[1])) {
+                        master.stepEchoBuildCount = Math.max(master.stepEchoBuildCount, count);
+                    } else if ("break2".equals(parts[1])) {
+                        master.stepEchoBreak2Count = Math.max(master.stepEchoBreak2Count, count);
+                    }
+                }
+            }
             case "closed" -> master.stepSlaveClosingDone = true;
             default -> {
                 if (debugPrints.get()) info("Unknown step progress message: " + message);
@@ -739,6 +772,7 @@ public class StepCheckered extends Module {
         restock.depositBacklogSlots = new ArrayList<>();
         restock.fullDepositChests = new HashSet<>();
         fullSweepActive = false;   // a module re-toggle must never inherit a dead reset
+        autoSpeedSession = false;  // re-pin sprint Always on the first tick of every activation
         lowerMapCorner = null;
         upperMapCorner = null;
         restock.lastInteractedChest = null;
@@ -980,7 +1014,39 @@ public class StepCheckered extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
+        autoSpeedTick();
         slave.tick(event);
+    }
+
+    /** auto-speed option: keep Meteor's Speed module enabled for the whole run with
+     *  the user's own Speed profile - no setting writes, no per-phase riding. On the
+     *  first session tick sprint-mode is pinned to plain Always (never Dynamic or
+     *  anything else). Runs BEFORE the engine tick so the Dynamic rider (updateTransit
+     *  Speed) sees the module already managed and stands down; turning the option off
+     *  mid-run disables the module we enabled, and a selected Dynamic mode re-takes
+     *  it the same tick. Deactivation still kills Speed via onDeactivate ->
+     *  setTransitSpeed(false). */
+    private void autoSpeedTick() {
+        if (autoSpeed.get()) {
+            if (!autoSpeedSession) {
+                autoSpeedSession = true;
+                if (sprinting.get() != SprintMode.Always) sprinting.set(SprintMode.Always);
+            }
+            try {
+                Speed speed = Modules.get().get(Speed.class);
+                if (!speed.isActive()) speed.toggle();
+            } catch (Exception e) {
+                warning("Speed module control failed: " + e.getMessage());
+            }
+        } else if (autoSpeedSession) {
+            autoSpeedSession = false;
+            try {
+                Speed speed = Modules.get().get(Speed.class);
+                if (speed.isActive()) speed.toggle();
+            } catch (Exception e) {
+                warning("Speed module control failed: " + e.getMessage());
+            }
+        }
     }
 
     /** START ALL deferred trigger: fired one tick after the HUD button enabled the

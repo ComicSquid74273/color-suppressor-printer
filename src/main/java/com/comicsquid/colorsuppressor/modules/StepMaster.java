@@ -67,6 +67,20 @@ final class StepMaster {
     static final int[] STEP_CHECKPOINT_Z = {14, 40, 64, 88, 112};
     static final int STEP_DWELL_TICKS = 80;
 
+    // ECHO CHECKPOINTS (user design, 2026-10-21): slave pass progress counters
+    // consumed by the sweep station gate. Written from the TCP reader thread like
+    // the other stepSlave* flags; validated against the CURRENT batch there and
+    // max-merged so a lagged echo can never regress a release.
+    volatile int stepEchoBuildCount;
+    volatile int stepEchoBreak2Count;
+    volatile int stepEchoBatch = -1;
+    // Progressive sweep feed: a station enters the checkpoint queue ONLY once its
+    // echo release has arrived, so the walker physically cannot walk to - or dwell
+    // at - an unreleased station (empty queue = the master stands still).
+    boolean stepSweepFeederActive;
+    int stepSweepLane, stepSweepStartSpot, stepSweepEndSpot, stepSweepNextSpot, stepSweepDir;
+    int stepSweepFedOrdinal = -1;   // ordinal of the most recently queued station (the hold gate reads it)
+
     StepMaster(StepCheckered mod) {
         this.mod = mod;
         maps = new MapLifecycle(mod);
@@ -98,6 +112,16 @@ final class StepMaster {
         stepSavedProgressMapId = -1;
         cachedResumeBatch = -1;
         mapHoldWarnCooldown = 0;
+        stepEchoBuildCount = 0;
+        stepEchoBreak2Count = 0;
+        stepEchoBatch = -1;
+        stepSweepFeederActive = false;
+        stepSweepLane = -1;
+        stepSweepStartSpot = -1;
+        stepSweepEndSpot = -1;
+        stepSweepNextSpot = -1;
+        stepSweepDir = 1;
+        stepSweepFedOrdinal = -1;
     }
 
     void beginStepMasterRun() {
@@ -239,6 +263,9 @@ final class StepMaster {
         stepSlaveReadyBatch = -1;
         stepSlaveBreak2DoneBatch = -1;
         stepSlaveDoneBatch = -1;
+        stepEchoBuildCount = 0;
+        stepEchoBreak2Count = 0;
+        stepEchoBatch = 0;
         stepMasterBreak2Sent = false;
         stepMasterBreakAllSent = false;
         stepSendToSlave("prime");
@@ -266,6 +293,9 @@ final class StepMaster {
         stepSlaveReadyBatch = stepSlaveReadyBatch == batch ? batch : -1;
         stepSlaveBreak2DoneBatch = -1;
         stepSlaveDoneBatch = -1;
+        stepEchoBuildCount = 0;
+        stepEchoBreak2Count = 0;
+        stepEchoBatch = batch;
         stepMasterBreak2Sent = false;
         stepMasterBreakAllSent = false;
         if (batch == 0 && mod.batch0SplitBuild.get()) {
@@ -344,27 +374,91 @@ final class StepMaster {
 
     void stepQueueSweep(int lane, int startSpot, int endSpot) {
         mod.checkpoints.clear();
-        int direction = Integer.compare(endSpot, startSpot);
-        for (int spot = startSpot; ; spot += direction) {
-            // SWEEP STANDING = PLATFORM CENTRE (lane + 0.5) - the EXACT position of the
-            // proven python runner's cp(): (127 + 2k + 0.5), 0 mismatches across dozens
-            // of verified batches. The old edge standing (lane + 0.0, from the dormant
-            // batch-0 split proof) had ZERO pixel-verified normal batches behind it and
-            // shaved the margin on the east pair's record band; the runner's centre is
-            // the only experimentally proven standing.
-            mod.checkpoints.add(new Pair<>(new Vec3d(
-                mod.lowerMapCorner.getX() + lane + 0.5,
-                mod.lowerMapCorner.getY(),
-                mod.lowerMapCorner.getZ() + STEP_CHECKPOINT_Z[spot] + 0.5), new Pair<>("stepDwell", null)));
-            if (spot == endSpot) break;
-        }
+        // SWEEP STANDING = PLATFORM CENTRE (lane + 0.5) - the EXACT position of the
+        // proven python runner's cp(): (127 + 2k + 0.5), 0 mismatches across dozens
+        // of verified batches. The old edge standing (lane + 0.0, from the dormant
+        // batch-0 split proof) had ZERO pixel-verified normal batches behind it and
+        // shaved the margin on the east pair's record band; the runner's centre is
+        // the only experimentally proven standing.
+        stepSweepLane = lane;
+        stepSweepStartSpot = startSpot;
+        stepSweepEndSpot = endSpot;
+        stepSweepDir = Integer.compare(endSpot, startSpot);
+        stepSweepNextSpot = startSpot;
+        stepSweepFeederActive = true;
         mod.state = State.Walking;
         stepMasterDwellTicks = 0;
         stepMasterSweepCompletionPending = false;
-        // Approach discipline: reach the first station via LATTICE legs (gate if
-        // entering from outside) - never a diagonal across the area (the resume case).
-        Vec3d firstStation = mod.checkpoints.getFirst().getLeft();
-        prependLatticeTransit(firstStation.x, firstStation.z);
+        stepFeedSweepStations();
+    }
+
+    /** ECHO STATION FEED (user design, 2026-10-21): queues the next sweep station
+     *  only once its WALK release has arrived, one station ahead at a time. The
+     *  walker moves exclusively toward queued checkpoints, so the master never
+     *  walks to an unreleased station - and while gated it stands with the map
+     *  stowed, counting the SAME named-wait heartbeat/timeout as every other
+     *  wait (a dead slave trips the 10-minute abort, not a silent hang). */
+    void stepFeedSweepStations() {
+        if (!stepSweepFeederActive || !mod.checkpoints.isEmpty()) return;
+        if (stepSweepNextSpot == stepSweepEndSpot + stepSweepDir) {
+            stepSweepFeederActive = false;   // every station queued - the walk finishes itself
+            return;
+        }
+        int ordinal = Math.abs(stepSweepNextSpot - stepSweepStartSpot);
+        if (!stepWalkReleased(ordinal)) {
+            stepWaitTick("echo " + (ordinal + 1) + "/4 (walk to station " + (ordinal + 1)
+                + "/5 of the " + (stepMasterStage == StepMasterStage.BATCH_WALK_B ? "break(2) shadow" : "print shadow") + ")");
+            return;
+        }
+        boolean isFinal = stepSweepNextSpot == stepSweepEndSpot;
+        mod.checkpoints.add(new Pair<>(new Vec3d(
+            mod.lowerMapCorner.getX() + stepSweepLane + 0.5,
+            mod.lowerMapCorner.getY(),
+            mod.lowerMapCorner.getZ() + STEP_CHECKPOINT_Z[stepSweepNextSpot] + 0.5),
+            new Pair<>(isFinal ? "stepDwellFinal" : "stepDwell", null)));
+        if (ordinal == 0) {
+            // Approach discipline: reach the first station via LATTICE legs (gate if
+            // entering from outside) - never a diagonal across the area (the resume case).
+            Vec3d firstStation = mod.checkpoints.getFirst().getLeft();
+            prependLatticeTransit(firstStation.x, firstStation.z);
+        }
+        stepSweepFedOrdinal = ordinal;
+        stepMasterWaitTicks = 0;   // progress made - reset the gated-wait stall counter
+        stepSweepNextSpot += stepSweepDir;
+    }
+
+    /** Walk release (user rule, tightened 2026-10-21): the master may WALK toward
+     *  sweep station ordinal k once the slave's echo count >= k+1. Walking is
+     *  map-STOWED transit (the live-proven hold guard), so an early walk touches
+     *  no pixels - the hold is the only thing that records. */
+    boolean stepWalkReleased(int ordinal) {
+        return stepEchoReleased(ordinal + 1);
+    }
+
+    /** Hold release (user rule): the map is held / the dwell starts at station
+     *  ordinal k only once the slave's echo count >= k+2 - the slave stays ONE
+     *  travel checkpoint (~26 rows) ahead of the master's +-14-15 row record
+     *  band, keeping >= ~21 rows of slack at every hold (station 1: band edge
+     *  ~29 vs slave at row 52; the binding cases sit at 21-24). The echo max is
+     *  4, so stations 4-5 hold only on the pass-done signals - station 5's band
+     *  touches the last rows, which is exactly the old full-build semantics.
+     *  With NO echoes at all the sweep degenerates to the old full-wait flow
+     *  (ready / break2done release everything). */
+    boolean stepHoldReleased(int ordinal) {
+        return stepEchoReleased(ordinal + 2);
+    }
+
+    private boolean stepEchoReleased(int requiredEcho) {
+        if (stepMasterStage == StepMasterStage.CLOSING_WALK) return true;
+        if (stepMasterStage == StepMasterStage.BATCH_WALK_A) {
+            return stepSlaveReadyBatch == stepMasterBatch
+                || (stepEchoBatch == stepMasterBatch && stepEchoBuildCount >= requiredEcho);
+        }
+        if (stepMasterStage == StepMasterStage.BATCH_WALK_B) {
+            return stepSlaveBreak2DoneBatch == stepMasterBatch
+                || (stepEchoBatch == stepMasterBatch && stepEchoBreak2Count >= requiredEcho);
+        }
+        return true;
     }
 
     void stepStartSweep(int lane, int startSpot, int endSpot) {
@@ -604,23 +698,39 @@ final class StepMaster {
         switch (stepMasterStage) {
             case WAIT_BREAK_2 -> {
                 // break(2) in progress. Sent at W1's completion (fallback: here).
-                // When the slave reports break2done, W2 (the S->N suppression walk)
-                // starts - NEVER before break(2) completes (user rule, live 2026-10-20).
+                // W2 (the S->N suppression walk) starts either on break2done (the
+                // full-wait rule, kept as the completion path and the no-echo
+                // fallback) or on break(2) echo 1/4 - the WALK level. It then
+                // trails the pass: the map is only HELD at a station once the
+                // slave's echo count reaches station+2 (stepHoldReleased), so the
+                // record band stays >= ~21 rows behind the breaking frontier.
                 if (!stepMasterBreak2Sent) {
                     stepMasterBreak2Sent = true;
                     stepSendToSlave("break2");
                     mod.info("§aBatch " + stepMasterBatch + ": break(2) requested.");
-                } else if (stepSlaveBreak2DoneBatch == stepMasterBatch) {
+                } else if (stepSlaveBreak2DoneBatch == stepMasterBatch
+                    || (stepEchoBatch == stepMasterBatch && stepEchoBreak2Count >= 1)) {
                     stepBreak2Ms = System.currentTimeMillis() - stepPhaseStartMs;
                     stepPhaseStartMs = System.currentTimeMillis();
                     stepMasterStage = StepMasterStage.BATCH_WALK_B;
                     int w2Lane = 2 * (stepMasterBatch + 1) + 127;
                     stepStartSweep(w2Lane, 4, 0);   // W2: fixed S->N
-                    mod.info("§aBatch " + stepMasterBatch + ": break(2) complete - W2 suppression walk starting.");
+                    mod.info(stepSlaveBreak2DoneBatch == stepMasterBatch
+                        ? "§aBatch " + stepMasterBatch + ": break(2) complete - W2 suppression walk starting."
+                        : "§aBatch " + stepMasterBatch + ": break(2) echo 1/4 - W2 walking, holds from echo 2/4.");
                 }
             }
             case WAIT_BATCH_BUILD -> {
-                if (stepSlaveReadyBatch == stepMasterBatch) {
+                // W1 launches on ready (the full-wait fallback) or on print echo
+                // 1/4 - the WALK level. It then trails the print: the map is only
+                // HELD at a station once the slave's echo count reaches station+2
+                // (stepHoldReleased), keeping the record band >= ~21 rows behind
+                // the completeness frontier. Batch 0 split-build keeps its
+                // ready-gated choreography: its W1 records the floor+borrow half
+                // and must not start early.
+                boolean echoLaunch = stepEchoBatch == stepMasterBatch && stepEchoBuildCount >= 1
+                    && !(stepMasterBatch == 0 && mod.batch0SplitBuild.get());
+                if (stepSlaveReadyBatch == stepMasterBatch || echoLaunch) {
                     stepBuildMs = System.currentTimeMillis() - stepPhaseStartMs;
                     stepPhaseStartMs = System.currentTimeMillis();
                     stepMasterStage = StepMasterStage.BATCH_WALK_A;
@@ -629,6 +739,11 @@ final class StepMaster {
                     int lane = stepMasterBatch == 0 && mod.batch0SplitBuild.get() && !stepMasterBreak2Sent
                         ? 125 : 2 * stepMasterBatch + 127;
                     stepStartSweep(lane, 0, 4);   // W1: fixed N->S
+                    if (!echoLaunch || stepSlaveReadyBatch == stepMasterBatch) {
+                        mod.info("§aBatch " + stepMasterBatch + ": build complete - W1 starting.");
+                    } else {
+                        mod.info("§aBatch " + stepMasterBatch + ": print echo 1/4 - W1 walking, holds from echo 2/4.");
+                    }
                 }
             }
             case WAIT_CLOSING_BUILD -> {
@@ -698,6 +813,11 @@ final class StepMaster {
             return;
         }
 
+        // Echo station feed: the next sweep station enters the queue only when its
+        // release has arrived. Runs before the walker's empty-queue standstill so a
+        // release transitions to walking on the same tick it arrives.
+        stepFeedSweepStations();
+
         if (mod.checkpoints.isEmpty()) {
             Utils.setForwardPressed(false);
             Utils.setSneakPressed(false);
@@ -709,7 +829,24 @@ final class StepMaster {
         Vec3d goal = mod.checkpoints.getFirst().getLeft();
         Vec3d horizontalGoal = goal.add(0, mc.player.getY() - goal.y, 0);
         if (PlayerUtils.distanceTo(horizontalGoal) < mod.checkpointBuffer.get()) {
-            String action = mod.checkpoints.removeFirst().getRight().getLeft();
+            String action = mod.checkpoints.getFirst().getRight().getLeft();
+            // HOLD GATE (echo checkpoints): ARRIVED at a sweep station whose hold
+            // release hasn't arrived yet - do NOT consume the checkpoint. Stand on
+            // it with the map stowed (standing is pixel-free; only the dwell-HOLD
+            // records) and count the gated wait; the station dispatches on the
+            // very tick its echo lands. Feeding the next station is blocked too,
+            // because this one still occupies the queue head.
+            if ((action.equals("stepDwell") || action.equals("stepDwellFinal"))
+                && (stepMasterStage == StepMasterStage.BATCH_WALK_A
+                    || stepMasterStage == StepMasterStage.BATCH_WALK_B)
+                && !stepHoldReleased(stepSweepFedOrdinal)) {
+                Utils.setForwardPressed(false);
+                Utils.setSneakPressed(false);
+                stepWaitTick("echo " + (stepSweepFedOrdinal + 2) + "/4 (hold at station " + (stepSweepFedOrdinal + 1)
+                    + "/5 of the " + (stepMasterStage == StepMasterStage.BATCH_WALK_B ? "break(2) shadow" : "print shadow") + ")");
+                return;
+            }
+            mod.checkpoints.removeFirst();
             String cpLog = action + "@" + (int) goal.x + "," + (int) goal.y + "," + (int) goal.z;
             if (!cpLog.equals(lastMasterCpLog)) {
                 lastMasterCpLog = cpLog;
@@ -834,7 +971,7 @@ final class StepMaster {
             case "stepTransit" -> {
                 // Crossing a platform while the map is stowed is intentionally a no-op.
             }
-            case "stepDwell" -> {
+            case "stepDwell", "stepDwellFinal" -> {
                 if (stepMasterStage != StepMasterStage.BATCH_WALK_A
                     && stepMasterStage != StepMasterStage.BATCH_WALK_B
                     && stepMasterStage != StepMasterStage.CLOSING_WALK) return;
@@ -843,7 +980,12 @@ final class StepMaster {
                     return;
                 }
                 stepMasterDwellTicks = STEP_DWELL_TICKS;
-                stepMasterSweepCompletionPending = mod.checkpoints.isEmpty();
+                stepMasterWaitTicks = 0;   // the hold gate (if any) just released
+                // The echo feeder keeps unreleased stations OUT of the queue, so an
+                // empty queue no longer means "sweep over" - only the tagged final
+                // station completes the sweep (a mid-walk empty queue is just the
+                // next station waiting for its echo release).
+                stepMasterSweepCompletionPending = "stepDwellFinal".equals(action);
             }
             default -> {
                 if (mod.debugPrints.get()) mod.info("Unknown step master checkpoint action: " + action);
@@ -908,6 +1050,8 @@ final class StepMaster {
         mod.checkpoints.clear();
         mod.state = State.StandBy;
         stepSweepQueuePending = false;
+        stepSweepFeederActive = false;
+        stepSweepFedOrdinal = -1;
         stepMasterDwellTicks = 0;
         stepMasterSweepCompletionPending = false;
         Utils.setForwardPressed(false);

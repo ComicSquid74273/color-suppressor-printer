@@ -73,6 +73,16 @@ final class SlaveEngine {
     boolean transitSpeedOn;
     private final ArrayDeque<String> pendingStepCommands = new ArrayDeque<>();
 
+    // ECHO CHECKPOINTS (user design, 2026-10-21): 5 equally spaced travel-fraction
+    // pings per shadowed pass (print + break(2) only) - fire-and-forget telemetry,
+    // the slave NEVER waits on them. The master releases its sweep stations on the
+    // echo COUNT (station k once the slave's echo count >= k+2 = mating distance 2).
+    private static final int[] ECHO_ROW_THRESHOLDS = {26, 52, 77, 103};
+    private int echoNextBuild = 1;
+    private int echoNextBreak2 = 1;
+    private int echoLastBreakStage = -1;
+    private int echoLastBatch = -1;
+
     /** RESET ladder z-segments: inclusive row ranges and station centres (relative). */
     /** Block drops skid up to 3-4 blocks outside the segment / print box (user-measured). */
 
@@ -96,6 +106,10 @@ final class SlaveEngine {
         sweepReArmSig = null;
         heartbeatTicks = 0;
         debugLastAction = null;
+        echoNextBuild = 1;
+        echoNextBreak2 = 1;
+        echoLastBreakStage = -1;
+        echoLastBatch = -1;
         debugPreviousState = null;
         stuckCheckpointCount = 0;
         lastCheckpointAction = null;
@@ -157,6 +171,47 @@ final class SlaveEngine {
             if (!LocalTCPTransport.isRunning()) {
                 SlaveSystem.setTcpAddress(mod.tcpIp.get(), mod.tcpPort.get());
                 if (LocalTCPTransport.isRunning()) mod.info("Reconnected to master");
+            }
+        }
+    }
+
+    /** ECHO CHECKPOINTS (user design, 2026-10-21): fired from the pass tick, pure
+     *  position math - no latch, no state to resync, crash/resume safe. Travel is
+     *  measured from the pass's entry edge (print N->S from row 0, break(2) S->N
+     *  from row 127 - the FIXED CYCLE makes the directions static). Guarded to
+     *  in-box positions only, so supply/emergency/prep trips north can never fire
+     *  progress the window hasn't made. Counters reset at every pass boundary
+     *  (breakStage or batch change); walking back for stragglers only lowers
+     *  traveled, so sweeps can never fire an unearned echo. */
+    void tickEchoCheckpoints() {
+        if (!SlaveSystem.isSlave || mod.lowerMapCorner == null || mc.player == null) return;
+        if (mod.fullSweepActive) return;   // the RESET ladder is not a shadowed pass
+        if (mod.breakStage != echoLastBreakStage || mod.currentBatch != echoLastBatch) {
+            echoLastBreakStage = mod.breakStage;
+            echoLastBatch = mod.currentBatch;
+            echoNextBuild = 1;
+            echoNextBreak2 = 1;
+        }
+        // Batch 0 split-build keeps its own mid-build choreography (buildhalf) -
+        // its W1 must launch on ready, so that build pass sends no echoes.
+        boolean splitBatch0 = mod.currentBatch == 0 && mod.batch0SplitBuild.get();
+        int botZ = mc.player.getBlockZ();
+        int cornerZ = mod.lowerMapCorner.getZ();
+        boolean inBox = botZ >= cornerZ && botZ <= cornerZ + 127;
+        if (mod.breakStage == 0 && !splitBatch0 && mod.currentBuildPlan != null
+            && mod.state.equals(State.Walking) && inBox) {
+            int traveled = botZ - cornerZ;   // print: fixed N->S
+            while (echoNextBuild <= ECHO_ROW_THRESHOLDS.length && traveled >= ECHO_ROW_THRESHOLDS[echoNextBuild - 1]) {
+                SlaveSystem.sendMessageToMaster("step:echo:build:" + mod.currentBatch + ":" + echoNextBuild);
+                echoNextBuild++;
+            }
+        }
+        if (mod.breakStage == 2 && mod.currentBuildPlan != null && inBox
+            && (mod.state.equals(State.Walking) || mod.state.equals(State.Mining))) {
+            int traveled = (cornerZ + 127) - botZ;   // break(2): fixed S->N
+            while (echoNextBreak2 <= ECHO_ROW_THRESHOLDS.length && traveled >= ECHO_ROW_THRESHOLDS[echoNextBreak2 - 1]) {
+                SlaveSystem.sendMessageToMaster("step:echo:break2:" + mod.currentBatch + ":" + echoNextBreak2);
+                echoNextBreak2++;
             }
         }
     }
@@ -956,6 +1011,13 @@ final class SlaveEngine {
 
 
     void updateTransitSpeed() {
+        // auto-speed option owns the Speed module for the whole run (hub autoSpeed
+        // Tick): retire any live Dynamic session WITHOUT disabling the module, and
+        // never ride phases - "enable it, sprint Always, change nothing else".
+        if (mod.autoSpeed.get()) {
+            transitSpeedOn = false;
+            return;
+        }
         if (mod.sprinting.get() != StepCheckered.SprintMode.Dynamic) {
             if (transitSpeedOn) setTransitSpeed(false);
             return;
@@ -1029,6 +1091,7 @@ final class SlaveEngine {
         if (SlaveSystem.isSlave) {
             if (tryResumePendingReset()) return;
             processPendingStepCommands();
+            tickEchoCheckpoints();
         } else if (mod.master.stepMasterStage != StepMasterStage.IDLE) {
             mod.master.tickStepMaster();
             return;
