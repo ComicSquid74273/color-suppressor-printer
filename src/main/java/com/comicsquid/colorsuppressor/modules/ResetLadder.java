@@ -125,6 +125,7 @@ final class ResetLadder {
         int ix0 = lx0 - RESET_ITEM_MARGIN, ix1 = lx1 + RESET_ITEM_MARGIN;
         int iz0 = lz0 - RESET_ITEM_MARGIN, iz1 = lz1 + RESET_ITEM_MARGIN;
         if (mod.restock.freeInventoryCapacity() == 0 && mod.slave.scan.findNearestItemInArea(ix0, ix1, iz0, iz1) != null) {
+            mod.restock.clearFilteredDump();   // emergency strip, not a quantity dump
             Pair<BlockPos, Vec3d> ladderChest = mod.restock.getBestDepositChest();
             if (ladderChest != null) {
                 mod.checkpoints.clear();
@@ -225,6 +226,7 @@ final class ResetLadder {
         mod.checkpoints.clear();
         mod.slave.printRepairPending = false;
         mod.restock.depositBacklogSlots.clear();
+        mod.restock.clearFilteredDump();
         mod.restock.restockBacklogSlots.clear();
         mod.restock.restockList.clear();
         mod.slave.batchPassRetries = 0;
@@ -323,6 +325,7 @@ final class ResetLadder {
         // finished at the SOUTH end the bare deposit checkpoint was next and the bot
         // beelined diagonally to the north chest, queue=2 in the log).
         Pair<BlockPos, Vec3d> doneChest = mod.restock.getBestDepositChest();
+        mod.restock.clearFilteredDump();   // abort-flow dump is a full strip
         double corridorZ = mod.lowerMapCorner.getZ() - 2;
         double y = mod.lowerMapCorner.getY();
         if (doneChest != null) {

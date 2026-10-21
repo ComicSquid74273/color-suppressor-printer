@@ -266,74 +266,46 @@ final class BatchRouter {
         mod.restock.mod.restock.refillFromCurrentPlan();
         boolean materialRestockQueued = !mod.restock.mod.restock.restockList.isEmpty();
 
-        // UNNEEDED-MATERIAL DUMP (user rule, 2026-10-20), inlined body-only (hotswap-
-        // safe): deposit carried building materials that NO remaining batch (or the
-        // closing) will ever place - leftovers from finished batches otherwise squat on
-        // slots for the rest of the run. Pre-fills mod.restock.mod.restock.depositBacklogSlots (the deposit
-        // handler treats a pre-filled backlog at chest-open as a filtered dump) and
-        // rides the SAME north-corridor trip, before the first refill checkpoint.
-        if (mod.lowerMapCorner != null && mod.stepLayers != null && mod.currentBatch >= 0) {
-            // QUANTITATIVE future need: per-item block counts over all remaining
-            // batches + closing (nothing stands yet for future batches, so full plan
-            // counts). Excess beyond that need is dead weight fragmenting slots - the
-            // live batch-1 stall: inventory full of prior-run drops, every item
-            // "needed" by SOME future batch, zero free slots at the chest withdrawal.
-            HashMap<Item, Integer> futureNeed = new HashMap<>();
-            for (int fb = mod.currentBatch; fb <= 62; fb++) {
-                for (Block fbBlock : mod.assembleBatch(fb).values()) {
-                    Item fbItem = fbBlock.asItem();
-                    futureNeed.put(fbItem, futureNeed.getOrDefault(fbItem, 0) + 1);
-                }
-            }
-            for (Block cb : mod.assembleClosing().values()) {
-                Item cbItem = cb.asItem();
-                futureNeed.put(cbItem, futureNeed.getOrDefault(cbItem, 0) + 1);
-            }
-            HashMap<Item, Integer> carried = new HashMap<>();
-            HashMap<Item, ArrayList<Integer>> itemSlots = new HashMap<>();
-            for (int dSlot = 0; dSlot < 36; dSlot++) {
-                ItemStack dStack = mc.player.getInventory().getStack(dSlot);
-                if (dStack.isEmpty() || ToolUtils.isTool(dStack) || dStack.contains(DataComponentTypes.FOOD)) continue;
-                if (!mod.materialDict.containsKey(dStack.getItem())) continue;
-                Item dItem = dStack.getItem();
-                carried.put(dItem, carried.getOrDefault(dItem, 0) + dStack.getCount());
-                ArrayList<Integer> listForItem = itemSlots.get(dItem);
-                if (listForItem == null) { listForItem = new ArrayList<>(); itemSlots.put(dItem, listForItem); }
-                listForItem.add(dSlot);
-            }
-            HashSet<Item> unneededItems = null;
-            ArrayList<Integer> dumpSlots = new ArrayList<>();
-            for (Map.Entry<Item, ArrayList<Integer>> ent : itemSlots.entrySet()) {
-                int need = futureNeed.getOrDefault(ent.getKey(), 0);
-                int have = carried.getOrDefault(ent.getKey(), 0);
-                if (have <= need) continue;   // fully used later - keep every stack
-                int toDump = have - need;     // deposit the excess, newest slots first
-                ArrayList<Integer> slotsOfItem = ent.getValue();
-                for (int si = slotsOfItem.size() - 1; si >= 0 && toDump > 0; si--) {
-                    int dSlot = slotsOfItem.get(si);
-                    dumpSlots.add(dSlot);
-                    toDump -= mc.player.getInventory().getStack(dSlot).getCount();
-                    if (unneededItems == null) unneededItems = new HashSet<>();
-                    if (!unneededItems.contains(ent.getKey())) { unneededItems.add(ent.getKey()); }
-                }
-            }
-            if (unneededItems != null) {
-                Pair<BlockPos, Vec3d> dumpChest = mod.restock.mod.restock.getBestDepositChest();
+        // EXACT-QUANTITY PREP DUMP (user rule, 2026-10-21): keep exactly what this
+        // build still needs, deposit the excess, refill the deficit - ONE trip.
+        // The NEED snapshot is taken here (priming swaps the plan right after
+        // queueing, and the refill above used the same world truth, so dump and
+        // withdrawal agree by construction). The stack selection re-derives live
+        // at every chest-open in RestockManager.buildFilteredDumpBacklog: the old
+        // queue-time pre-fill used INVENTORY indices where the drain reads
+        // CHEST-SCREEN indices (hotbar/main-9..26 slots pointed at CHEST stacks
+        // and pulled items OUT), and the drain's strip chain then dumped
+        // materials the refill leg in this same trip was about to re-withdraw -
+        // the dump-then-refill churn.
+        if (mod.lowerMapCorner != null && mod.currentBatch >= 0 && mod.currentBuildPlan != null) {
+            mod.restock.mod.restock.filteredDumpNeed = mod.restock.mod.restock.getRequiredItems();
+            HashSet<Item> excessItems = mod.restock.mod.restock.excessItemsBeyondNeed();
+            if (!excessItems.isEmpty()) {
+                Pair<BlockPos, Vec3d> dumpChest = mod.restock.mod.restock.getNextFilteredDepositChest(excessItems);
+                StringBuilder dumpNames = new StringBuilder();
+                for (Item dn : excessItems) { if (dumpNames.length() > 0) dumpNames.append(", "); dumpNames.append(dn.getName().getString()); }
                 if (dumpChest != null) {
-                    mod.restock.mod.restock.depositBacklogSlots.clear();
-                    mod.restock.mod.restock.depositBacklogSlots.addAll(dumpSlots);
-                    StringBuilder dumpNames = new StringBuilder();
-                    for (Item dn : unneededItems) { if (dumpNames.length() > 0) dumpNames.append(", "); dumpNames.append(dn.getName().getString()); }
-                    mod.info("§7Prep dump: depositing materials no future batch uses (" + dumpNames + ").");
+                    mod.restock.mod.restock.depositBacklogSlots.clear();   // selection happens at chest-open
+                    mod.restock.mod.restock.filteredDumpActive = true;
+                    mod.info("§7Prep dump planned: excess of §b" + dumpNames + "§7 beyond this build's need - depositing before the refill.");
                     int insertAt = 0;
                     for (int ci = 0; ci < mod.checkpoints.size(); ci++) {
                         String ca = mod.checkpoints.get(ci).getRight().getLeft();
                         if ("refill".equals(ca) || "mod.foodChest".equals(ca)) { insertAt = ci; break; }
                     }
                     mod.checkpoints.add(insertAt, new Pair(new Vec3d(dumpChest.getRight().x, dumpChest.getRight().y, dumpChest.getRight().z), new Pair("depositUnneeded", dumpChest.getLeft())));
+                } else {
+                    mod.restock.mod.restock.clearFilteredDump();
+                    mod.warning("§ePrep dump: no chest with room for the excess (" + dumpNames + ") - carrying it on.");
                 }
+            } else {
+                mod.restock.mod.restock.clearFilteredDump();
             }
         }
+        // TOOLS CAN SIT ANYWHERE (user rule, live 06:49: an offhand axe read as
+        // "missing" and the prep fetched a duplicate). Pull any offhand tool into
+        // the main inventory FIRST, then every scan below sees one pool.
+        mod.restock.mod.restock.normalizeToolsFromOffhand();
         // PICKAXE (user rule, 2026-10-20): tools are exchanged ONLY here - at the
         // pre-batch restock trip, when the best pickaxe has gone BELOW min-durability
         // (strictly below, not at the touch). Never mid-run: a worn pickaxe keeps
@@ -372,10 +344,10 @@ final class BatchRouter {
         // healthy -> KEPT (no withdrawal); >1 carried -> spares deposit.
         {
             // ONE scan pass: best remaining durability + carried count (the one-axe
-            // invariant's evidence)
+            // invariant's evidence). 40 = offhand: tools can sit anywhere.
             int bestAxeRemaining = -1;
             int axeCarried = 0;
-            for (int aSlot = 0; aSlot < 36; aSlot++) {
+            for (int aSlot = 0; aSlot <= 40; aSlot++) {
                 ItemStack aStack = mc.player.getInventory().getStack(aSlot);
                 if (aStack.isEmpty() || !aStack.isIn(ItemTags.AXES)) continue;
                 axeCarried++;
@@ -518,6 +490,7 @@ final class BatchRouter {
 
     void pauseBreakAllForDeposit() {
         mod.info("§eInventory full - depositing building blocks before continuing the break.");
+        mod.restock.mod.restock.clearFilteredDump();   // emergency strip, not a quantity dump
         mod.breakStage = 0;
         mod.checkpoints.clear();
         // Explicit order: chest visit -> north re-entry on the batch lane -> resumed
@@ -572,19 +545,21 @@ final class BatchRouter {
         double startZ = mod.lowerMapCorner.getZ() - 2;
         double farZ = mod.lowerMapCorner.getZ() + 128.7;
 
-        Pair<BlockPos, Vec3d> chest = mod.restock.mod.restock.getBestDepositChest();
+        // NO pre-break dump (user rule, 2026-10-21): the old deposit tour here
+        // (out to the chests, strip every carried material, walk back) only made
+        // the next batch's prep trip withdraw the same items again - prep already
+        // dumps/recounts on its own trip. Carried materials ride into break-all
+        // (drops merge into the same partial stacks); a true overflow stays
+        // covered by the exact triggers: mid-break capacity==0
+        // (pauseBreakAllForDeposit), finishBatch's full-with-drops deposit, and
+        // the prep trip's quantitative dump.
         mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), startZ), new Pair("breakAllBegin", null)));
         mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), farZ), new Pair("breakAllDone", null)));
         mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), farZ), new Pair("batchExit", null)));
-        if (chest != null) {
-            mod.checkpoints.addFirst(new Pair(chest.getRight(), new Pair("depositBuilding", chest.getLeft())));
-            prependNorthCorridor(chest.getRight().x);
-        } else {
-            prependNorthCorridor(walkX);
-        }
+        prependNorthCorridor(walkX);
         mod.state = State.Walking;
         Utils.setForwardPressed(false);
-        mod.info("§aBreak-all: depositing building blocks first, then recycling batch " + mod.currentBatch + ".");
+        mod.info("§aBreak-all: recycling batch " + mod.currentBatch + " (materials kept for the next prep).");
     }
 
 }

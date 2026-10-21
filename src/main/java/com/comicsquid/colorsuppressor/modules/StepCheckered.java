@@ -770,6 +770,7 @@ public class StepCheckered extends Module {
         startedFiles = new ArrayList<>();
         restock.restockBacklogSlots = new ArrayList<>();
         restock.depositBacklogSlots = new ArrayList<>();
+        restock.clearFilteredDump();
         restock.fullDepositChests = new HashSet<>();
         fullSweepActive = false;   // a module re-toggle must never inherit a dead reset
         autoSpeedSession = false;  // re-pin sprint Always on the first tick of every activation

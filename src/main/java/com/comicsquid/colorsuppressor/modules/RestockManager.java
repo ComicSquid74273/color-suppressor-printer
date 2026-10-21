@@ -52,6 +52,12 @@ final class RestockManager {
     int interactTimeout;
     InventoryS2CPacket toBeHandledInvPacket;
     boolean closeNextInvPacket;
+    // FILTERED PREP DUMP (user rule, 2026-10-21): the prep-trip deposit keeps
+    // exactly what the upcoming build still needs and deposits only the excess.
+    // The need snapshot is taken at queue time (priming swaps the plan right
+    // after queueing); the stack selection re-derives live at every chest-open.
+    boolean filteredDumpActive;
+    HashMap<Item, Integer> filteredDumpNeed;
 
     RestockManager(StepCheckered mod) {
         this.mod = mod;
@@ -68,6 +74,95 @@ final class RestockManager {
         interactTimeout = 0;
         toBeHandledInvPacket = null;
         closeNextInvPacket = false;
+        clearFilteredDump();
+    }
+
+    void clearFilteredDump() {
+        filteredDumpActive = false;
+        filteredDumpNeed = null;
+    }
+
+    /** Items currently carried BEYOND the snapshotted need (tools/food never
+     *  count). Derived from the live inventory so drops picked up en route
+     *  simply join the excess. */
+    HashSet<Item> excessItemsBeyondNeed() {
+        HashSet<Item> excess = new HashSet<>();
+        if (filteredDumpNeed == null) return excess;
+        HashMap<Item, Integer> carried = new HashMap<>();
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (stack.isEmpty() || ToolUtils.isTool(stack) || stack.contains(DataComponentTypes.FOOD)) continue;
+            if (!mod.materialDict.containsKey(stack.getItem())) continue;
+            carried.merge(stack.getItem(), stack.getCount(), Integer::sum);
+        }
+        for (Map.Entry<Item, Integer> ent : carried.entrySet()) {
+            if (ent.getValue() > filteredDumpNeed.getOrDefault(ent.getKey(), 0)) excess.add(ent.getKey());
+        }
+        return excess;
+    }
+
+    /** Nearest chest stocking any of the given excess items, skipping the
+     *  last-interacted and known-full ones. Deliberately NOT getNextDepositChest:
+     *  that one chains while ANY stocking material is carried - correct for the
+     *  emergency full strip, wrong for a quantity dump (it would strip exactly
+     *  the materials the refill leg is about to count on). */
+    Pair<BlockPos, Vec3d> getNextFilteredDepositChest(HashSet<Item> items) {
+        Pair<BlockPos, Vec3d> best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (Item item : items) {
+            for (Pair<BlockPos, Vec3d> chest : mod.materialDict.getOrDefault(item, new ArrayList<>())) {
+                if (lastInteractedChest != null && chest.getLeft().equals(lastInteractedChest)) continue;
+                if (fullDepositChests.contains(chest.getLeft())) continue;
+                double dist = PlayerUtils.distanceTo(chest.getRight());
+                if (dist < bestDist) { bestDist = dist; best = chest; }
+            }
+        }
+        return best;
+    }
+
+    /** CHEST-OPEN selection for the filtered dump: re-derive the excess live and
+     *  queue whole stacks as CHEST-SCREEN indices - the packet's last 36 slots
+     *  are the player inventory in screen space, the exact indexing
+     *  drainDepositBacklog clicks. (The old queue-time pre-fill used INVENTORY
+     *  indices: 0-26 pointed at CHEST stacks and quick-moved them OUT.) Screen
+     *  order visits main inventory before the hotbar, so the pre-staged hotbar
+     *  survives whenever the excess reaches into main inventory. */
+    void buildFilteredDumpBacklog(InventoryS2CPacket packet) {
+        depositBacklogSlots.clear();
+        if (filteredDumpNeed == null) {
+            clearFilteredDump();
+            mod.timeoutTicks = mod.postRestockDelay.get();
+            mod.state = State.Walking;
+            return;
+        }
+        HashMap<Item, Integer> surplus = new HashMap<>();
+        for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
+            ItemStack stack = packet.contents().get(slot);
+            if (stack.isEmpty() || ToolUtils.isTool(stack) || stack.contains(DataComponentTypes.FOOD)) continue;
+            if (!mod.materialDict.containsKey(stack.getItem())) continue;
+            surplus.merge(stack.getItem(), stack.getCount(), Integer::sum);
+        }
+        for (Map.Entry<Item, Integer> ent : new ArrayList<>(surplus.entrySet())) {
+            int over = ent.getValue() - filteredDumpNeed.getOrDefault(ent.getKey(), 0);
+            if (over > 0) surplus.put(ent.getKey(), over);
+            else surplus.remove(ent.getKey());
+        }
+        for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
+            ItemStack stack = packet.contents().get(slot);
+            if (stack.isEmpty() || ToolUtils.isTool(stack) || stack.contains(DataComponentTypes.FOOD)) continue;
+            int rem = surplus.getOrDefault(stack.getItem(), 0);
+            if (rem <= 0) continue;
+            depositBacklogSlots.add(slot);
+            surplus.put(stack.getItem(), rem - stack.getCount());
+        }
+        if (depositBacklogSlots.isEmpty()) {
+            // Nothing beyond need (any more) - the dump leg is done, route continues
+            clearFilteredDump();
+            mod.timeoutTicks = mod.postRestockDelay.get();
+            mod.state = State.Walking;
+            return;
+        }
+        mod.info("§7Prep dump: depositing §b" + depositBacklogSlots.size() + "§7 excess stack(s) beyond this build's need.");
     }
 
     Pair<BlockPos, Vec3d> getBestChest(Item item) {
@@ -345,13 +440,19 @@ final class RestockManager {
                 break;
             case AwaitDepositResponse:
                 interactTimeout = 0;
-                // Queue EVERY carried stack that belongs in this chest (the chest must stock
-                // the item); the tick then deposits one per delay tick while the screen stays
-                // open - full-inventory syncs only arrive on open, so per-packet re-triggering
-                // stalls after the first stack
+                // FILTERED PREP DUMP: select the excess live at every chest-open
+                // (screen-index truth, self-correcting); when nothing is beyond
+                // need the leg finishes and the route continues to the refill.
+                if (filteredDumpActive) {
+                    buildFilteredDumpBacklog(packet);
+                    if (!depositBacklogSlots.isEmpty()) mod.timeoutTicks = mod.invActionDelay.get();
+                    break;
+                }
+                // Normal (strip) flow: queue EVERY carried stack that belongs in this
+                // chest (the chest must stock the item); the tick then deposits one per
+                // delay tick while the screen stays open - full-inventory syncs only
+                // arrive on open, so per-packet re-triggering stalls after the first stack
                 if (depositBacklogSlots.isEmpty()) {
-                    // Normal flow: backlog is empty at chest-open - build it from every
-                    // carried stack that belongs in this chest.
                     for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
                         ItemStack stack = packet.contents().get(slot);
                         if (stack.isEmpty() || ToolUtils.isTool(stack) || stack.contains(DataComponentTypes.FOOD)) continue;
@@ -360,8 +461,6 @@ final class RestockManager {
                         depositBacklogSlots.add(slot);
                     }
                 }
-                // else: PRE-FILLED backlog = the unneeded-material dump (depositUnneeded
-                // action) - keep exactly those slots, deposit nothing else.
                 if (depositBacklogSlots.isEmpty()) {
                     // Nothing belongs in THIS chest: hop to the next correct one or continue
                     Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
@@ -543,7 +642,14 @@ final class RestockManager {
             mod.warning("§eDeposit chest screen closed mid-drain (slot " + slot + " unreachable) - re-queueing the deposit leg.");
             depositBacklogSlots.clear();
             if (mc.currentScreen != null) mc.player.closeHandledScreen();
-            Pair<BlockPos, Vec3d> redoChest = getNextDepositChest();
+            Pair<BlockPos, Vec3d> redoChest;
+            if (filteredDumpActive) {
+                HashSet<Item> excess = excessItemsBeyondNeed();
+                redoChest = excess.isEmpty() ? null : getNextFilteredDepositChest(excess);
+                if (redoChest == null) clearFilteredDump();   // nowhere to put it - carry the excess
+            } else {
+                redoChest = getNextDepositChest();
+            }
             if (redoChest != null) queueDepositChestAtHead(redoChest);
             mod.timeoutTicks = mod.postRestockDelay.get();
             mod.state = State.Walking;
@@ -554,15 +660,43 @@ final class RestockManager {
         if (!chestHasRoomFor(pending)) {
             fullDepositChests.add(lastInteractedChest);
             mod.info("§eChest " + lastInteractedChest.toShortString() + " is full - depositing in another registered chest.");
-            Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
             depositBacklogSlots.clear();
-            if (nextDepositChest != null) queueDepositChestAtHead(nextDepositChest);
+            if (filteredDumpActive) {
+                // Quantity dump: re-derive the still-carried excess at the next chest
+                HashSet<Item> excess = excessItemsBeyondNeed();
+                Pair<BlockPos, Vec3d> nextFiltered = excess.isEmpty() ? null : getNextFilteredDepositChest(excess);
+                if (nextFiltered != null) queueDepositChestAtHead(nextFiltered);
+                else clearFilteredDump();   // nowhere to put it - carry the excess, prep accounting tolerates it
+            } else {
+                Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
+                if (nextDepositChest != null) queueDepositChestAtHead(nextDepositChest);
+            }
             mod.timeoutTicks = mod.postRestockDelay.get();
             mod.state = State.Walking;
             return true;
         }
         mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, slot, 0, SlotActionType.QUICK_MOVE, mc.player);
         if (depositBacklogSlots.isEmpty()) {
+            if (filteredDumpActive) {
+                // Quantity dump done at this chest: only chain while excess is still
+                // carried (e.g. drops picked up en route); NEVER the strip chain -
+                // the refill leg later in this same trip counts on the kept stacks.
+                HashSet<Item> excess = excessItemsBeyondNeed();
+                if (!excess.isEmpty()) {
+                    Pair<BlockPos, Vec3d> nextFiltered = getNextFilteredDepositChest(excess);
+                    if (nextFiltered != null) {
+                        queueDepositChestAtHead(nextFiltered);
+                        mod.timeoutTicks = mod.postRestockDelay.get();
+                        mod.state = State.Walking;
+                        return true;
+                    }
+                    mod.warning("§ePrep dump: no chest with room for the remaining excess - carrying it on.");
+                }
+                clearFilteredDump();
+                mod.timeoutTicks = mod.postRestockDelay.get();
+                mod.state = State.Walking;
+                return true;
+            }
             Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
             if (nextDepositChest != null) queueDepositChestAtHead(nextDepositChest);
             mod.timeoutTicks = mod.postRestockDelay.get();
@@ -603,6 +737,7 @@ final class RestockManager {
         //(live world truth), capped by the available inventory slots
         HashMap<Item, Integer> requiredItems = new HashMap<>();
         if (mod.currentBuildPlan == null) return requiredItems;
+        boolean capped = false;
         for (Map.Entry<BlockPos, Block> entry : mod.currentBuildPlan.entrySet()) {
             if (!mod.miningBlockState(entry.getKey()).isAir()) continue;
             Item material = entry.getValue().asItem();
@@ -610,8 +745,12 @@ final class RestockManager {
             requiredItems.put(material, oldCount + 1);
             if (Utils.stacksRequired(requiredItems.values()) > mod.availableSlots.size()) {
                 requiredItems.put(material, oldCount);
+                capped = true;
             }
         }
+        // Silent truncation here starved hash-order item types of their withdrawal
+        // and surfaced later as mid-print supply runs (user-diagnosed, 2026-10-21)
+        if (capped) mod.warning("§eRestock capped by slot count - some plan materials left unwithdrawn; a mid-pass supply run may fire.");
         return requiredItems;
     }
 
@@ -718,9 +857,34 @@ final class RestockManager {
         if (mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) return;
         int slot = findPickaxeSlot();
         if (slot == -1) return;
+        if (slot == 40) {
+            // Offhand source: inventory index 40 is NOT a handler slot id (that is
+            // hotbar 4) - swap offhand <-> hotbar 8 directly via button 40.
+            Utils.swapOffhand(36 + 8);
+            mod.info("Pickaxe moved to slot 8.");
+            return;
+        }
         if (slot < 9) slot += 36;   // clickSlot is HANDLER-indexed: hotbar h = 36+h (0-8 are crafting/armor)
         Utils.performSwap(slot, 8);
         mod.info("Pickaxe moved to slot 8.");
+    }
+
+    /** Tools never live in the offhand (food owns it) - but a player can park one
+     *  there, and EVERY tool scan used to read only slots 0-35: an offhand axe
+     *  read as "no axe carried" and the prep fetched a duplicate (live 06:49,
+     *  batch 8, user: "tool can be anywhere in inventory"). Pull any offhand tool
+     *  into a free main-inventory slot BEFORE the prep's fetch/deposit decisions.
+     *  No free slot: no-op - the scans are offhand-aware and decide truthfully. */
+    void normalizeToolsFromOffhand() {
+        ItemStack off = mc.player.getInventory().getStack(40);
+        if (off.isEmpty() || !ToolUtils.isTool(off)) return;
+        for (int slot = 9; slot < 36; slot++) {
+            if (mc.player.getInventory().getStack(slot).isEmpty()) {
+                Utils.swapOffhand(slot);
+                mod.info("§7" + off.getItem().getName().getString() + " normalized out of the offhand (slot " + slot + ").");
+                return;
+            }
+        }
     }
 
     void ensurePickaxeSlot8() {
@@ -729,7 +893,7 @@ final class RestockManager {
 
     int findPickaxeSlot() {
         int bestSlot = -1;
-        for (int slot = 0; slot < 36; slot++) {
+        for (int slot = 0; slot <= 40; slot++) {   // 40 = offhand: tools can sit anywhere (user rule)
             ItemStack stack = mc.player.getInventory().getStack(slot);
             if (stack.isEmpty() || !stack.isIn(ItemTags.PICKAXES)) continue;
             if (bestSlot == -1 || ToolUtils.getRemainingDamage(stack) > ToolUtils.getRemainingDamage(mc.player.getInventory().getStack(bestSlot))) bestSlot = slot;
@@ -739,7 +903,7 @@ final class RestockManager {
 
     int countPickaxes() {
         int count = 0;
-        for (int slot = 0; slot < 36; slot++) {
+        for (int slot = 0; slot <= 40; slot++) {   // 40 = offhand
             ItemStack stack = mc.player.getInventory().getStack(slot);
             if (!stack.isEmpty() && stack.isIn(ItemTags.PICKAXES)) count++;
         }
@@ -766,7 +930,7 @@ final class RestockManager {
 
     boolean hasAnyPickaxe() {
         if (mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) return true;
-        for (int slot = 0; slot < 36; slot++) {
+        for (int slot = 0; slot <= 40; slot++) {   // 40 = offhand
             ItemStack stack = mc.player.getInventory().getStack(slot);
             if (!stack.isEmpty() && stack.isIn(ItemTags.PICKAXES)) return true;
         }

@@ -9,6 +9,7 @@ import net.minecraft.block.BlockState;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
+import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
@@ -46,6 +47,10 @@ final class BreakPlaceEngine {
     HashMap<BlockPos, Integer> vanillaBreakRetries;              // pos -> times expired into vanilla fallback
     BlockPos vanillaStickyTarget;                                // ONE multi-tick vanilla target at a time
     boolean breakSweepActedThisTick;                             // the break loop already sent packets this tick
+    BlockPos splitPendingPos;                                    // live split pair: START sent, STOP awaiting its due tick
+    int splitStopDueTick;                                        // absolute tickIndex of that STOP
+    int tickIndex;                                               // monotonic engine tick (the split-pair clock)
+    int lastSyncedSelectedSlot;                                  // selected slot the server has been told about
     int rateTick;                                                // 20-tick rate-report cycle
     int breakSentPerSec, breakConfirmedPerSec, placeSentPerSec;  // [RATE] verification counters
     int toBeSwappedSlot;                                         // pending on-demand hotbar swap
@@ -66,6 +71,10 @@ final class BreakPlaceEngine {
         vanillaBreakRetries = new HashMap<>();
         vanillaStickyTarget = null;
         breakSweepActedThisTick = false;
+        splitPendingPos = null;
+        splitStopDueTick = -1;
+        tickIndex = 0;
+        lastSyncedSelectedSlot = -1;
         rateTick = 0;
         breakSentPerSec = 0;
         breakConfirmedPerSec = 0;
@@ -81,7 +90,8 @@ final class BreakPlaceEngine {
             BlockPos placeNow = getNextBatchPlacementPos();
             if (placeNow != null && placementAttempts.getOrDefault(placeNow, 0) < 5) {
                 Block planned = mod.currentBuildPlan.get(placeNow);
-                if (planned != null && mod.restock.isMaterialCarried(planned.asItem())) {
+                if (planned != null && mod.restock.isMaterialCarried(planned.asItem())
+                    && printFrontierWithinGap()) {
                     placeHoldTicks++;
                     if (placeHoldTicks > 100) {
                         placementAttempts.put(placeNow, 5);   // force-release: treat as capped
@@ -100,7 +110,43 @@ final class BreakPlaceEngine {
         return false;
     }
 
+    /** PRINT FORWARD GAP (user rule 2026-10-21: "reduce the print forward gap to 1
+     *  or max 2 blocks so the bot can burst more"): the pace hold engages only once
+     *  the bot has walked UP TO the work — nearest still-unplaced FORWARD plan block
+     *  within 2 horizontal blocks. The old hold fired at first contact (interaction
+     *  range 5 ≈ 4+ horizontal ahead), stopping the bot 2-3 blocks short with only
+     *  the front hemisphere of the reach printable per stop; walking in first and
+     *  bursting from close range covers nearly the whole reach sphere per stop, and
+     *  blocks that fall behind print en route anyway (the picker is any-direction).
+     *  Direction from the live route like the break cadence; 0 = at-goal (pass-end
+     *  drain holds until the sphere is dry). Attempts-capped and not-carried
+     *  positions never pin the bot — standing on them wastes the stop. */
+    boolean printFrontierWithinGap() {
+        int dir = breakTravelDir();
+        int botZ = mc.player.getBlockZ();
+        BlockPos nearest = null;
+        double nearestH = Double.MAX_VALUE;
+        for (BlockPos pos : mod.currentBuildPlan.keySet()) {
+            if (!mod.miningBlockState(pos).isAir()) continue;           // placed = done
+            if (placementAttempts.getOrDefault(pos, 0) >= 5) continue;  // force-released - repair owns it
+            if (dir != 0 && (pos.getZ() - botZ) * dir < -1) continue;   // behind - prints en route
+            double dx = pos.getX() + 0.5 - mc.player.getX();
+            double dz = pos.getZ() + 0.5 - mc.player.getZ();
+            double hDist = Math.sqrt(dx * dx + dz * dz);
+            if (hDist < nearestH) { nearestH = hDist; nearest = pos; }
+        }
+        if (nearest == null) return false;
+        Block planned = mod.currentBuildPlan.get(nearest);
+        return planned != null && mod.restock.isMaterialCarried(planned.asItem()) && nearestH <= 2.0;
+    }
+
     int sendDistinctBreaks(int maxSends, boolean fullSweep) {
+        // LIVE SPLIT SESSION: only its STOP (flushed first in tickBreakConfirmations,
+        // before this runs) may touch the server's mining state this tick — any other
+        // START (pair, split, or vanilla attack) aborts the live session per the
+        // server's "another started" rule. With palette blocks this window is always
+        // empty (extraTicks = 1, STOP flushed at the top of the very next tick).
+        if (splitPendingPos != null) return 0;
         HashSet<BlockPos> attempted = new HashSet<>();
         // INSTA-BREAK REQUIRES THE PICKAXE IN HAND: the server computes break time
         // from the HELD item at packet time. With a building material selected
@@ -176,7 +222,7 @@ final class BreakPlaceEngine {
             // crimson/warped hyphae in the art need an AXE — with the pickaxe they
             // take ~60 ticks/block). The server computes break time from the HELD item.
             if (!ensureBestToolFor(breakTarget)) continue;        // no usable tool - try next candidate
-            sendHybridBreak(breakTarget);
+            if (!sendHybridBreak(breakTarget)) continue;          // split session busy / vanilla-routed - no send slot used
             if (needsVanilla) {
                 vanillaStickyTarget = breakTarget;
                 vanillaSentThisTick = true;
@@ -188,13 +234,66 @@ final class BreakPlaceEngine {
         return sent;
     }
 
-    void sendHybridBreak(BlockPos target) {
+    /** SLOT SYNC — tell the server which hotbar slot we hold BEFORE any raw pair.
+     *  Vanilla 1.21.11 (bytecode-verified): PlayerInventory.setSelectedSlot is a
+     *  client-only field write; the server learns the held slot ONLY from
+     *  UpdateSelectedSlotC2SPacket, sent by ClientPlayerInteractionManager's
+     *  syncSelectedSlot — which runs per-tick (one tick late for us) and before
+     *  vanilla interaction-manager actions, neither of which our raw fastBreak
+     *  path touches. The server computes every break delta from ITS believed held
+     *  stack, so a pair sent right after a slot flip was validated with the old
+     *  tool and silently rejected (the wood/stone handover stragglers, and the
+     *  print-material handover at pass start). Send-if-changed only: steady state
+     *  costs zero packets, and vanilla's own per-tick sync may duplicate one
+     *  harmless same-value packet after our flip. */
+    void syncSelectedSlotNow() {
+        int sel = mc.player.getInventory().getSelectedSlot();
+        if (sel != lastSyncedSelectedSlot) {
+            mc.getNetworkHandler().sendPacket(new UpdateSelectedSlotC2SPacket(sel));
+            lastSyncedSelectedSlot = sel;
+        }
+    }
+
+    /** Server-side per-tick break progress for the CURRENT held stack — the exact
+     *  mirror of what ServerPlayerInteractionManager computes (verified against the
+     *  1.21.11 bytecode: speed = held multiplier + efficiency attribute if >1, x
+     *  haste, x fatigue, x block_break_speed, x0.2 submerged, /5 airborne; delta =
+     *  speed / hardness / (canHarvest ? 30 : 100)). Using the client player's own
+     *  getBlockBreakingSpeed/canHarvest keeps enchant/haste/water/onGround parity
+     *  without porting the formula. */
+    float serverBreakDelta(BlockState state, BlockPos pos) {
+        if (state.isAir()) return 1f;   // race: already gone — the pair is a harmless no-op
+        float hardness = state.getHardness(mc.world, pos);
+        if (hardness < 0) return 0f;   // unbreakable — never pair/split-able
+        return mc.player.getBlockBreakingSpeed(state) / hardness
+            / (mc.player.canHarvest(state) ? 30f : 100f);
+    }
+
+    /** DELTA-ROUTED BREAK SEND — the ONE copy of the break rules. The server's STOP
+     *  validation is delta x (elapsedServerTicks + 1) >= 0.7f (bytecode constant), so:
+     *  delta >= 0.7 -> the classic same-tick pair (START+STOP+ABORT) breaks it now;
+     *  0.7 > delta >= ~0.09 -> SPLIT PAIR: START now, STOP after ceil(0.7/delta)-1
+     *  ticks so the elapsed term carries it over the gate (all real palette blocks
+     *  with a proper tool land here at exactly 1 extra tick: concrete 0.65, wood
+     *  0.58 with an eff5 netherite tool — these could NEVER break from a same-tick
+     *  pair, which was the whole multi-attempt ladder: pair -> 10t -> resend pair
+     *  (deterministically futile) -> 10t -> vanilla);
+     *  smaller delta (wrong/missing tool) -> the vanilla ladder owns it.
+     *  A new START aborts any live session (server rule), so ONE split session at a
+     *  time; its STOP is flushed by tickBreakConfirmations BEFORE any new sends.
+     *  @return true when packets were actually sent (consumes a send slot). */
+    boolean sendHybridBreak(BlockPos target) {
         if (needsVanillaBreak.contains(target)) {
             // Vanilla progress speed = HELD tool speed. The old forced slot-8 pickaxe
             // put WOOD blocks at ~60 ticks/block - the 15s-per-straggler gate drains.
             if (!ensureBestToolFor(target)) mc.player.getInventory().setSelectedSlot(8);
             BlockUtils.breakBlock(target, true);
-        } else {
+            return true;
+        }
+        syncSelectedSlotNow();
+        BlockState state = mod.miningBlockState(target);
+        float delta = serverBreakDelta(state, target);
+        if (delta >= 0.7f) {
             ((IClientPlayerInteractionManager) mc.interactionManager).fastBreak(target);
             // THM SPEEDMINE PACKET RECIPE (decompiled from THM-Addons-1.21.11, live
             // 2026-10-21): a trailing ABORT_DESTROY after the START/STOP pair resets
@@ -211,7 +310,30 @@ final class BreakPlaceEngine {
             // the 6-tick window re-sent blocks that had already broken (the visible
             // multi-swing on instaminables, and batch 6's lone blocks=1 straggler).
             breakPending.put(target, 10);
+            return true;
         }
+        int extraTicks = (int)Math.ceil(0.7f / delta) - 1;
+        if (extraTicks > 7) {
+            // No proper tool in reach of this block (e.g. wood with only a pickaxe):
+            // no legal split window clears the gate — the vanilla ladder (which can
+            // fetch/swap tools) owns it. Bookkeeping only; nothing sent this tick.
+            needsVanillaBreak.add(target);
+            return false;
+        }
+        if (splitPendingPos != null) return false;   // a session is live — next tick
+        if (mod.debugPrints.get()) {
+            mod.info(String.format("§3[dbg] SPLIT pair %s (delta=%.2f, STOP in %d tick%s)",
+                target.toShortString(), delta, extraTicks, extraTicks == 1 ? "" : "s"));
+        }
+        mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+            PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, target, Direction.UP));
+        mc.player.swingHand(Hand.MAIN_HAND);
+        splitPendingPos = target;
+        splitStopDueTick = tickIndex + extraTicks;
+        // In the pickers' skip set while in flight; the window also covers the STOP
+        // wait (flush re-arms it), and the expiry ladder remains the safety net.
+        breakPending.put(target, 10 + extraTicks);
+        return true;
     }
 
     boolean ensureBestToolFor(BlockPos target) {
@@ -309,6 +431,22 @@ final class BreakPlaceEngine {
 
     void tickBreakConfirmations() {
         breakSweepActedThisTick = false;
+        tickIndex++;
+        // SPLIT-PAIR STOP FLUSH — must run BEFORE any new sends this tick (a new
+        // START aborts a live session, server rule): at STOP time the elapsed term
+        // has accumulated ceil(0.7/delta) server ticks, so f = delta x elapsed >= 0.7
+        // validates by construction. Same trailing ABORT + pending window as a pair.
+        if (splitPendingPos != null && tickIndex >= splitStopDueTick) {
+            BlockPos splitPos = splitPendingPos;
+            splitPendingPos = null;
+            mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+                PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, splitPos, Direction.UP));
+            mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+                PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK, splitPos, Direction.UP));
+            mc.player.swingHand(Hand.MAIN_HAND);
+            breakPending.put(splitPos, 10);
+            breakSentPerSec++;
+        }
         if (++rateTick >= 20) {
             rateTick = 0;
             if (breakSentPerSec > 0 || breakConfirmedPerSec > 0 || placeSentPerSec > 0) {
@@ -339,8 +477,12 @@ final class BreakPlaceEngine {
                     if (expiryCount == 0
                         && mc.player.getEyePos().distanceTo(pending.toCenterPos()) <= Math.min(mod.interactionRange.get(), 4.4)
                         && ensureBestToolFor(pending)) {
-                        sendHybridBreak(pending);   // the ONE break-rules copy (fastBreak + ABORT reset + pending window)
-                        vanillaBreakRetries.put(pending, 1);
+                        // the ONE break-rules copy (pair / split / vanilla routing)
+                        if (sendHybridBreak(pending)) {
+                            vanillaBreakRetries.put(pending, 1);
+                        } else {
+                            breakPending.put(pending, 2);   // split session was busy — retry shortly
+                        }
                         continue;
                     }
                     // fastBreak failed twice — multi-tick block. Vanilla progress REQUIRES the
@@ -541,14 +683,20 @@ final class BreakPlaceEngine {
                 // Best axe regardless of durability - the pickaxe's rule: a worn tool
                 // keeps swinging until it breaks; exchanges happen ONLY at batch prep.
                 // (The old min-durability gate here left a worn sole axe unstaged, so
-                // wood fell back to 60-tick pickaxe breaks.)
-                for (int as2 = 0; as2 < 36; as2++) {
+                // wood fell back to 60-tick pickaxe breaks.) 40 = offhand: the tool
+                // can sit anywhere (user rule, live 06:49 duplicate-fetch).
+                for (int as2 = 0; as2 <= 40; as2++) {
                     ItemStack a3 = mc.player.getInventory().getStack(as2);
                     if (a3.isEmpty() || !a3.isIn(ItemTags.AXES)) continue;
                     int life = ToolUtils.getRemainingDamage(a3);
                     if (life > axeLife) { axeLife = life; axeSlot = as2; }
                 }
-                if (axeSlot >= 9) {
+                if (axeSlot == 40) {
+                    // Offhand source: inventory index 40 is NOT a handler slot id
+                    // (that is hotbar 4) - swap offhand <-> hotbar 7 directly.
+                    Utils.swapOffhand(36 + 7);
+                    mod.availableHotBarSlots.remove(Integer.valueOf(7));
+                } else if (axeSlot >= 9) {
                     Utils.performSwap(axeSlot, 7);
                     mod.availableHotBarSlots.remove(Integer.valueOf(7));
                 } else if (axeSlot >= 0) {
@@ -623,7 +771,17 @@ final class BreakPlaceEngine {
             if (mod.miningBlockState(pos).isAir()) continue;
             if (exclude.contains(pos)) continue;
             if (breakPending.containsKey(pos)) continue;   // awaiting server confirm - not sendable
-            if (break2Only && (pos.getX() >= westX + 2 || pos.getY() < mod.lowerMapCorner.getY() + 2)) continue;
+            // BREAK(2) ABSORBS THE WEST LANES - FULL columns, tops AND floors
+            // (optimization 2026-10-21): break(2) is gated on W1's completion, and the
+            // only walk active during it is W2 on lane 2k+129, from which the west
+            // lanes sit at index-distance 128-129 - past the dominant-record edge, so
+            // the recorded west art can never be re-recorded regardless of timing.
+            // Clearing the west half here moves its break volume out of the post-W2
+            // serial tail into break(2)'s shadowed window; break-all air-skips what
+            // is already gone and is left with the east half only (the east lanes
+            // still gate on W2-complete - their borrow tops are dominant-class and
+            // re-recordable from W2's lane).
+            if (break2Only && pos.getX() >= westX + 2) continue;
             if (dir != 0 && (pos.getZ() - botZ) * dir < -1) continue;   // behind us (1-row grace for the standing row)
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist > mod.interactionRange.get()) continue;
@@ -668,7 +826,8 @@ final class BreakPlaceEngine {
         double sendReach = Math.min(mod.interactionRange.get(), 4.4);
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
             if ((pos.getZ() - botZ) * dir < -1) continue;   // behind - sweep territory
-            if (break2Only && (pos.getX() >= westX + 2 || pos.getY() < mod.lowerMapCorner.getY() + 2)) continue;
+            // BREAK(2) absorbs the west lanes' full columns (see getNextBatchBreakPos).
+            if (break2Only && pos.getX() >= westX + 2) continue;
             if (mod.miningBlockState(pos).isAir()) continue;
             double dx = pos.getX() + 0.5 - mc.player.getX();
             double dz = pos.getZ() + 0.5 - mc.player.getZ();

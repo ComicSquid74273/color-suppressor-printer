@@ -692,6 +692,7 @@ final class SlaveEngine {
         // Inventory full with content remaining: deposit first, then re-verify —
         // otherwise every sweepTick re-arm exits instantly and burns all retries.
         if (mod.restock.mod.restock.freeInventoryCapacity() == 0 && (groundItems > 0 || inFlight > 0)) {
+            mod.restock.mod.restock.clearFilteredDump();   // emergency strip, not a quantity dump
             Pair<BlockPos, Vec3d> depositChest = mod.restock.mod.restock.getBestDepositChest();
             if (depositChest != null) {
                 mod.checkpoints.clear();
@@ -971,11 +972,15 @@ final class SlaveEngine {
         int westX = mod.lowerMapCorner.getX() + 2 * mod.currentBatch;
         ArrayList<BlockPos> remaining = new ArrayList<>();
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
-            if (pos.getX() >= westX + 2 || pos.getY() < mod.lowerMapCorner.getY() + 2) continue;
+            // BREAK(2) absorbs the west lanes' FULL columns (optimization 2026-10-21):
+            // break2done now certifies the whole west half clear - tops AND floors -
+            // so break-all is left with the east half only. The retry pass re-enters
+            // breakStage 2 and uses the same full-column picker filter.
+            if (pos.getX() >= westX + 2) continue;
             if (!mod.miningBlockState(pos).isAir()) remaining.add(pos);
         }
         if (remaining.isEmpty()) {
-            mod.info("§aBatch " + mod.currentBatch + " break(2) complete (west Y2/Y3 down).");
+            mod.info("§aBatch " + mod.currentBatch + " break(2) complete (west lanes fully cleared).");
             return true;
         }
         if (batchPassRetries >= 2) {

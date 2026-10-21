@@ -76,33 +76,21 @@ public final class Utils {
     }
 
     public static Pair<ArrayList<Integer>, HashMap<Item, Integer>> getInvInformation(HashMap<Item, Integer> requiredItems, ArrayList<Integer> availableSlots) {
-        //Return a list of slots to be dumped and a Hashmap of material-amount we can keep in the inventory
-        ArrayList<Integer> dumpSlots = new ArrayList<>();
+        // Carried amounts per required item - EVERY stack counts fully. The old
+        // modulus rule ignored partial stacks smaller than required%64, so the
+        // refill re-withdrew materials already carried in fragments (slot
+        // pressure -> full-at-withdrawal loops that looked like emergency
+        // refills). The dumpSlots half of the pair is dead (no caller reads it)
+        // and the deposit side now lives in RestockManager's filtered dump.
         HashMap<Item, Integer> materialInInv = new HashMap<>();
         for (int slot : availableSlots) {
-            if (mc.player.getInventory().getStack(slot).isEmpty()) continue;
-            Item item = mc.player.getInventory().getStack(slot).getItem();
-            if (requiredItems.containsKey(item)) {
-                int requiredAmount = requiredItems.get(item);
-                int requiredModulusAmount = (requiredAmount - (requiredAmount / 64) * 64);
-                if (requiredModulusAmount == 0) requiredModulusAmount = 64;
-                int stackAmount = mc.player.getInventory().getStack(slot).getCount();
-                // ChatUtils.info(material.getName().getString() + " | Required: " + requiredModulusAmount + " | Inv: " + stackAmount);
-                if (requiredAmount > 0 && requiredModulusAmount <= stackAmount) {
-                    int oldEntry = requiredItems.remove(item);
-                    requiredItems.put(item, Math.max(0, oldEntry - stackAmount));
-                    if (materialInInv.containsKey(item)) {
-                        oldEntry = materialInInv.remove(item);
-                        materialInInv.put(item, oldEntry + stackAmount);
-                    } else {
-                        materialInInv.put(item, stackAmount);
-                    }
-                    continue;
-                }
-            }
-            dumpSlots.add(slot);
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (stack.isEmpty()) continue;
+            Item item = stack.getItem();
+            if (!requiredItems.containsKey(item)) continue;
+            materialInInv.merge(item, stack.getCount(), Integer::sum);
         }
-        return new Pair(dumpSlots, materialInInv);
+        return new Pair(new ArrayList<>(), materialInInv);
     }
 
     public static File getMinecraftDirectory() {
@@ -212,6 +200,23 @@ public final class Utils {
             mc.player.currentScreenHandler.syncId,
             invSlot,
             hotbarSlot,
+            SlotActionType.SWAP,
+            mc.player
+        );
+    }
+
+    /** Swap the OFFHAND stack with an inventory slot. In SWAP semantics button 40
+     *  IS the offhand. handlerSlot is a PLAYER-screen handler id: main inventory
+     *  9-35 (identical to inventory indices) or hotbar h as 36+h. Runs with no
+     *  container open (prep/staging) - the chest screen has no offhand slot. */
+    public static void swapOffhand(int handlerSlot) {
+        IClientPlayerInteractionManager cim =
+            (IClientPlayerInteractionManager) mc.interactionManager;
+
+        cim.clickSlot(
+            mc.player.currentScreenHandler.syncId,
+            handlerSlot,
+            40,
             SlotActionType.SWAP,
             mc.player
         );

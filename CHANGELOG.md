@@ -53,10 +53,10 @@ relative lane (corner+2.5, its window = lanes 0-3); closing walks corner+127.5
 
 | # | Phase | What happens | Lane | Direction |
 |---|-------|-------------|------|-----------|
-| 1 | SUPPLY | Restock materials + pickaxe (slot 8) + food (offhand) via north corridor | corridor → station | out & back |
+| 1 | SUPPLY | One trip via north corridor: exact-quantity dump (keep = this build's need, deposit only the excess, 2026-10-21) + refill the deficit + pickaxe (slot 8) + food (offhand) | corridor → station | out & back |
 | 2 | PRINT | **Center on lane 2 first** (lateral `centerLane` leg; placement suppressed until centered), then walk lane 2, litematica-style in-range placement (any direction, nearest first), 4-tick cooldown retry per position; repair pass also from lane 2 | lane 2 | N → S |
 | 3 | SUPPRESS | Wait master break(2) at south end, then walk north breaking west Y2/Y3 only (instamine fastBreak) | lane 2 | S → N |
-| 4 | DEPOSIT | Wait master break-all at north end, then deposit leftover building blocks via north corridor (also fires mid-break when inventory fills) | corridor → station | out & back |
+| 4 | AWAIT | Wait for master break-all permission at north end — no chest trip (dump removed 2026-10-21; carried materials ride into break-all, overflow self-heals via mid-break/finishBatch/prep deposit triggers) | north end | in place |
 | 5 | RECYCLE | Break-all pass over the whole 4×128×4 window + noobline, drops collected by proximity | lane 2 | N → S → N (batchExit) |
 | 6 | SWEEP | `batchExit` → `finishBatch()`: combined spatial break+collect of stragglers (loops back to batchExit while any remain), then `step:done:k` | window | in place |
 
@@ -91,6 +91,204 @@ box (budget renews instead of declaring complete over visible work).
 ---
 
 ## Change history (most recent first)
+
+### 2026-10-21 (v) — DELTA-ROUTED BREAKS: slot sync + split pair (the multi-attempt straggler root cause)
+**Diagnosis (bytecode-verified against 1.21.11 vanilla, both directions):** the
+server's `ServerPlayerInteractionManager.processBlockBreakingAction` breaks a
+same-tick START+STOP pair only when `delta × (elapsedTicks+1) ≥ 0.7f` (a literal
+constant), with `delta = getBlockBreakingSpeed / hardness / (canHarvest?30:100)`
+computed from the SERVER's believed main-hand stack — and `delta ≥ 1.0` instabreaks
+at START. Two independent consequences:
+1. **The 0.7 cliff (slot-independent):** with an Eff V netherite tool (speed 9+26),
+   concrete (1.8) = 0.648 and wood (2.0, even with the right axe) = 0.583 — both
+   below 0.7, so a same-tick pair can NEVER break them, no matter what. These blocks
+   deterministically walked the full ladder: pair → 10t window → resend pair
+   (futile — same arithmetic) → 10t window → vanilla fallback. Terracotta (0.83)
+   and powder (2.33) sit above the cliff — the working 90-99%. The 10-tick-resend
+   comment's "dropped/ceiling-rejected pair" theory was wrong: it was arithmetic.
+2. **Slot staleness (the amplifier):** `PlayerInventory.setSelectedSlot` is a
+   client-only field write; the server learns the held slot ONLY from
+   `UpdateSelectedSlotC2SPacket`, sent by `ClientPlayerInteractionManager
+   .syncSelectedSlot` — per-tick (one tick behind our POST-tick sends) and before
+   vanilla interaction-manager actions. Our raw fastBreak path touched neither, so
+   pairs sent right after a pickaxe↔axe flip (or at pass start, with the last
+   PLACED MATERIAL still believed) were validated with the wrong tool and rejected.
+**Fix (BreakPlaceEngine only, both break(2)/break-all/RESET/sweeps route through
+`sendHybridBreak`):**
+- `syncSelectedSlotNow()` before every routed send — send-if-changed
+  `UpdateSelectedSlotC2SPacket`, so the server always computes delta with the tool
+  we actually hold. Zero packets in steady state; vanilla's own per-tick sync may
+  duplicate one harmless same-value packet after a flip.
+- `serverBreakDelta()` — the exact client-side mirror of the server computation
+  (client's own `getBlockBreakingSpeed`/`canHarvest`, hardness from the world):
+  enchant/haste/water/onGround parity without porting the formula.
+- Routing: `delta ≥ 0.7` → the classic pair (unchanged, same speed); `0.7 > delta`
+  with a sane window (extraTicks = ceil(0.7/delta)−1 ≤ 7) → **SPLIT PAIR**: START
+  now, STOP flushed by `tickBreakConfirmations` after the due ticks, so the elapsed
+  term carries f over the gate legally (all real palette blocks land at
+  extraTicks = 1 — i.e. 20 blocks/s pipelined, versus the old ~23-tick-per-block
+  serialized ladder); no legal window → the vanilla ladder (wrong/missing tool).
+- Session rules honored: a new START aborts a live session (server "another
+  started" rule), so ONE split session in flight, STOPs flushed FIRST each tick
+  (tickBreakConfirmations runs before both send paths), and `sendDistinctBreaks`
+  sits out while a session is live (empty window in practice: extraTicks = 1).
+  The split target rides in `breakPending` (picker skip + expiry ladder as the
+  safety net); the send loop and the expiry-resend only consume budget on real
+  sends (`sendHybridBreak` now returns boolean).
+**Expected effect:** above-cliff families identical to today; concrete/wood
+first-intended-attempt breaks instead of 2 futile pairs + 2×10t waits + vanilla
+round-trip — straggler clusters at pass starts and tool handovers gone. Debug
+`[dbg] SPLIT pair` lines under debug-prints. Structural (new fields + method
+signatures) → restart-deploy. Build green, jar ~08:20 (also carries (l)-(u)).
+NOT deployed/committed — awaits live 100% verification.
+
+### 2026-10-21 (u) — PRINT FORWARD GAP: approach-to-2 then burst (user: "it prints keeping a distance of 2-3 blocks... reduce the print forward gap to 1 or max 2 so the bot can burst more")
+**Diagnosis:** `adaptivePaceHold` held the bot the moment ANY placeable target
+existed in range — first contact at interaction range 5 ≈ 4+ horizontal blocks
+from the frontier (eye-to-block-centre, layers y99-102 give ~4.6-4.9 horizontal
+at the far edge). Each stop therefore printed only the front hemisphere of the
+reach (~4-5 rows), then walk-stop-walk: the observed 2-3-block standing gap and
+small bursts.
+**Fix:** new `printFrontierWithinGap()` gate on the hold (same cadence shape as
+the break approach-hold): scan the plan for the nearest still-AIR FORWARD
+position (route direction via `breakTravelDir()`, 1-row behind grace;
+attempts-capped positions skipped — the repair pass owns them); the hold engages
+only when that frontier is within **2.0 horizontal blocks** AND its material is
+carried. Walking continues through first contact (placements still fire every
+tick en route — the hold only gates movement), so the bot walks deep into each
+cluster, stops once, and bursts the whole reach sphere (~8-9 rows front+behind)
+instead of the front half. Release: frontier drained past 2.0 or picker dry;
+pass-end drain (dir=0, at-goal) keeps the old hold-until-sphere-dry behaviour;
+the 100-tick placeHoldTicks watchdog is unchanged. Missing-material frontiers
+never pin the bot (no hold — the on-demand swap / supply-trip path owns them).
+Gap 2.0 = the user's stated max; tighten to 1.0 by editing the constant in
+`printFrontierWithinGap` if burst depth should grow further. Structural (new
+method) → restart-deploy (same restart as (l)). Build green, jar 08:00
+(also carries (l) + the parallel (m)-(t) work). NOT deployed/committed.
+
+### 2026-10-21 (t) — EXACT-QUANTITY PREP SUPPLY: keep=need / dump=excess / refill=deficit, one trip (user order)
+User: leftovers from the last batch should be KEPT up to what the next batch uses,
+excess dumped, deficit refilled — all in the first stocking attempt — because
+"bot cant correctly refill" sometimes caused emergency (mid-print) supply runs.
+Audit found the stocking attempt was broken in three independent ways:
+
+- **Refill blind to partial stacks** (`Utils.getInvInformation`): the old modulus
+  rule counted a carried stack only if its size ≥ required%64 — every smaller
+  fragment was invisible, so the refill withdrew the FULL requirement on top of
+  carried fragments. Over-withdrawal → slot pressure → "inventory full at
+  withdrawal" recovery (`pauseForRestockTrip`) that looks exactly like an
+  emergency refill. Now every stack of a required item counts fully; the dead
+  dumpSlots half of the return pair is gone (no caller read it).
+- **Dump pre-fill in the wrong index space** (`queueStepBuildPreparation`): the
+  queue-time backlog used INVENTORY indices (0-8 hotbar, 9-35 main) where
+  `drainDepositBacklog` reads CHEST-SCREEN indices (chest slots are 0-26, the
+  player inventory starts at screen 27). Pre-filled slots 0-26 clicked CHEST
+  stacks — quick-moving items OUT of the chest; only slots 27-35 ever deposited
+  the intended stacks. Selection now happens at chest-open
+  (`buildFilteredDumpBacklog`): re-derived live from the packet's player-inventory
+  range (screen truth), surplus per item = carried − snapshotted need, whole
+  stacks, main-inventory before hotbar so the pre-staged hotbar survives. Drops
+  picked up en route simply join the excess.
+- **Strip chain after the filtered dump** (`drainDepositBacklog` completion):
+  the old code always chained `getNextDepositChest()` — which queues another
+  chest while ANY stocking material is carried — so after the first dump chest
+  the leg degenerated into a full strip of even future-needed materials, which
+  the refill leg of the SAME trip then re-withdrew (the observed
+  dump-then-refill churn). Filtered mode now chains only while excess is still
+  carried (`getNextFilteredDepositChest`, restricted to excess items), else the
+  leg finishes and the route advances to the refill.
+- **Keep rule** (user's): the prep dump keeps exactly the CURRENT build's need
+  (snapshot at queue time — priming swaps the plan right after, so a live
+  re-read at chest-open would dump the split-build's dom stacks) instead of the
+  old all-remaining-batches horizon. Same single trip; dump and withdrawal
+  agree by construction because both derive from the same queue-time world
+  truth; the 63-batch futureNeed assembly loop per prep is gone.
+- **Silent slot-cap now visible**: `getRequiredItems`'s capacity cap silently
+  starved hash-order item types of their withdrawal (a stockout that surfaced
+  as a mid-print supply run); it now logs a warning when it truncates.
+- Emergency strips (mid-break full, finishBatch full, RESET/abort dumps) clear
+  the filtered state (`clearFilteredDump`) so a stale quantity-dump snapshot can
+  never blunt them; every reset path clears it too.
+- **STRUCTURAL change** (2 new RestockManager fields + 4 new methods) →
+  RESTART-deploy required, hotswap cannot carry it. UNTESTED live — pending
+  user go-ahead.
+
+### 2026-10-21 (s) — OFFHAND-BLIND TOOL SCANS: duplicate axe fetch (live 06:49, user: "tool can be ANYWHERE in inventory")
+Evidence (session -7): batch 8 prep 06:49:50 printed "Axe missing - exchanging"
+while a healthy axe was carried — it sat in the OFFHAND (inventory slot 40).
+EVERY tool scan read slots 0-35 only: the prep fetch/deposit decision
+(BatchRouter), findPickaxeSlot/countPickaxes/hasAnyPickaxe (RestockManager),
+and the break-phase axe staging (BreakPlaceEngine) — an offhand tool read as
+"not carried" and the bot fetched a duplicate. Fix, position-agnostic:
+1. **Prep normalization**: normalizeToolsFromOffhand() runs FIRST in
+   queueStepBuildPreparation — any tool in the offhand is swapped into a free
+   main-inventory slot (Utils.swapOffhand, SWAP button 40) before any decision.
+   No free slot: no-op, the scans below still see it.
+2. **Every tool scan extended to slot <= 40** (armor 36-39 skipped by tag):
+   findPickaxeSlot / countPickaxes / hasAnyPickaxe / the prep axe scan / the
+   staging scan.
+3. **Offhand-aware moves**: movePickaxeToSlot8 and the axe staging special-case
+   slot 40 — inventory index 40 is NOT a player-handler slot id (that is hotbar
+   4); they swap offhand <-> hotbar directly via Utils.swapOffhand(36+h).
+   New Utils.swapOffhand(handlerSlot) = clickSlot(syncId, handlerSlot, 40, SWAP)
+   — the same button-40 semantics moveFoodToOffhand already uses.
+Build green; NOT deployed — awaiting go-ahead.
+
+### 2026-10-21 (r) — BREAK(2) ABSORBS THE WEST LANES: full columns (user: "more room to optimize")
+The last pipelining-grade win. The 325s cycle's biggest remaining serial chunk is
+breakall+collect (2m13 live, batch 13); break(2) now clears the west half of the
+window (full columns — tops AND floors, was tops-only y101/102) during its S→N
+pass, so break-all (air-skipping) is left with the east half only. The west break
+volume moves OUT of the post-W2 tail into break(2)'s already-shadowed window
+(W2 trails break(2) at echo k+2 and just takes longer to trail).
+
+- **Pixel safety is POSITION law, not timing**: break(2) is gated on W1's
+  completion; the only walk active during it is W2 on lane 2k+129, from which
+  the west lanes sit at index-distance 128–129 — past the dominant-record edge
+  127.2 (~0.8 margin) and inside the sub-128.5 dead zone, so no west pixel
+  (top or floor, any class) can re-record regardless of when it breaks. The
+  EAST lanes are untouched by break(2) and still gate on W2-complete (their
+  borrow tops are dominant-class, recordable from W2's lane — Gate A intact).
+- **Sites**: both break2Only picker filters (BreakPlaceEngine
+  getNextBatchBreakPos + breakApproachHold) drop the y≥Y+2 restriction, keep
+  x<westX+2; `verifyBreak2` now certifies the FULL west half clear (retry pass
+  re-enters breakStage 2 with the same filter). Log line: "west lanes fully
+  cleared". Batch 0 split has no break(2) — untouched. No gravity blocks in
+  the palette (breaking floors under standing tops drops nothing early). Item
+  despawn margin: first west drop → collect ≈ 3 min worst case vs 5-min cap.
+- Expected: tail −~30–45s (west share of break volume), on top of echo (−~55s)
+  and (q)'s dump removal. Cycle ~325 → ~230s ballpark — re-measure [BATCH-TIME].
+- UNTESTED on the server. Restart-deploy required (rides the same structural
+  jar as echo/auto-speed).
+
+### 2026-10-21 (q) — PRE-BREAK-ALL DUMP REMOVED: no chest tour between break(2) and break(4) (user order)
+User: the DEPOSIT phase right after break(2) wastes time — the slave already
+dumps + restocks at the next batch's prep trip. Audit confirmed and went
+further: the tour was actively counterproductive.
+
+- **What it did** (`BatchRouter.startBreakAll`): before the break-all pass it
+  prepended a `depositBuilding` chest visit (+ north-corridor legs) — and the
+  deposit handler chains chest-to-chest via `getNextDepositChest()` until
+  NOTHING depositable is carried, i.e. a full material strip, out and back.
+- **Why it was churn, not just waste**: the very next batch's
+  `queueStepBuildPreparation()` re-withdraws those same items from the chests
+  (its refill computes deficit vs carried). Deposit-everything → walk back →
+  break-all → withdraw-everything, every batch, both directions of clicks plus
+  the out-and-back walk — 100% on the critical path (the master idles at the
+  end checkpoint until `step:done` the whole time).
+- **The fix**: `startBreakAll` now queues only breakAllBegin → breakAllDone →
+  batchExit + the (near no-op) corridor leg; carried materials — break(2)'s
+  mined dominants + print leftovers — ride INTO break-all, whose drops merge
+  into the same partial stacks (same palette), then flow straight into the
+  next build via the prep deficit/refill. When carried covers the plan, the
+  refill is empty and the material-chest visit disappears entirely.
+- **Overflow safety unchanged** (the exact, need-based triggers): mid-break
+  capacity==0 → `pauseBreakAllForDeposit` (SlaveEngine tick gate); finishBatch
+  full-with-drops deposit; prep trip's quantitative dump (excess beyond ALL
+  remaining batches) + full-at-withdrawal recovery. Worst case = one deposit
+  trip only when the inventory is ACTUALLY full, not every batch.
+- Method-body-only change → hotswap-compatible; UNTESTED live — pending user
+  go-ahead. Lifecycle table row 4 (DEPOSIT) updated: now an await, not a trip.
 
 ### 2026-10-21 (p) — AUTO-SPEED option: Meteor's Speed module plainly on for the whole run (user request)
 New "auto-speed" bool in the General group, **default ON**. While the module is
