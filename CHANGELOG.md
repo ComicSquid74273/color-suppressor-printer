@@ -92,6 +92,375 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-10-21 (m) — CONFIRM WINDOW 6→10 ticks: echo-lag double-swings + the lone pass straggler
+Evidence the ABORT recipe worked (slave restarted 05:56 on the new jar): [RATE]
+confirm ratio jumped from 1-16 of 20-36 sent to **27 of 28** — the server now
+accepts ~every pair. What remained: occasional multi-swing on instaminable
+blocks and batch 6 ending blocks=1 on first verify. With rejections rare, an
+unconfirmed position is almost always Folia's block-update echo STILL IN
+FLIGHT — the 6-tick window expired and re-sent blocks that had already broken
+(harmless packet, visible extra swing), and in the worst case cascaded the
+ladder into a standing straggler. FIX: breakPending window 6→10 ticks in
+sendHybridBreak (the one copy). True rejects now cost 0.5s to detect —
+acceptable at a 27/28 acceptance rate. Hotswapped into both running instances
+(39 classes incl. the (k) abort+crash fixes the 05:56 restart predated for the
+master) + mods jars synced.
+
+### 2026-10-21 (l) — LOOKAHEAD DEMAND INVERSION FIXED + one eviction authority (user: "lookahead is not working properly while printing")
+**Root cause 1 — the roller computed demand over the WRONG blocks.**
+`rollingHotbarLookahead`'s window loop skipped AIR plan blocks and counted NON-air
+ones. AIR is the to-place set (same semantics as the placement picker and
+`getRequiredItems`), so demand/firstUseZ were computed over ALREADY-PLACED work —
+the ≤2-row tail behind the bot. Consequences: future materials never entered
+demand (never pre-staged — every first use fell to a stop-and-swap), just-finished
+materials sorted as most-urgent (firstUseZ ≈ botZ-2), and future residents got
+`firstUseZ == null → eDist = MAX` = preferred Belady eviction victims. The roller
+was actively anti-lookahead. Fix: `!isAir()` (demand = still-air window blocks).
+**Root cause 2 — `swapIntoHotbar`'s eviction heuristic was dead + anti-stacking.**
+Its "distance to next use" scan ran through `forEachMapBlock`, which passes the
+desired block as a hardcoded `null` → every distance stayed "never used" (-1);
+and its hotbar-FREQUENCY priority evicted double-staged materials first (the
+opposite of the "stage two stacks" rule). Victim choice was arbitrary and
+un-did correct staging at use-time.
+**Fix (single authority, no duplication):** new `BreakPlaceEngine.WindowDemand`
+snapshot (`computeWindowDemand()`: firstUseZ/demand/supply/botZ over the
+[botZ-2, botZ+24] window) + `pickHotbarVictim(wd, inItem, srcCount, force)` used
+by BOTH callers: the roller (force=false: load-bearing residents protected,
+Belady farthest-first) and `swapIntoHotbar` (force=true: needed NOW, farthest-first
+even when all load-bearing; roller re-stages the victim within 1 s). Victim
+preference: same-item top-up trade > empty slot > farthest first use. Roller
+upgrades: largest carried stack per bring (was first-slot), srcScan 9-35.
+Deleted: `forEachMapBlock` + `MapBlockAction` (RestockManager) + unused
+`AtomicReference` import — dead with the heuristic. `getRequiredItems` already
+had correct air semantics (untouched). StepCheckered's private `MapBlockAction`
+(1873) was ALREADY dead before this — left for the in-flight refactor.
+Build green (compileJava + full build, jar 05:53). Structural change (new class +
+methods) → hotswap IMPOSSIBLE, restart-deploy required. NOT deployed/committed —
+awaiting live verification per WIP rule.
+
+### 2026-10-21 (k) — THM SPEEDMINE ABORT RECIPE ported + 05:38 deposit-drain crash fixed
+**Breaking (user: "check THM speedmine — it can break so many blocks at once"):
+decompiled THM-Addons-1.21.11 (CFR) — its Speedmine PACKET mode sends per block
+START_DESTROY → STOP_DESTROY → ABORT_DESTROY → swing (repeated once for
+non-instant blocks). The trailing ABORT resets the server's breaking-state
+machine so the NEXT block's pair validates against clean state — that is how it
+breaks many blocks per tick at range 5. Our fastBreak sent only START+STOP and
+left stale breaking bookkeeping behind → later pairs rejected (the ~1-2/tick
+acceptance ceiling + the 4-5-attempt blocks). Port: sendHybridBreak (the ONE
+break-rules copy) now sends the ABORT after every fastBreak pair; the expiry
+resend was deduped onto sendHybridBreak (it had a manual copy of the trio).
+Also verified in the decompile: THM has no separate AutoMine module (the
+"Auto Mine" in the user's list is another addon) and a Grim-specific variant
+(ABORT→START→STOP→ABORT + a vanilla-ABORT-intercept offset trick) not needed on
+Folia. NOTE: THM-abort reached the live master via hotswap but the slave had
+already crashed (below) — it takes effect for the slave on next start from the
+synced jar.
+**Crash (05:38:40, slave, batch 5 break-all → deposit)**:
+IndexOutOfBoundsException Index 68 of 46 at
+RestockManager.drainDepositBacklog — depositBacklogSlots holds CHEST-screen
+slot indices (double-chest layout); the chest screen closed under the drain and
+the current handler was the player's own (46 slots). FIX: screen-validity guard
+in BOTH drains (deposit + restock): handler missing / ≤46 slots / slot out of
+range → drop backlog, close any screen, re-queue the deposit leg via the
+existing next-chest hop (never blacklist a chest whose screen merely closed),
+Walking + postRestockDelay. Jar rebuilt + deployed both instances (md5
+single-unique), NOT launched per user.
+
+### 2026-10-21 (j) — AXE EXCHANGE = PICKAXE RULE VERBATIM (user: "axe getting restocked with one healthy axe in inventory; same logic as pickaxe")
+Diagnosis across ALL retained logs (word-boundary grep, every session back to
+10-19): the CURRENT code never fetched an axe while any was carried — 3bb03b3
+(01:45) over-corrected the pre-fix "exchange below min" rule to "fetch only when
+ZERO axes carried". What the user saw was the pre-01:45 jar's fetch (fired
+whenever no ≥threshold axe was momentarily carried; silent, no chat line — which
+is why no log shows any axe fetch/deposit/exchange line ever). But 3bb03b3 left
+the exchange DEAD: `bestAxeRemaining < min && axeCarried == 0` can never fire
+with a worn-but-present axe, so a sub-20 axe rides forever, wood breaks fall
+back to ~60-tick pickaxe swings, and (live evidence) batch 4's prep printed no
+"Netherite Axe moved out of slot 7" line — the break-phase staging gate
+(`life >= minDurability`) skipped the worn axe entirely. Three-part fix to the
+PICKAXE's exact pattern:
+1. **BatchRouter prep**: fetch+exchange when `axeCarried == 0 || bestAxeRemaining
+   < minDurability` (pickaxe: `pickSlot < 0 || pickRemaining < min`), queue
+   chest checkpoint when no material restock queued (the old fetch branch
+   missed this — a no-material batch would queue an axe with no chest visit);
+   else if >1 carried → deposit spares (the redundant `best >= min` guard
+   dropped — the else-if already implies it, matching the pickaxe branch).
+2. **RestockManager.handleRestockResponse**: AXE PARKING mirroring the pickaxe
+   chest parking — at an axe-stocking chest (`isOpenChestAnAxeChest`, new), a
+   pending axe take parks ALL carried axes (swap), otherwise keep-best and park
+   spares; one deposit per sync, sequenced after the pickaxe parking drains.
+   Deposit-only queue advance (middle==0 head) extended from pickaxe-tag to
+   pickaxe-or-axe (an axe 0-stack entry would have stalled at the chest).
+3. **BreakPlaceEngine staging**: best axe stages regardless of durability (was
+   `life >= minDurability` — the pickaxe's findPickaxeSlot has no such gate; a
+   worn sole axe must keep swinging until it breaks, per the user's tool rule).
+Mid-run behavior unchanged: no mid-batch axe trips (wood falls back to pickaxe
+speed; the pickaxe's mid-run fetch exists only because instamine REQUIRES it).
+Deployed by the user (restart, 05:56). Live correction (06:10, user test: they
+manually removed BOTH tools and the bot fetched only the pickaxe): the WOOD-NEED
+gate (carried over from the 1dc267b axe fetch) suppressed the axe exchange on
+batches with no axe-mineable blocks — batch 6's palette is terracotta/concrete/
+granite/resin, so "Axe missing" never fired even with ZERO axes carried. The
+pickaxe has no plan-content gate, so per "same logic as pickaxe" the gate is
+REMOVED entirely: one-axe invariant enforced at EVERY prep (missing/below-min →
+exchange, healthy → keep, >1 → deposit spares). Session facts for the record:
+exactly 1 pickaxe take and 0 axe takes in the 05:56-06:02 window; the pickaxe
+swap had nothing to park (the user had already removed the worn tools).
+BatchRouter delta is body-only (wood scan deleted) — hotswap-compatible; full
+restart-deploy also fine. Build green; NOT deployed — awaiting go-ahead.
+
+### 2026-10-21 (i) — ONE-PASS CLEANUP: expiry-resend, best-tool vanilla, vanilla-aware hold (batch 4: blocks=6, 19s gate round trips)
+Evidence: batch 4 break-all ended blocks=6 (all vanillaQ), gate drained 6→0 over
+19s of walk-backs. RATE showed 20-36/s sent vs 1-16/s server-confirmed — the
+server's ~1-2-same-tick-instamine acceptance ceiling rejects a slice of sends,
+and ALL rejected blocks fell into a vanilla pipeline that could not finish
+in-pass. Three compounding holes, three fixes (all in BreakPlaceEngine,
+body-only, HOTSWAPPED):
+1. **Expiry → instant fastBreak RESEND once**: a first-expiry instamine has NO
+   server progress to reset (it was dropped/ceiling-rejected) — one clean
+   resend (with ensureBestToolFor held) clears most stragglers with zero stops;
+   only a second expiry routes to multi-tick vanilla. Value-update-on-live-key
+   is iterator-safe.
+2. **Vanilla path holds the BEST tool** (was forced slot-8 pickaxe): wood in
+   vanilla at ~60 ticks/block was the 15s-per-straggler gate drain; with the
+   axe it is ~4-8 ticks.
+3. **Vanilla-aware approach hold**: a forward vanilla-queued block within 4.4
+   now holds the bot AT ANY horizontal distance (the 1.3 cluster threshold
+   never stopped for side-lane stragglers — the bot walked past, the
+   behind-clear dropped the sticky mid-progress, and the block stood until the
+   gate round-tripped). Hold condition: (nearestH<=1.3 && reachBusy) ||
+   vanillaBusy; 150-tick watchdog still applies.
+
+### 2026-10-21 (h) — PASS-END STRAGGLERS plugged: adaptive walking send clamp (batch 3 evidence: blocks=2 gate chase 18s)
+Post-(g) evidence: deadlock gone (no watchdog lines, confirms 11/s), run healthy
+(batch 4 printing 23-40/s) — but each break pass still ended with 2-3 stragglers
+the gate walked back for (05:24:22 blocks=2 → 05:24:40 blocks=0). Leak: during
+the APPROACH phase (walking, not held) sends went out to the full 4.4 clamp at
+the trailing edge of reach — a send whose rejection/6-tick-echo landed after the
+bot moved on ended up BEHIND the forward filter → gate work. FIX
+(BreakPlaceEngine.sendDistinctBreaks): adaptive send clamp reading the same
+forward-key state the movement governor drives — walking → 3.5 (3.5 + one
+6-tick window at ~5 bps keeps every walking send ahead of the bot), held
+stationary burst → full 4.4 (its pendings resolve in place). Body-only,
+HOTSWAPPED live into both instances (1 class, 0 failed) + mods jars synced.
+
+### 2026-10-21 (g) — STUCK-WHILE-BREAKING fixed: vanilla-sticky vs forward-filter deadlock (live at [-445,99,-299])
+Symptom (screenshot): "Break approach watchdog: released a 151-tick hold near
+[-445,99,-299]" repeating at the SAME position, vanilla-queue=5 with server=0,
+break rate dead. Mechanism: the vanilla-sticky target (one multi-tick vanilla
+block at a time) sat BEHIND the bot — solid and within 4.4, so the only sticky
+clears (air || dist>4.4) never fired — but the new forward-only picker never
+re-sends behind blocks → sticky frozen forever → every other vanilla target
+skips on sticky!=target → the whole vanilla queue froze solid → those blocks
+kept reachBusy true → approach hold → watchdog release → but the lane was
+PHYSICALLY blocked by one of the frozen blocks → re-hold at the same spot.
+Pre-rework the unfiltered picker ping-ponged back to behind stickies, which is
+why this deadlock is new. FIX (BreakPlaceEngine.sendDistinctBreaks): clear the
+sticky when it is behind the travel direction on batch passes (fullSweep/RESET
+keeps old behavior — its ring-scanner has no direction filter); the picker
+immediately re-homes sticky to a sendable vanilla target and the queue drains.
+Body-only edit, HOTSWAPPED live into both running instances (33 redefined,
+0 failed) + mods jars synced.
+
+### 2026-10-21 (f) — LOOKAHEAD MADE QUANTITY-AWARE (user: "if we need two stacks of same block why is only one in there / whole hotbar not arranged / item needed sits in inventory")
+Four root causes, four fixes:
+- **Presence-blind staging**: `rollingHotbarLookahead` staged only materials
+  ABSENT from the hotbar (`isItemInHotbar` = any count > 0), so a second stack
+  of a >64-block material never pre-staged; the run-out then hit
+  `tryPlacingBlock`'s on-demand path (forward=false + preSwapDelay = the
+  visible wait). FIX: Belady with stack arithmetic — per material in the
+  z-window [botZ-2, botZ+24], DEMAND = unplaced window blocks vs SUPPLY =
+  blocks staged in the hotbar; missing = supply < demand (a 3-block remainder
+  is not supply for a 70-block demand). Eviction guard: a resident is
+  evict-eligible only when the rest of the hotbar still covers ITS OWN window
+  demand (never evict needed supply to create supply).
+- **Pass-start seed in RANDOM order**: beginBatch's pre-stage built its
+  "coming" set from `currentBuildPlan.entrySet()` — a plain HashMap, hash
+  order — the exact v3 bug left in the pass-start path. FIX: sort plan keys by
+  z (walking order N->S) before collecting first-use materials.
+- **Cascade cap 4→8 swaps/s**: 4/s was an arbitrary brake; each swap is one
+  clickSlot packet. Corrections now converge within one cadence tick.
+- **Supply bookkeeping**: the swap loop now tracks supply deltas (brought-in
+  count, evicted count) so later evictions in the same cascade see post-swap
+  state; swap log now prints "window need N / staged M".
+- Single authority: the pass-start arrange stays ORDER-only; quantity top-up
+  lives solely in the roller (fires 0.5 s into the pass, before the first
+  block enters reach). On-demand stop-swap remains as the emergency path only.
+- Jar deployed both instances (md5 verified single-unique), game not launched
+  (managed by another agent per user).
+
+### 2026-10-21 (e) — 02:27 CRASH fixed + FORWARD-ONLY BREAK CADENCE (user: "game crashed... also while breaking bot skips so many blocks")
+**Crash** (`crash-2026-10-21_02.27.25`, slave): `IllegalArgumentException: Invalid
+selected slot` — `beginBatch`'s print-phase tool move-out called
+`performSwap(ts, freeSlot)` with a MAIN-INVENTORY index as the hotbar argument;
+`performSwap` runs `setSelectedSlot(toSlot)` which only accepts hotbar 0–8.
+Batches 1–2 survived only because the inventory was full (no free slot → skip).
+Root design error: the phase-slot scheme assumed a hotbar slot 9 exists — it does
+NOT (hotbar is 0–8; slot 9 is main inventory). Fixes (survived the pass-6 refactor
+into BatchRouter/BreakPlaceEngine):
+- `Utils.performSwap`: toSlot guard (0–8, else stderr + no-op — this class of bug
+  can never crash the client again) + new `Utils.swapHotbarToInventory(hotbar, inv)`
+  which parks a hotbar stack into main inventory via SWAP button semantics with NO
+  setSelectedSlot.
+- Tools now park in hotbar **7 (axe) + 8 (pickaxe)**: beginBatch frees both into
+  staging for the print pass; break(2) entry stages pickaxe→8 + best axe→7
+  (previously `performSwap(axeSlot, 9)` = the same latent crash).
+- `movePickaxeToSlot8`: handler-coords conversion (`slot < 9 → 36+slot`) — a
+  pickaxe found in hotbar 0–7 would have clicked CRAFTING/ARMOR handler slots.
+- `ensureBestToolFor`: hotbar scan widened to 0–8 (staged axe in 7 is outside
+  availableHotBarSlots by design; the staging-only scan fell back to the pickaxe
+  on wood blocks).
+
+**Breaking rework** (user rule: walk to ~1 block from the next cluster, break ALL
+in reach, verify, then advance — no ping-pong, no skips), all in
+`BreakPlaceEngine` + one line in `SlaveEngine`:
+- `getNextBatchBreakPos`: FORWARD-ONLY filter — targets behind the travel
+  direction (derived from the live route goal; break2 S→N, break-all N→S) are
+  never picked (1-row grace for the standing row). Old any-direction nearest
+  picker ping-ponged backward mid-pass.
+- `breakApproachHold()`: movement gate wired as
+  `setForwardPressed(!adaptivePaceHold() && !breakApproachHold())`. Within ~1.3
+  blocks (horizontal) of the nearest forward still-standing target, forward is
+  HELD until every forward target within the 4.4 server-reach clamp is confirmed
+  air (echo-lag pendings keep it held; vanilla-queued blocks hold it while sticky
+  mining). Between clusters the bot walks (and sends opportunistically toward
+  targets — walking toward never outruns confirms). 150-tick watchdog releases a
+  stuck hold for the sweep to recheck. RESET/fullSweep excluded (own feed).
+- Approach-phase sends unchanged: burst rate still breaksPerTick (3/tick = 60/s
+  cap), 6-tick confirm window, sticky-vanilla single-target, no speed-hack during
+  break passes.
+- NOT yet live-verified (game closed per user instruction; jar deployed to both
+  instances, md5 d5a666a6415fe53f1aee2deceaefb719, NOT launched).
+
+### 2026-10-21 (d) — Pass 6: MASTER + SLAVE DE-PILED (user: "refactor master and slave codes, its currently piled up")
+SlaveEngine 2041 → **1114** and StepMaster 1169 → **952**; new focused collaborators
+(commits 27157b8 / 9066a18 / 33f58f6):
+- SlaveEngine keeps ONLY the tick pipeline, checkpoint-arrival dispatch + case handlers,
+  batch gates (finishBatch, verify*), command queue, steering/sprint, transit speed.
+  → `WorldScanner` (263): area/print-box block+item finders, censuses, plan-defect
+  counting, pickup filter, walk-to-item, collect-skip blacklist.
+  → `BatchRouter` (584): batch/priming/closing routes, split-build halves, the batch-prep
+  trip (supply dump + tool/food rules), break-all staging, mid-run supply/deposit
+  interruptions + resume rebuilds, corridor/lane legs.
+  → `ResetLadder` (343): the scoped serpentine RESET FSM, feed + jam guard, arrival
+  stall detector, abort entry; owns ladder state + segment tables.
+- StepMaster keeps the run lifecycle (begin/batch/closing/reset), tickStepMaster
+  scheduler, sweeps/waits, lattice + map-hold watchdogs, progress persistence.
+  → `MapLifecycle` (206): map id resolution, slot finders, pin/hold/stow discipline,
+  inv-to-hotbar swap, empty-map fill, supervisor hold service.
+  → `CartographyLock` (97): the lock machine.
+- Pattern: sub-objects constructed in the OWNER's constructor (field initializers would
+  capture a null mod — caught in review), reset via their resetForActivation()
+  (master's inline duplicate reset replaced by the sub-calls). @EventHandler count
+  re-verified (4) after every move.
+Current file map: hub 1900, SlaveEngine 1114, StepMaster 952, RestockManager 827,
+BatchRouter 584, BreakPlaceEngine 482, ResetLadder 343, WorldScanner 263, MapLifecycle
+206, StepRenderer 159, CartographyLock 97, State/StepMasterStage 42.
+Deploy: restart; watch one full batch cycle live before unattended runs.
+
+### 2026-10-21 (c) — Pass 5: THE CLASS SPLIT (user: "Main Step Checkered class is so big... create subclass, make it lightweight")
+`StepCheckered` 6256 → **1897 lines**, now a lightweight hub. Five commits (2bfe36b → 13c0769),
+one subsystem each, full build green after each:
+
+| Class | Lines | Owns |
+|---|---|---|
+| StepCheckered (hub) | 1897 | settings, registration/config/NBT load, lifecycle (onActivate/onDeactivate), the 4 @EventHandler dispatchers (thin), control-endpoint + SlaveSystem contract surface, HUD widget |
+| SlaveEngine | 2041 | slave FSM: tick() pipeline, checkpoint-arrival dispatch + all case handlers, batch/priming/closing routes, RESET ladder, scanners/censuses, verify gates, transit speed, command queue |
+| StepMaster | 1169 | master FSM: sweeps/waits, map fetch/fill/pin/stow, cartography lock, lattice + map-hold watchdogs, batch-progress persistence |
+| RestockManager | 827 | chests/refill/deposit backlogs + inventory-packet responses, tool/food/pickaxe management, hotbar staging, capacity queries |
+| BreakPlaceEngine | 482 | target pickers, distinct multi-place/break, hybrid fastBreak+vanilla sender + confirmations, pace governor, rolling hotbar lookahead |
+| StepRenderer | 159 | render pass + plan cache |
+| State / StepMasterStage | 42 | top-level enums |
+
+Design: same-package collaborators holding `final StepCheckered mod`; SHARED run state
+(state, checkpoints, currentBatch/currentBuildPlan, breakStage, nextBlockPos,
+fullSweepActive, corners, chests, slots) stays on the module so both bots' paths read
+one truth; each subsystem owns its private state and resets via `resetForActivation()`
+(called from onActivate). Wire protocol, BotControlEndpoint reflection contract, and
+SlaveSystem signatures unchanged (in-tree compile proves them).
+CAUGHT IN REVIEW: the onTick body was initially lost to a case-sensitive extraction
+("tick(" vs "onTick(") — recovered from git and restored as module delegate + SlaveEngine.tick.
+Deploy: restart; first live run needs a full watched batch cycle (this was the biggest
+code-movement of the series — compile-verified, not yet live-verified).
+
+### 2026-10-21 (b) — Pass 4: LEGACY TWO-LAYER ENGINE REMOVED (user: "Stepcheckered class has so much duplicacy... dead code")
+`StepCheckered` 7108 → **6256 lines**; total src 9337 → 8178. Reachability proof in the
+commit message: the legacy engine computed over `lower/upperMapLayer` arrays that were
+NEVER populated in step-checker mode, and its wire commands were sent only by the legacy
+master + HUD legacy buttons (both gone) — every legacy path was an unreachable no-op,
+and "Pause all" parked a slave in `AwaitSlaveContinue` forever (`oldState` written,
+never read).
+- Removed from the module: the whole legacy engine (buildPath/minePath/fillMapPath/
+  suppressPath/pickers/refillMining/finishMineLine/setMiningFinished/serviceMineEndJobs/
+  delegateMiningCommands/advanceSuppressionFlow/checkAwaitMinedSuppression/
+  tryLoadNextNbtFile/mineLine/slaveFinished/pause/start/skipBuilding/addError/setLayer),
+  14 dead checkpoint cases, 2 dead inventory-response handlers, 25 dead fields,
+  5 dead settings (durability-buffer, master-help-min-lines, collect-mined-blocks,
+  collect-both-directions, map-load-timeout), 6 dead State constants.
+- `forEachMapBlock` now walks coordinates directly (layer arrays deleted);
+  `getBestChest` layer preference folded to its always-live LOWER-chest behavior;
+  ALLOW_PLACE_ACTIONS/no-sprint pruned of unqueueable action names.
+- Shared infra: `SlaveSystem` = live protocol only (heartbeat/register/step; module
+  typed `StepCheckered`); `SlaveTableController` = status list only (legacy
+  start/pause/skip/remove HUD buttons removed with the dead commands — the module's own
+  START ALL / RESET RUN buttons remain THE controls); `MapPrinter` interface +
+  `MapCompletionState` DELETED; `LocalTCPTransport.sendToAllSlaves` removed.
+- Post-removal sweeps: ZERO zero-reference private methods, ZERO write-only fields,
+  ZERO stragglers tree-wide. Both bots run this jar → legacy wire messages disappear
+  from both sides together. **Restart deploy required; watch one full batch cycle.**
+
+### 2026-10-21 (a) — WHOLE-PROJECT REFACTOR (user goal: code quality, maintainability, no duplication, reusable code)
+Three passes, each compile-verified and committed separately; behavior preserved by
+construction AND by token-level equivalence proofs (multiset diff of every moved token).
+
+**Pass 1 (ac9d787) — dead code + duplication dedup.**
+Dead (zero-reference, grep-proven): fields `minedLines`/`collectingStragglers`/
+`fullSweepBudget`/`fullSweepCenterChecked` (write-only); State constants
+`MasterWaitBuild`/`MasterDwell`/`AwaitMasterAllCleared`; `AwaitBlockBreak` was read but
+NEVER assigned (unreachable branches removed); methods `printBoxEmptyInRange`/
+`hasFoodInInventory`/`carriesAxe`; dead v3-lookahead locals `bringIn`/`bringInZ`; dead
+`bestAxe` local; 7 dead Utils methods (`hasTool`, `iterateBlocks`, `generateMapArray`,
+`getInvalidPlacements`, `readMapColorId`, `setBackwardPressed`, `setJumpPressed`).
+Dedup — ONE shared copy each: `planDefects()` (was 3 copy-pasted scans),
+`isPickupable()` (4 item scanners), `batchWindowWestX()` (5 hand-rolled expressions),
+`isItemInHotbar()` (2), `queueDepositChestAtHead()` (3), `refillFromCurrentPlan()` (3),
+`sendPlaceStatus()` 7/4-field builders (4), merged double axe scan in prep.
+Cosmetics: all redundant `java.util.*`/`java.io.*` FQNs → imports.
+
+**Pass 2 (3b13db0) — onTick decomposition.**
+onTick 1280 → 114 lines of linear orchestration; ~30 named pipeline methods in the SAME
+order with the SAME early-return contract (see the commit for the token-diff proof:
+only guard negations (De Morgan), return-mapping (`return;`→`return true;`,
+switch-`break;`→`return false;`), two identical-case merges, and new signatures/call
+glue differ). tickStepMaster: lattice watchdog + map-hold guard extracted.
+handleInventoryPacket: the 90-line AwaitRestockResponse case → handleRestockResponse.
+NOTE: this commit also carries an external mid-session live fix that landed on disk
+during the refactor: break(2) axe arming is best-first into hotbar slot 7 (old 'slot 9'
+addressed the main inventory and crashed performSwap).
+
+**Pass 3 (b4ef21a) — reusable subsystems extracted.**
+`utils/StepFiles.java` (progress/reset persistence; byte-identical file formats,
+read order preserved so a readable mapId survives a corrupt batch field) and
+`utils/StepCheckerLayers.java` (the PROVEN converter + all plan assembly incl. the
+batch-0 split halves; conversion token-identical to the original). Module keeps thin
+delegates + one `stepLayers` field (`StepCheckerLayers.empty()` placeholder until the
+first NBT load).
+
+**Sizes:** StepCheckered 7205 → 7108 lines BUT with onTick at 114 (was 1280), 2 new
+focused utils (~460 lines moved out), ~340 lines of dead code deleted, every remaining
+duplication documented. `swapIntoHotbar` (legacy heuristic swap) is still LIVE code —
+it serves on-demand swaps when the rolling lookahead misses; do not delete.
+Known remaining intentional non-unifications (documented, not drift): the chest-search
+trio (getBestChest / getBestDepositChest / getNextDepositChest — genuinely different
+semantics: layer preference + checked-set cycling vs carried-item vs exclusion +
+registration side effect) and the legacy two-layer engine (buildPath/suppressPath/
+fillMapPath/...) which stays reachable through the SlaveSystem protocol (mine:/start/
+skip) and the shared State machine — removing it is a behavior decision, not a refactor.
+
+**Deploy note:** all three passes are STRUCTURAL (new methods/classes) — hotswap
+cannot load them; the next deploy is restart-deploy (close → replace jar → relaunch).
+First live run after deploy should be watched for one full batch cycle as smoke test.
+
 ### 2026-10-20 (t) — FINAL tool-exchange design (user rule): ONE setting, prep-only, strictly-below
 User rejected the (r)/(s) two-setting + destruction-guard design: "no mid-run emergency
 restock for pickaxe or any tool; use only min-durability; not a hard cap at the touch —

@@ -8,6 +8,7 @@ import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
+import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
@@ -39,6 +40,7 @@ final class BreakPlaceEngine {
     HashMap<BlockPos, Integer> placementCooldowns;               // litematica-style: retry timer per position
     HashMap<BlockPos, Integer> placementAttempts;                // per-position placement attempts (adaptive-pace cap)
     int placeHoldTicks;                                          // consecutive adaptive-pace hold ticks (watchdog)
+    int approachHoldTicks;                                       // consecutive break approach-hold ticks (watchdog)
     HashMap<BlockPos, Integer> breakPending;                     // pos -> ticks until silently confirmed
     HashSet<BlockPos> needsVanillaBreak;                         // fastBreak failed -> use vanilla mining
     HashMap<BlockPos, Integer> vanillaBreakRetries;              // pos -> times expired into vanilla fallback
@@ -58,6 +60,7 @@ final class BreakPlaceEngine {
         placementCooldowns = new HashMap<>();
         placementAttempts = new HashMap<>();
         placeHoldTicks = 0;
+        approachHoldTicks = 0;
         breakPending = new HashMap<>();
         needsVanillaBreak = new HashSet<>();
         vanillaBreakRetries = new HashMap<>();
@@ -117,8 +120,32 @@ final class BreakPlaceEngine {
             || mc.player.getEyePos().distanceTo(vanillaStickyTarget.toCenterPos()) > 4.4)) {
             vanillaStickyTarget = null;   // broke, or the bot outran it - never freeze the queue on it
         }
+        // FORWARD-FILTER COMPATIBILITY (live 2026-10-21, the 151-tick-hold deadlock at
+        // [-445,99,-299]): a sticky that sits BEHIND the travel direction is never
+        // re-sent by the forward-only picker, yet the air/out-of-reach clears above
+        // never fire for it - every other vanilla target then skips on sticky!=target
+        // and the whole vanilla queue froze (5 blocks, server=0) while the blocked
+        // lane re-triggered the approach watchdog at the same spot. Behind = the
+        // pass-end sweep's territory: drop it and let the picker re-home sticky to a
+        // sendable target. fullSweep's ring-scanner has no direction filter, so RESET
+        // keeps the old behavior.
+        if (vanillaStickyTarget != null && !fullSweep && mod.currentBuildPlan != null) {
+            int stickyDir = breakTravelDir();
+            if (stickyDir != 0 && (vanillaStickyTarget.getZ() - mc.player.getBlockZ()) * stickyDir < -1) {
+                vanillaStickyTarget = null;
+            }
+        }
         int sent = 0;
         boolean vanillaSentThisTick = false;
+        // ADAPTIVE SEND CLAMP (live 2026-10-21: every pass still ended with 2-3
+        // stragglers for the gate to chase). While WALKING (approach phase) only send
+        // WELL inside reach: a trailing-edge send whose rejection/echo lands after the
+        // bot has moved on ends up behind the forward filter and becomes gate work.
+        // 3.5 + one 6-tick confirm window at ~5 bps keeps every walking send ahead of
+        // the bot. The HELD phase (stationary burst) keeps the full server-reach clamp
+        // - its pendings resolve in place. Reads the same forward-key state the
+        // movement governor drives, so it cannot disagree with the hold.
+        double sendClamp = mc.options.forwardKey.isPressed() ? 3.5 : Math.min(mod.interactionRange.get(), 4.4);
         for (int pick = 0; pick < maxSends * 6 && sent < maxSends; pick++) {
             BlockPos breakTarget;
             if (pick == 0 && mod.nextBlockPos != null && !attempted.contains(mod.nextBlockPos)) {
@@ -135,7 +162,7 @@ final class BreakPlaceEngine {
             // range to the SERVER's survival reach (~4.5) - client range 5.0 sends at
             // 4.5-5.0 get silently rejected, which starved the rate and caused the
             // rare stuck (block 'trying to break but nothing happens').
-            if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > Math.min(mod.interactionRange.get(), 4.4)) continue;
+            if (mc.player.getEyePos().distanceTo(breakTarget.toCenterPos()) > sendClamp) continue;
             if (breakPending.containsKey(breakTarget)) continue;  // awaiting server confirm - next distinct
             boolean needsVanilla = needsVanillaBreak.contains(breakTarget);
             if (needsVanilla) {
@@ -163,12 +190,27 @@ final class BreakPlaceEngine {
 
     void sendHybridBreak(BlockPos target) {
         if (needsVanillaBreak.contains(target)) {
-            mc.player.getInventory().setSelectedSlot(8);
+            // Vanilla progress speed = HELD tool speed. The old forced slot-8 pickaxe
+            // put WOOD blocks at ~60 ticks/block - the 15s-per-straggler gate drains.
+            if (!ensureBestToolFor(target)) mc.player.getInventory().setSelectedSlot(8);
             BlockUtils.breakBlock(target, true);
         } else {
             ((IClientPlayerInteractionManager) mc.interactionManager).fastBreak(target);
+            // THM SPEEDMINE PACKET RECIPE (decompiled from THM-Addons-1.21.11, live
+            // 2026-10-21): a trailing ABORT_DESTROY after the START/STOP pair resets
+            // the server's breaking-state machine, so the NEXT block's pair validates
+            // against clean state - that addon breaks many blocks per tick at range 5
+            // this way. Without it the server holds stale bookkeeping and rejects
+            // later pairs (our ~1-2/tick acceptance ceiling + the 4-5-attempt blocks).
+            mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+                PlayerActionC2SPacket.Action.ABORT_DESTROY_BLOCK, target, Direction.UP));
             mc.player.swingHand(Hand.MAIN_HAND);
-            breakPending.put(target, 6);   // 4-tick window: Folia's block-update echo can lag 2-3 ticks
+            // 10-tick window: with the ABORT recipe the server accepts ~every pair
+            // (live 05:56 session: 27/28 confirmed), so an unconfirmed position is
+            // almost always Folia's block-update echo STILL IN FLIGHT, not a reject -
+            // the 6-tick window re-sent blocks that had already broken (the visible
+            // multi-swing on instaminables, and batch 6's lone blocks=1 straggler).
+            breakPending.put(target, 10);
         }
     }
 
@@ -182,7 +224,10 @@ final class BreakPlaceEngine {
         }
         Item bestItem = best.getItem();
         if (mc.player.getMainHandStack().getItem().equals(bestItem)) return true;
-        for (int slot : mod.availableHotBarSlots) {
+        // Whole hotbar 0-8: the break-phase tool slots (7=axe staging, 8=pickaxe) sit
+        // OUTSIDE availableHotBarSlots by design - a staging-only scan never saw the
+        // staged axe and fell back to the pickaxe on wood blocks.
+        for (int slot = 0; slot <= 8; slot++) {
             if (!mc.player.getInventory().getStack(slot).isEmpty()
                 && mc.player.getInventory().getStack(slot).getItem().equals(bestItem)) {
                 mc.player.getInventory().setSelectedSlot(slot);
@@ -283,7 +328,22 @@ final class BreakPlaceEngine {
                     confirmedThisTick++;
                     vanillaBreakRetries.remove(pending);
                 } else if (ticksLeft <= 0) {
-                    // fastBreak failed — multi-tick block. Vanilla progress REQUIRES the
+                    // FIRST expiry of an instamine-class send is usually a dropped or
+                    // ceiling-rejected pair (the server accepts ~1-2 same-tick
+                    // instamines - live RATE: 20-36/s sent, 1-16/s confirmed), and an
+                    // unconfirmed instamine has NO server progress to reset: ONE clean
+                    // resend clears most stragglers with zero stops. Only a second
+                    // expiry routes to multi-tick vanilla (batch 4 ended blocks=6, all
+                    // vanillaQ, 19s of gate round trips - user: 100% in one pass).
+                    int expiryCount = vanillaBreakRetries.getOrDefault(pending, 0);
+                    if (expiryCount == 0
+                        && mc.player.getEyePos().distanceTo(pending.toCenterPos()) <= Math.min(mod.interactionRange.get(), 4.4)
+                        && ensureBestToolFor(pending)) {
+                        sendHybridBreak(pending);   // the ONE break-rules copy (fastBreak + ABORT reset + pending window)
+                        vanillaBreakRetries.put(pending, 1);
+                        continue;
+                    }
+                    // fastBreak failed twice — multi-tick block. Vanilla progress REQUIRES the
                     // block in server reach: at speed-hack pace the bot outruns the echo
                     // and expired blocks behind it could never progress (live 2026-10-21:
                     // 51 blocks frozen in vanillaQ). Still-in-reach -> vanilla; behind
@@ -291,7 +351,7 @@ final class BreakPlaceEngine {
                     if (mc.player.getEyePos().distanceTo(pending.toCenterPos()) <= 4.4) {
                         needsVanillaBreak.add(pending);
                     }
-                    int retries = vanillaBreakRetries.getOrDefault(pending, 0) + 1;
+                    int retries = expiryCount + 1;
                     vanillaBreakRetries.put(pending, retries);
                     if (retries == 4) {
                         mod.warning("§6[RESET-VERIFY]§c PERSISTENT REJECTION: " + pending.toShortString()
@@ -318,23 +378,29 @@ final class BreakPlaceEngine {
         }
     }
 
+    /** ROLLING HOTBAR LOOKAHEAD — Belady WITH stack arithmetic (user rule
+     *  2026-10-21: "if we need two stacks of the same block, stage two stacks").
+     *  Once per walking second, over the plan's z-window ahead [botZ-2, botZ+24]:
+     *  per material, DEMAND = still-AIR window blocks and SUPPLY = blocks currently
+     *  staged in the hotbar. AIR is the to-place set — the same world semantics as
+     *  the placement picker; counting non-air instead counted already-placed work,
+     *  so future materials never entered demand, finished ones looked most-urgent,
+     *  and future residents were the preferred eviction victims (the anti-lookahead,
+     *  live 2026-10-21). A material is missing when supply < demand — a 3-block
+     *  remainder is not supply for a 70-block demand, and one 64-stack is not supply
+     *  for a 130-block window. Missing materials stage most-urgent-first (smallest
+     *  first-use z), the largest carried stack per swap. Victim choice is
+     *  pickHotbarVictim — the ONE eviction authority, shared with swapIntoHotbar, so
+     *  a use-time bring can never un-do what the roller staged. */
     void rollingHotbarLookahead() {
-        HashMap<Item, Integer> firstUseZ = new HashMap<>();
-        int botZNow = mc.player.getBlockZ();
-        for (Map.Entry<BlockPos, Block> ue : mod.currentBuildPlan.entrySet()) {
-            BlockPos up = ue.getKey();
-            int uz = up.getZ();
-            if (uz < botZNow - 2 || uz > botZNow + 24) continue;   // the walking window
-            if (mod.miningBlockState(up).isAir()) continue;
-            Item uItem = ue.getValue().asItem();
-            Integer prev = firstUseZ.get(uItem);
-            if (prev == null || uz < prev) firstUseZ.put(uItem, uz);
-        }
-        int swapsDone = 0;
+        WindowDemand wd = computeWindowDemand();
         ArrayList<Item> bringOrder = new ArrayList<>();
         ArrayList<Integer> bringZs = new ArrayList<>();
-        for (Map.Entry<Item, Integer> fe : firstUseZ.entrySet()) {
-            if (!mod.restock.isItemInHotbar(fe.getKey())) { bringOrder.add(fe.getKey()); bringZs.add(fe.getValue()); }
+        for (Map.Entry<Item, Integer> fe : wd.firstUseZ.entrySet()) {
+            if (wd.supply.getOrDefault(fe.getKey(), 0) < wd.demand.get(fe.getKey())) {
+                bringOrder.add(fe.getKey());
+                bringZs.add(fe.getValue());
+            }
         }
         for (int a = 0; a < bringOrder.size(); a++) {
             for (int b = a + 1; b < bringOrder.size(); b++) {
@@ -344,31 +410,107 @@ final class BreakPlaceEngine {
                 }
             }
         }
-        for (int bi = 0; bi < bringOrder.size() && swapsDone < 4; bi++) {
+        int swapsDone = 0;
+        for (int bi = 0; bi < bringOrder.size() && swapsDone < 8; bi++) {
             Item inItem = bringOrder.get(bi);
             int inZ = bringZs.get(bi);
+            // Largest carried stack first: one swap moves the most supply.
             int srcSlot = -1;
-            for (int is = 9; is < 36 && srcSlot == -1; is++) {
+            int srcCount = 0;
+            for (int is = 9; is < 36; is++) {
                 ItemStack iStack = mc.player.getInventory().getStack(is);
-                if (!iStack.isEmpty() && iStack.getItem().equals(inItem)) srcSlot = is;
+                if (!iStack.isEmpty() && iStack.getItem().equals(inItem) && iStack.getCount() > srcCount) {
+                    srcCount = iStack.getCount();
+                    srcSlot = is;
+                }
             }
-            if (srcSlot == -1) continue;
-            int evictSlot = -1;
-            int worstZ = Integer.MIN_VALUE;
-            for (int hs : mod.availableHotBarSlots) {
-                ItemStack eStack = mc.player.getInventory().getStack(hs);
-                if (eStack.isEmpty()) { evictSlot = hs; worstZ = Integer.MAX_VALUE; break; }
-                Integer eZ = firstUseZ.get(eStack.getItem());
-                int eDist = (eZ == null) ? Integer.MAX_VALUE : eZ;
-                if (eDist > worstZ) { worstZ = eDist; evictSlot = hs; }
+            if (srcSlot == -1) continue;   // not carried — the mid-print supply trip owns it
+            int evictSlot = pickHotbarVictim(wd, inItem, srcCount, false);
+            if (evictSlot == -1) break;    // every resident is load-bearing for the window
+            ItemStack evictedStack = mc.player.getInventory().getStack(evictSlot);
+            Item evictedItem = evictedStack.isEmpty() ? null : evictedStack.getItem();
+            if (evictedItem != null) {
+                Integer vz = wd.firstUseZ.get(evictedItem);
+                if (vz != null && vz < inZ) break;   // Belady: nothing resident is farther-future than the bring-in
             }
-            if (evictSlot == -1) break;
-            if (worstZ < inZ) break;
+            int evictedCount = evictedStack.getCount();
             Utils.performSwap(srcSlot, evictSlot);
+            wd.supply.merge(inItem, srcCount, Integer::sum);
+            if (evictedItem != null) wd.supply.merge(evictedItem, -evictedCount, Integer::sum);
             swapsDone++;
-            mod.info("§7Hotbar rolling: §f" + inItem.getName().getString() + "§7 swapped in (slot " + evictSlot
-                + ", first use ~" + (inZ - botZNow) + " rows ahead).");
+            mod.info("§7Hotbar rolling: §f" + inItem.getName().getString() + "§7 staged (slot " + evictSlot
+                + ", window need " + wd.demand.get(inItem) + " / staged " + wd.supply.get(inItem)
+                + ", first use ~" + (inZ - wd.botZ) + " rows ahead).");
         }
+    }
+
+    /** One lookahead snapshot: per-material window demand and first upcoming use
+     *  over the still-air plan blocks ahead, plus the hotbar's staged supply. The
+     *  staging passes mutate supply so it stays true across several swaps. */
+    static final class WindowDemand {
+        final HashMap<Item, Integer> firstUseZ = new HashMap<>();
+        final HashMap<Item, Integer> demand = new HashMap<>();
+        final HashMap<Item, Integer> supply = new HashMap<>();
+        int botZ;
+    }
+
+    WindowDemand computeWindowDemand() {
+        WindowDemand wd = new WindowDemand();
+        wd.botZ = mc.player.getBlockZ();
+        for (Map.Entry<BlockPos, Block> ue : mod.currentBuildPlan.entrySet()) {
+            BlockPos up = ue.getKey();
+            int uz = up.getZ();
+            if (uz < wd.botZ - 2 || uz > wd.botZ + 24) continue;   // the walking window
+            if (!mod.miningBlockState(up).isAir()) continue;       // placed/obstructed = not demand
+            Item uItem = ue.getValue().asItem();
+            wd.firstUseZ.merge(uItem, uz, Math::min);
+            wd.demand.merge(uItem, 1, Integer::sum);
+        }
+        for (int hs : mod.availableHotBarSlots) {
+            ItemStack hStack = mc.player.getInventory().getStack(hs);
+            if (!hStack.isEmpty()) wd.supply.merge(hStack.getItem(), hStack.getCount(), Integer::sum);
+        }
+        return wd;
+    }
+
+    /** THE eviction authority for hotbar staging — the rolling lookahead and the
+     *  use-time swapIntoHotbar share this one rule (the heuristic swapIntoHotbar
+     *  used instead was dead code: forEachMapBlock passed a null desired block, so
+     *  every distance stayed "never used", and its hotbar-frequency priority
+     *  evicted double-staged materials first — the opposite of the staging rule).
+     *  Victim preference: (1) a same-item resident smaller than the bring-in — a
+     *  top-up trade that costs no other material its slot; (2) an empty staging
+     *  slot; (3) Belady — the non-load-bearing resident with the farthest first
+     *  upcoming window use (a resident is load-bearing when the rest of the hotbar
+     *  no longer covers its own window demand without that stack). force=true
+     *  (use-time bring: the material is needed NOW) drops the load-bearing
+     *  protection — farthest-first still — and the roller re-stages the victim
+     *  from main inventory within a second. Returns -1 when force=false and every
+     *  resident is load-bearing. */
+    int pickHotbarVictim(WindowDemand wd, Item inItem, int srcCount, boolean force) {
+        int topUpSlot = -1;
+        int emptySlot = -1;
+        int evictSlot = -1;
+        int worstZ = Integer.MIN_VALUE;
+        for (int hs : mod.availableHotBarSlots) {
+            ItemStack eStack = mc.player.getInventory().getStack(hs);
+            if (eStack.isEmpty()) {
+                if (emptySlot == -1) emptySlot = hs;
+                continue;
+            }
+            Item eItem = eStack.getItem();
+            if (eItem.equals(inItem)) {
+                if (srcCount > eStack.getCount() && topUpSlot == -1) topUpSlot = hs;
+                continue;
+            }
+            if (!force && wd.supply.getOrDefault(eItem, 0) - eStack.getCount() < wd.demand.getOrDefault(eItem, 0)) continue;
+            Integer eZ = wd.firstUseZ.get(eItem);
+            int eDist = (eZ == null) ? Integer.MAX_VALUE : eZ;
+            if (eDist > worstZ) { worstZ = eDist; evictSlot = hs; }
+        }
+        if (topUpSlot != -1) return topUpSlot;
+        if (emptySlot != -1) return emptySlot;
+        return evictSlot;
     }
 
     void pumpArmedBreakTarget() {
@@ -396,11 +538,15 @@ final class BreakPlaceEngine {
             {
                 int axeSlot = -1;
                 int axeLife = -1;
+                // Best axe regardless of durability - the pickaxe's rule: a worn tool
+                // keeps swinging until it breaks; exchanges happen ONLY at batch prep.
+                // (The old min-durability gate here left a worn sole axe unstaged, so
+                // wood fell back to 60-tick pickaxe breaks.)
                 for (int as2 = 0; as2 < 36; as2++) {
                     ItemStack a3 = mc.player.getInventory().getStack(as2);
                     if (a3.isEmpty() || !a3.isIn(ItemTags.AXES)) continue;
                     int life = ToolUtils.getRemainingDamage(a3);
-                    if (life >= mod.minDurability.get() && life > axeLife) { axeLife = life; axeSlot = as2; }
+                    if (life > axeLife) { axeLife = life; axeSlot = as2; }
                 }
                 if (axeSlot >= 9) {
                     Utils.performSwap(axeSlot, 7);
@@ -465,6 +611,12 @@ final class BreakPlaceEngine {
         if (mod.currentBuildPlan == null) return null;
         boolean break2Only = mod.breakStage == 2;
         int westX = mod.lowerMapCorner.getX() + 2 * mod.currentBatch;
+        // FORWARD-ONLY (user rule, live 2026-10-21): break targets AHEAD in the travel
+        // direction only - the any-direction nearest picker ping-ponged the bot backward
+        // mid-pass. Direction comes from the live route (break2 walks S->N, break-all
+        // N->S); ambiguous/at-goal = no filter (pass-end sweeps own the stragglers).
+        int dir = breakTravelDir();
+        int botZ = mc.player.getBlockZ();
         BlockPos best = null;
         double bestDist = Double.MAX_VALUE;
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
@@ -472,11 +624,78 @@ final class BreakPlaceEngine {
             if (exclude.contains(pos)) continue;
             if (breakPending.containsKey(pos)) continue;   // awaiting server confirm - not sendable
             if (break2Only && (pos.getX() >= westX + 2 || pos.getY() < mod.lowerMapCorner.getY() + 2)) continue;
+            if (dir != 0 && (pos.getZ() - botZ) * dir < -1) continue;   // behind us (1-row grace for the standing row)
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist > mod.interactionRange.get()) continue;
             if (dist < bestDist) { bestDist = dist; best = pos; }
         }
         return best;
+    }
+
+    /** Travel direction of the current break pass from the live route: +1 south,
+     *  -1 north, 0 = at/ambiguous to the goal (callers then apply no direction filter). */
+    int breakTravelDir() {
+        if (mod.checkpoints.isEmpty()) return 0;
+        double dz = mod.checkpoints.getFirst().getLeft().z - mc.player.getZ();
+        if (dz > 0.5) return 1;
+        if (dz < -0.5) return -1;
+        return 0;
+    }
+
+    /** FORWARD-ONLY BREAK CADENCE (user rule, live 2026-10-21: "go close to the next
+     *  batch of blocks - closest ~1 block, not 2-3 far - break ALL in reach, verify,
+     *  then move on, no skips"). Holds forward movement once the bot is ~1 row from
+     *  the nearest still-standing FORWARD target, and releases only when every forward
+     *  target within the server-reach clamp is confirmed air. The old continuous walk
+     *  broke from 2-3 blocks out and strode past blocks whose confirms lagged - the
+     *  skips the straggler sweeps then had to chase. Sends still fire while approaching
+     *  (walking TOWARD targets never outruns their confirms), so each stop arrives
+     *  already half-cleared; blocks beyond the 4.4 server-reach clamp are simply the
+     *  next cluster after one more step. */
+    boolean breakApproachHold() {
+        if (mod.breakStage == 0 || mod.currentBuildPlan == null || mod.lowerMapCorner == null) return false;
+        if (mod.fullSweepActive) return false;   // RESET runs its own segment feed + gates
+        if (!(mod.state.equals(State.Walking) || mod.state.equals(State.Mining))) return false;
+        int dir = breakTravelDir();
+        if (dir == 0) { approachHoldTicks = 0; return false; }
+        boolean break2Only = mod.breakStage == 2;
+        int westX = mod.lowerMapCorner.getX() + 2 * mod.currentBatch;
+        int botZ = mc.player.getBlockZ();
+        BlockPos nearest = null;
+        double nearestH = Double.MAX_VALUE;
+        boolean reachBusy = false;
+        boolean vanillaBusy = false;
+        double sendReach = Math.min(mod.interactionRange.get(), 4.4);
+        for (BlockPos pos : mod.currentBuildPlan.keySet()) {
+            if ((pos.getZ() - botZ) * dir < -1) continue;   // behind - sweep territory
+            if (break2Only && (pos.getX() >= westX + 2 || pos.getY() < mod.lowerMapCorner.getY() + 2)) continue;
+            if (mod.miningBlockState(pos).isAir()) continue;
+            double dx = pos.getX() + 0.5 - mc.player.getX();
+            double dz = pos.getZ() + 0.5 - mc.player.getZ();
+            double hDist = Math.sqrt(dx * dx + dz * dz);
+            if (hDist < nearestH) { nearestH = hDist; nearest = pos; }
+            if (mc.player.getEyePos().distanceTo(pos.toCenterPos()) <= sendReach) reachBusy = true;
+            // A forward VANILLA-queued block in reach holds the bot AT ANY distance:
+            // multi-tick vanilla mining only completes while the bot stays in server
+            // reach, and walking past one (the 1.3 cluster threshold never stopped
+            // for side-lane stragglers) is exactly how passes ended with blocks for
+            // the gate to round-trip (user: 100% cleanup in one pass).
+            if (needsVanillaBreak.contains(pos)
+                && mc.player.getEyePos().distanceTo(pos.toCenterPos()) <= sendReach) vanillaBusy = true;
+        }
+        boolean atCluster = nearest != null && nearestH <= 1.3 && reachBusy;
+        if (!atCluster && !vanillaBusy) {
+            approachHoldTicks = 0;   // clean ahead / still approaching / cluster verified
+            return false;
+        }
+        approachHoldTicks++;
+        if (approachHoldTicks > 150) {
+            mod.warning("§eBreak approach watchdog: released a " + approachHoldTicks
+                + "-tick hold near " + nearest.toShortString() + " - walking on (sweep will recheck).");
+            approachHoldTicks = 0;
+            return false;
+        }
+        return true;
     }
 
 }

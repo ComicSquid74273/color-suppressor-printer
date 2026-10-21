@@ -27,7 +27,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -414,6 +413,35 @@ final class RestockManager {
                 }
             }
         }
+        // AXE PARKING - the pickaxe rule verbatim (user rule 2026-10-21: same logic
+        // as pickaxe): at an axe-stocking chest a pending axe take is a SWAP - park
+        // ALL carried axes, the fresh one is taken below. With no take pending keep
+        // exactly ONE axe - the best - and return every spare. One deposit per sync,
+        // after the pickaxe parking above has drained.
+        if (isOpenChestAnAxeChest()) {
+            boolean swapTakeAxe = !restockList.isEmpty() && restockList.get(0).getMiddle() > 0
+                && new ItemStack(restockList.get(0).getLeft()).isIn(ItemTags.AXES);
+            int keepAxeSlot = -1;
+            if (!swapTakeAxe) {
+                int keepAxeRemaining = -1;
+                for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
+                    ItemStack invStack = packet.contents().get(slot);
+                    if (invStack.isIn(ItemTags.AXES) && ToolUtils.getRemainingDamage(invStack) > keepAxeRemaining) {
+                        keepAxeSlot = slot;
+                        keepAxeRemaining = ToolUtils.getRemainingDamage(invStack);
+                    }
+                }
+            }
+            for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
+                if (slot == keepAxeSlot) continue;
+                ItemStack invStack = packet.contents().get(slot);
+                if (invStack.isIn(ItemTags.AXES)) {
+                    mc.interactionManager.clickSlot(packet.syncId(), slot, 0, SlotActionType.QUICK_MOVE, mc.player);
+                    mod.timeoutTicks = mod.invActionDelay.get();
+                    return;
+                }
+            }
+        }
         boolean foundMaterials = false;
         List<Integer> slots = IntStream.rangeClosed(0, packet.contents().size() - 37)
             .boxed()
@@ -423,12 +451,13 @@ final class RestockManager {
             ItemStack stack = packet.contents().get(slot);
 
             if (restockList.get(0).getMiddle() == 0) {
-                // Deposit-only pickaxe entry (0 stacks to take): spent once nothing
+                // Deposit-only TOOL entry (0 stacks to take): spent once nothing
                 // is left to park here. A pending TAKE also reaches middle==0 while
                 // its backlog drains - the tick's drain ends that entry itself, so
                 // only advance when no backlog is in flight.
                 if (restockBacklogSlots.isEmpty()
-                    && new ItemStack(restockList.get(0).getLeft()).isIn(ItemTags.PICKAXES)) {
+                    && (new ItemStack(restockList.get(0).getLeft()).isIn(ItemTags.PICKAXES)
+                        || new ItemStack(restockList.get(0).getLeft()).isIn(ItemTags.AXES))) {
                     endRestocking();
                 }
                 foundMaterials = true;
@@ -468,6 +497,17 @@ final class RestockManager {
 
     boolean drainRestockBacklog() {
         if (restockBacklogSlots.size() == 0) return false;
+        // Same screen guard as drainDepositBacklog: chest-relative indices are
+        // unclickworthy once the chest screen is gone - drop the backlog and let the
+        // restock-retry paths (prep/emergency) re-open a chest cleanly.
+        if (mc.player.currentScreenHandler == null
+            || mc.player.currentScreenHandler.slots.size() <= 46) {
+            restockBacklogSlots.clear();
+            if (mc.currentScreen != null) mc.player.closeHandledScreen();
+            mod.timeoutTicks = mod.postRestockDelay.get();
+            mod.state = State.Walking;
+            return true;
+        }
         int slot = restockBacklogSlots.remove(0);
         mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, slot, 1, SlotActionType.QUICK_MOVE, mc.player);
         if (restockBacklogSlots.isEmpty()) {
@@ -483,6 +523,23 @@ final class RestockManager {
     boolean drainDepositBacklog() {
         if (mod.state != State.AwaitDepositResponse || depositBacklogSlots.isEmpty()) return false;
         int slot = depositBacklogSlots.remove(0);
+        // SCREEN GUARD (live 05:38:40 crash: Index 68 out of 46): the backlog holds
+        // CHEST-screen slot indices; if that screen closed under us the current
+        // handler is the player's own (46 slots) and .get(slot) throws. A gone screen
+        // means the deposit leg ended through no fault of the chest - re-queue the leg
+        // and let the chest-open flow rebuild the backlog (never blacklist, never click).
+        if (mc.player.currentScreenHandler == null
+            || mc.player.currentScreenHandler.slots.size() <= 46
+            || slot >= mc.player.currentScreenHandler.slots.size()) {
+            mod.warning("§eDeposit chest screen closed mid-drain (slot " + slot + " unreachable) - re-queueing the deposit leg.");
+            depositBacklogSlots.clear();
+            if (mc.currentScreen != null) mc.player.closeHandledScreen();
+            Pair<BlockPos, Vec3d> redoChest = getNextDepositChest();
+            if (redoChest != null) queueDepositChestAtHead(redoChest);
+            mod.timeoutTicks = mod.postRestockDelay.get();
+            mod.state = State.Walking;
+            return true;
+        }
         ItemStack pending = mc.player.currentScreenHandler.slots.get(slot).getStack();
         if (pending.isEmpty()) return true;
         if (!chestHasRoomFor(pending)) {
@@ -607,113 +664,21 @@ final class RestockManager {
         return false;
     }
 
+    /** Use-time hotbar entry (consumeHotbarSwap path): victim choice delegates to
+     *  BreakPlaceEngine.pickHotbarVictim — the same window supply/demand authority
+     *  as the rolling lookahead — with force=true: the material is needed NOW, so
+     *  when every resident is load-bearing the farthest-first resident still gives
+     *  way (the roller re-stages it from main inventory within a second). Without a
+     *  live plan there is no window to reason with — first staging slot. */
     void swapIntoHotbar(int slot) {
-        Map<Item, Integer> itemSlot = new HashMap<>();
-        Map<Item, Integer> itemDistance = new HashMap<>();
-        Map<Item, Integer> itemFrequency = new HashMap<>();
-
-        int targetSlot = mod.availableHotBarSlots.get(0);
-
-        // Scan hotbar
-        for (int hotbarSlot : mod.availableHotBarSlots) {
-            ItemStack stack = mc.player.getInventory().getStack(hotbarSlot);
-            if (!stack.isEmpty()) {
-                Item item = stack.getItem();
-                itemSlot.put(item, hotbarSlot);
-                itemDistance.put(item, -1); // -1 = never used
-                itemFrequency.put(item, 0);
-            } else {
-                targetSlot = hotbarSlot;
-                break;
-            }
+        int targetSlot = -1;
+        if (mod.currentBuildPlan != null) {
+            BreakPlaceEngine.WindowDemand wd = mod.engine.computeWindowDemand();
+            ItemStack srcStack = mc.player.getInventory().getStack(slot);
+            targetSlot = mod.engine.pickHotbarVictim(wd, srcStack.getItem(), srcStack.getCount(), true);
         }
-
-        // PRIORITY 1: empty slot → instant choice
-        if (mc.player.getInventory().getStack(targetSlot).isEmpty()) {
-            Utils.performSwap(slot, targetSlot);
-            return;
-        }
-
-        // Get blocks until next use of items in hotbar
-        AtomicReference<Integer> blockCounter = new AtomicReference<>(0);
-        forEachMapBlock((x, z, y, blockState, block) -> {
-            if (!Utils.isInInterval(mod.workingInterval, x)) return true;
-            blockCounter.set(blockCounter.get() + 1);
-
-            if (blockState.isAir() || block == null) return true;
-            Item item = block.asItem();
-
-            if (itemDistance.containsKey(item) &&
-                itemDistance.get(item) == -1) {
-                itemDistance.put(item, blockCounter.get());
-            }
-            return true;
-        });
-
-        // Count frequency of items in hotbar
-        for (int hotbarSlot : mod.availableHotBarSlots) {
-            ItemStack stack = mc.player.getInventory().getStack(hotbarSlot);
-            if (!stack.isEmpty()) {
-                Item item = stack.getItem();
-                itemFrequency.put(item, itemFrequency.get(item) + 1);
-            }
-        }
-
-        // Choose best candidate
-        Item bestItem = null;
-        int bestDistance = -2; // lower than -1
-        int bestFrequency = -1;
-
-        for (Item item : itemSlot.keySet()) {
-            int distance = itemDistance.get(item); // -1 = never used
-            int frequency = itemFrequency.get(item);
-
-            boolean better = false;
-
-            // PRIORITY 2: never used (-1)
-            if (distance == -1 && bestDistance != -1) {
-                better = true;
-            }
-            // PRIORITY 3: hotbar frequency
-            else if (frequency > bestFrequency) {
-                better = true;
-            }
-            // PRIORITY 4: distance to next use
-            else if (frequency == bestFrequency && distance > bestDistance && bestDistance != -1) {
-                better = true;
-            }
-
-            if (better) {
-                bestItem = item;
-                bestDistance = distance;
-                bestFrequency = frequency;
-            }
-        }
-
-        if (bestItem != null) {
-            targetSlot = itemSlot.get(bestItem);
-        }
-
+        if (targetSlot == -1) targetSlot = mod.availableHotBarSlots.get(0);
         Utils.performSwap(slot, targetSlot);
-    }
-
-    void forEachMapBlock(MapBlockAction action) {
-        for (int x = mod.workingInterval.getLeft(); x <= mod.workingInterval.getRight(); x += mod.linesPerRun) {
-            for (int z = 0; z < 129; z++) {
-                for (int lineBonus = 0; lineBonus < mod.linesPerRun; lineBonus++) {
-                    int adjustedX = x + lineBonus;
-                    if (!Utils.isInInterval(mod.workingInterval, adjustedX)) break;
-                    for (int y = 0; y < 2; y++) {
-                        BlockPos pos = mod.lowerMapCorner.add(adjustedX, y, z);
-                        BlockState state = mc.world.getBlockState(pos);
-                        if (!action.accept(adjustedX, z, y, state, null)) {
-                            // Stop future iterations if false is returned
-                            return;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     int offhandFoodCount() {
@@ -744,6 +709,7 @@ final class RestockManager {
         if (mc.player.getInventory().getStack(8).isIn(ItemTags.PICKAXES)) return;
         int slot = findPickaxeSlot();
         if (slot == -1) return;
+        if (slot < 9) slot += 36;   // clickSlot is HANDLER-indexed: hotbar h = 36+h (0-8 are crafting/armor)
         Utils.performSwap(slot, 8);
         mod.info("Pickaxe moved to slot 8.");
     }
@@ -775,6 +741,15 @@ final class RestockManager {
         if (lastInteractedChest == null) return false;
         for (HashMap.Entry<Item, ArrayList<Pair<BlockPos, Vec3d>>> entry : mod.materialDict.entrySet()) {
             if (!new ItemStack(entry.getKey()).isIn(ItemTags.PICKAXES)) continue;
+            if (containsChest(entry.getValue(), lastInteractedChest)) return true;
+        }
+        return false;
+    }
+
+    boolean isOpenChestAnAxeChest() {
+        if (lastInteractedChest == null) return false;
+        for (HashMap.Entry<Item, ArrayList<Pair<BlockPos, Vec3d>>> entry : mod.materialDict.entrySet()) {
+            if (!new ItemStack(entry.getKey()).isIn(ItemTags.AXES)) continue;
             if (containsChest(entry.getValue(), lastInteractedChest)) return true;
         }
         return false;
@@ -818,10 +793,4 @@ final class RestockManager {
     }
 
 
-    /** Walks the map area's coordinate domain (working interval, 129 rows, y 0-1) in
-     *  placement order - swapIntoHotbar's eviction heuristic domain. */
-    @FunctionalInterface
-    interface MapBlockAction {
-        boolean accept(int x, int z, int y, net.minecraft.block.BlockState state, net.minecraft.block.Block desiredBlock);
-    }
 }

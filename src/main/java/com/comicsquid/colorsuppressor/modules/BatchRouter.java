@@ -4,11 +4,10 @@ import com.comicsquid.colorsuppressor.utils.StepCheckerLayers;
 import com.comicsquid.colorsuppressor.utils.ToolUtils;
 import com.comicsquid.colorsuppressor.utils.SlaveSystem;
 import com.comicsquid.colorsuppressor.utils.Utils;
-import net.minecraft.block.Block;
 import net.minecraft.component.DataComponentTypes;
+import net.minecraft.block.Block;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
-import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.util.Pair;
 import net.minecraft.util.math.BlockPos;
@@ -16,6 +15,7 @@ import net.minecraft.util.math.Vec3d;
 import org.apache.commons.lang3.tuple.Triple;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -101,14 +101,22 @@ final class BatchRouter {
             }
         }
         // HOTBAR LOOKAHEAD (user rule, live 2026-10-21): pre-arrange the hotbar with
-        // the FIRST distinct materials of this batch's plan (walking order), so the
-        // print pass rarely stalls on mid-run swaps - the old on-demand one-slot
-        // swapping was the print delay. Runs before the route; one swap per material.
+        // the FIRST distinct materials of this batch's plan in WALKING ORDER, so the
+        // print pass starts correctly staged. Quantity top-up is NOT done here -
+        // rollingHotbarLookahead is the single supply/demand authority and fires
+        // 0.5s into the pass, before the first block enters reach.
         {
+            // Sort the plan by z first: currentBuildPlan is a HashMap, entrySet order
+            // is hash order, and the old seed staged a RANDOM palette subset (the v3
+            // rolling lesson, unfixed here until 2026-10-21 - passes started
+            // mis-arranged and the roller needed seconds to correct while soon-used
+            // items sat in the inventory).
+            ArrayList<BlockPos> walkingOrder = new ArrayList<>(mod.currentBuildPlan.keySet());
+            walkingOrder.sort(Comparator.comparingInt(BlockPos::getZ));
             LinkedHashSet<Item> coming = new LinkedHashSet<>();
-            for (Map.Entry<BlockPos, Block> le : mod.currentBuildPlan.entrySet()) {
+            for (BlockPos wp : walkingOrder) {
                 if (coming.size() >= mod.availableHotBarSlots.size()) break;
-                coming.add(le.getValue().asItem());
+                coming.add(mod.currentBuildPlan.get(wp).asItem());
             }
             int preSwapped = 0;
             int slotCursor = 0;
@@ -355,57 +363,55 @@ final class BatchRouter {
                 if (!materialRestockQueued) mod.restock.mod.restock.addClosestRestockCheckpoint();
             }
         }
-        // BEST-TOOL PREP — AXE with the PICKAXE'S predictive rule (user rule, live
-        // 2026-10-21: "same stock restock as pickaxe - never exchange or withdraw
-        // until min-durability is reached"): only when the batch has axe-class blocks
-        // AND the best carried axe is missing or BELOW min-durability. A worn-but-present
-        // axe above threshold is KEPT (no withdrawal); below threshold it is exchanged.
-        if (mod.currentBuildPlan != null) {
-            boolean needsWoodTool = false;
-            for (Block b : mod.currentBuildPlan.values()) {
-                if (b.getDefaultState().isIn(BlockTags.AXE_MINEABLE)) { needsWoodTool = true; break; }
+        // BEST-TOOL PREP — AXE, the PICKAXE'S rule verbatim (user rules, live
+        // 2026-10-21: "same logic as pickaxe - one axe" + "why bot not get an axe
+        // when there was no axe in inventory or hotbar"): NO wood-need gate - the
+        // pickaxe has no plan-content gate either. One-axe invariant at every prep:
+        // missing or below min-durability -> EXCHANGE (the worn axe parks at the
+        // tool chest during the same visit - handleRestockResponse's axe parking);
+        // healthy -> KEPT (no withdrawal); >1 carried -> spares deposit.
+        {
+            // ONE scan pass: best remaining durability + carried count (the one-axe
+            // invariant's evidence)
+            int bestAxeRemaining = -1;
+            int axeCarried = 0;
+            for (int aSlot = 0; aSlot < 36; aSlot++) {
+                ItemStack aStack = mc.player.getInventory().getStack(aSlot);
+                if (aStack.isEmpty() || !aStack.isIn(ItemTags.AXES)) continue;
+                axeCarried++;
+                bestAxeRemaining = Math.max(bestAxeRemaining, ToolUtils.getRemainingDamage(aStack));
             }
-            if (needsWoodTool) {
-                // ONE scan pass: best remaining durability + carried count (the one-axe
-                // invariant's evidence)
-                int bestAxeRemaining = -1;
-                int axeCarried = 0;
-                for (int aSlot = 0; aSlot < 36; aSlot++) {
-                    ItemStack aStack = mc.player.getInventory().getStack(aSlot);
-                    if (aStack.isEmpty() || !aStack.isIn(ItemTags.AXES)) continue;
-                    axeCarried++;
-                    bestAxeRemaining = Math.max(bestAxeRemaining, ToolUtils.getRemainingDamage(aStack));
+            if (axeCarried == 0 || bestAxeRemaining < mod.minDurability.get()) {
+                ItemStack axe = null;
+                float axeSpeed = -1;
+                for (ItemStack tool : mod.toolSet) {
+                    if (!tool.isIn(ItemTags.AXES)) continue;
+                    float sp = tool.getMiningSpeedMultiplier(net.minecraft.block.Blocks.OAK_PLANKS.getDefaultState());
+                    if (sp > axeSpeed) { axeSpeed = sp; axe = tool; }
                 }
-                if (bestAxeRemaining < mod.minDurability.get() && axeCarried == 0) {
-                    ItemStack axe = null;
-                    float axeSpeed = -1;
-                    for (ItemStack tool : mod.toolSet) {
-                        if (!tool.isIn(ItemTags.AXES)) continue;
-                        float sp = tool.getMiningSpeedMultiplier(net.minecraft.block.Blocks.OAK_PLANKS.getDefaultState());
-                        if (sp > axeSpeed) { axeSpeed = sp; axe = tool; }
-                    }
-                    if (axe != null) {
-                        mod.info("§7Axe missing - fetching one at the batch-prep trip.");
-                        mod.restock.mod.restock.restockList.add(Triple.of(axe.getItem(), 1, 1));
-                    }
-                } else if (axeCarried > 1) {
-                    // ONE-AXE INVARIANT (mirrors the pickaxe's): the best axe survives;
-                    // spares ride forever otherwise. Deposit-only visit (0 stacks = take
-                    // nothing) parks the spares at the chest. NEVER withdraws a new axe
-                    // while any axe above min-durability is carried.
-                    Item spareAxe = null;
-                    float spareSpeed = -1;
-                    for (ItemStack tool : mod.toolSet) {
-                        if (!tool.isIn(ItemTags.AXES)) continue;
-                        float sp = tool.getMiningSpeedMultiplier(net.minecraft.block.Blocks.OAK_PLANKS.getDefaultState());
-                        if (sp > spareSpeed) { spareSpeed = sp; spareAxe = tool.getItem(); }
-                    }
-                    if (spareAxe != null && bestAxeRemaining >= mod.minDurability.get()) {
-                        mod.info("§7" + (axeCarried - 1) + " spare axe(s) carried (best at " + bestAxeRemaining
-                            + " durability, above min " + mod.minDurability.get() + ") - depositing spares, NO new axe fetched.");
-                        mod.restock.mod.restock.restockList.add(Triple.of(spareAxe, 0, 0));
-                        if (!materialRestockQueued) mod.restock.mod.restock.addClosestRestockCheckpoint();
-                    }
+                if (axe != null) {
+                    mod.info("§7Axe " + (axeCarried == 0 ? "missing" : "at " + bestAxeRemaining + " durability")
+                        + " - exchanging at the batch-prep trip (min-durability " + mod.minDurability.get() + ").");
+                    mod.restock.mod.restock.restockList.add(Triple.of(axe.getItem(), 1, 1));
+                    // Without a chest at the head of the queue the exchange never
+                    // visits one - the pickaxe branch's guard, mirrored.
+                    if (!materialRestockQueued) mod.restock.mod.restock.addClosestRestockCheckpoint();
+                }
+            } else if (axeCarried > 1) {
+                // ONE-AXE INVARIANT (mirrors the pickaxe's): the best axe survives;
+                // spares ride forever otherwise. Deposit-only visit (0 stacks = take
+                // nothing) parks the spares at the chest.
+                Item spareAxe = null;
+                float spareSpeed = -1;
+                for (ItemStack tool : mod.toolSet) {
+                    if (!tool.isIn(ItemTags.AXES)) continue;
+                    float sp = tool.getMiningSpeedMultiplier(net.minecraft.block.Blocks.OAK_PLANKS.getDefaultState());
+                    if (sp > spareSpeed) { spareSpeed = sp; spareAxe = tool.getItem(); }
+                }
+                if (spareAxe != null) {
+                    mod.info("§7" + (axeCarried - 1) + " spare axe(s) carried - depositing them at the batch-prep trip.");
+                    mod.restock.mod.restock.restockList.add(Triple.of(spareAxe, 0, 0));
+                    if (!materialRestockQueued) mod.restock.mod.restock.addClosestRestockCheckpoint();
                 }
             }
         }

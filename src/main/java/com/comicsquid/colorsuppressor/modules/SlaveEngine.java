@@ -1078,8 +1078,9 @@ final class SlaveEngine {
         if (mod.checkpoints.isEmpty()) return;
 
         // ADAPTIVE PACE GOVERNOR - the ONE place that decides whether the bot may
-        // advance while working. Two modes, one contract (see mod.engine.adaptivePaceHold()).
-        Utils.setForwardPressed(!mod.engine.adaptivePaceHold());
+        // advance while working. Print mode: adaptivePaceHold; break mode: the
+        // forward-only approach/verify cadence (see mod.engine.breakApproachHold()).
+        Utils.setForwardPressed(!mod.engine.adaptivePaceHold() && !mod.engine.breakApproachHold());
 
         Vec3d goal = mod.checkpoints.get(0).getLeft();
         if (PlayerUtils.distanceTo(goal.add(0, mc.player.getY() - goal.y, 0)) < mod.checkpointBuffer.get()) {
