@@ -47,6 +47,8 @@ final class BatchRouter {
         mod.currentBatch = k;
         mod.slave.batchPassRetries = 0;
         mod.engine.placementAttempts.clear();
+        mod.engine.placementRetryStart.clear();
+        mod.engine.breakRetryStart.clear();
         mod.slave.scan.collectSkips.clear();
         mod.clearResetPending();   // a new run supersedes any interrupted reset
         mod.slave.sweepReArmSig = null;
@@ -172,6 +174,8 @@ final class BatchRouter {
         mod.breakStage = 0;
         mod.slave.printRepairPending = false;
         mod.engine.placementAttempts.clear();
+        mod.engine.placementRetryStart.clear();
+        mod.engine.breakRetryStart.clear();
         mod.clearResetPending();
         // A new run kills any leftover RESET mod.state - a stale mod.fullSweepActive here made
         // the first mid-run supply run resurrect the dead reset ladder over the priming
@@ -263,6 +267,7 @@ final class BatchRouter {
     }
 
     void queueStepBuildPreparation(double stagingX) {
+        mod.restock.mod.restock.prepServerRecheckPending = true;   // recount deficits at the first chest-open (server truth)
         mod.restock.mod.restock.refillFromCurrentPlan();
         boolean materialRestockQueued = !mod.restock.mod.restock.restockList.isEmpty();
 

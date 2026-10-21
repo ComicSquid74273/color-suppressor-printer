@@ -17,6 +17,7 @@ import net.minecraft.block.BlockState;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.ItemEntity;
+import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.tag.BlockTags;
@@ -28,6 +29,7 @@ import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -73,6 +75,34 @@ final class SlaveEngine {
     boolean transitSpeedOn;
     private final ArrayDeque<String> pendingStepCommands = new ArrayDeque<>();
 
+    // --- Sub-floor drop recovery (NEVER-SKIP + AUTO-CONTINUE rules, user
+    // 2026-10-21) ---
+    // A drop resting below the pickup band (its box can never intersect the player
+    // box grown by 1.0/0.5 from the surface) is retrieved physically: walk onto its
+    // column, break the floor block above it, fall in (touch pickup fires by
+    // construction - the bot lands on the drop's own ground), climb out on a buried
+    // step block, restore the exact floor block, then re-verify. NOTHING may ever
+    // break outside the map bounding area (print-box x/z footprint) - drops outside
+    // it are never dug, just named as out-of-scope remainders. No stuck state
+    // exists: every failure retries (3 full attempts per drop), then declares the
+    // drop out of scope and the run CONTINUES automatically.
+    static final int RECOVERY_MAX_PER_BATCH = 16;
+    static final int RECOVERY_WATCHDOG_TICKS = 1200;   // 60s per drop attempt, then retry/out-of-scope
+    static final int RECOVERY_ATTEMPTS_PER_DROP = 3;
+    enum RecoveryStage { DIG, ENTER, COLLECT, EXIT, RESTORE }
+    RecoveryStage recoveryStage;
+    BlockPos recoveryDropPos;                          // resting column of the target drop
+    BlockPos recoveryFloorPos;                         // floor block dug above it (restored after)
+    BlockPos recoveryStepPos;                          // climb-out step cell, captured at jump start
+    Block recoveryFloorBlock;                          // its exact block (null = floor was already a hole)
+    Item recoveryStepItem;                             // placeable item for the climb-out step (drop's own, else any block)
+    int recoveryTicks;
+    int recoveryRestoreTries;
+    int recoveryCount;                                 // this batch (bounded)
+    HashSet<BlockPos> recoveryOutOfScope;              // per batch: never-dug drops (named remainders)
+    HashMap<BlockPos, Integer> recoveryAttempts;       // per batch: full attempts per drop
+    BlockPos containerDigPos;                          // frozen-sweep escalation: encased drop's cell
+
     // ECHO CHECKPOINTS (user design, 2026-10-21): 5 equally spaced travel-fraction
     // pings per shadowed pass (print + break(2) only) - fire-and-forget telemetry,
     // the slave NEVER waits on them. The master releases its sweep stations on the
@@ -114,6 +144,18 @@ final class SlaveEngine {
         stuckCheckpointCount = 0;
         lastCheckpointAction = null;
         pendingDisable = false;
+        recoveryStage = null;
+        recoveryDropPos = null;
+        recoveryFloorPos = null;
+        recoveryStepPos = null;
+        recoveryFloorBlock = null;
+        recoveryStepItem = null;
+        recoveryTicks = 0;
+        recoveryRestoreTries = 0;
+        recoveryCount = 0;
+        recoveryOutOfScope = new HashSet<>();
+        recoveryAttempts = new HashMap<>();
+        containerDigPos = null;
         synchronized (pendingStepCommands) {
             pendingStepCommands.clear();
         }
@@ -284,8 +326,16 @@ final class SlaveEngine {
                     if (target == null) break;
                     attempted.add(target);
                     mod.nextBlockPos = target;
-                    mod.engine.placementCooldowns.put(target, 4);  // ~0.2s before retry
-                    mod.engine.placementAttempts.merge(target, 1, Integer::sum);  // adaptive-pace cap
+                    // ECHO-WINDOW COOLDOWN (live batch 18 histogram: 52% of burst
+                    // placements need >1 send — 322/619 positions re-sent; the old
+                    // 4-tick cooldown re-fired INTO the server's block-update echo,
+                    // burning attempts on blocks that were already coming). 10 ticks
+                    // = the break side's proven pending window; retries now land
+                    // after the echo had time to arrive. The multi-place loop always
+                    // has other distinct positions to fill the tick with.
+                    mod.engine.placementCooldowns.put(target, 10);
+                    mod.engine.placementAttempts.merge(target, 1, Integer::sum);  // diagnostic (gating is tick-based now)
+                    mod.engine.placementRetryStart.putIfAbsent(target, mod.engine.tickIndex);  // opens the print-retry-ticks window at the FIRST pick
                     int code = mod.engine.mod.engine.tryPlacingBlock();
                     if (code == 1) { placed++; mod.engine.placeSentPerSec++; }
                     else break;  // swap pending or material missing — tick handles it
@@ -322,7 +372,12 @@ final class SlaveEngine {
         Pair<String, BlockPos> checkpointAction = mod.checkpoints.get(0).getRight();
         if (mod.debugPrints.get() && checkpointAction.getLeft() != null)
             mod.info("Reached: §a" + checkpointAction.getLeft());
-        if (mod.snapToCheckpoints.get()) mc.player.setPosition(goal.x, mc.player.getY(), goal.z);
+        // Snap only for genuinely close arrivals - collection legs arrive at the
+        // wide 1.1 buffer and a snap from that range is a 1-block position jerk.
+        if (mod.snapToCheckpoints.get()
+            && Math.hypot(mc.player.getX() - goal.x, mc.player.getZ() - goal.z) < 0.5) {
+            mc.player.setPosition(goal.x, mc.player.getY(), goal.z);
+        }
         // ANTI-STUCK: if the same action fires 10+ times consecutively (handler
         // re-queuing itself without progress), force-skip to the next checkpoint.
         // EXCEPTION — sweep-family actions: resetPass/resetStation (RESET ladder),
@@ -338,7 +393,9 @@ final class SlaveEngine {
             || "sweepTick".equals(checkpointAction.getLeft())
             || "batchExit".equals(checkpointAction.getLeft())
             || "breakAllDone".equals(checkpointAction.getLeft())
-            || "collectRun".equals(checkpointAction.getLeft());
+            || "collectRun".equals(checkpointAction.getLeft())
+            || "recoverStart".equals(checkpointAction.getLeft())
+            || "containerDig".equals(checkpointAction.getLeft());
         if (isSweepFamilyAction) {
             stuckCheckpointCount = 0;
             lastCheckpointAction = checkpointAction.getLeft();
@@ -443,6 +500,27 @@ final class SlaveEngine {
                 return true;
             case "sweepTick":
                 return handleSweepTickArrival();
+            case "recoverStart":
+                return handleRecoverStartArrival();
+            case "containerDig":
+                // Frozen-sweep escalation: dig the block encasing a drop until it
+                // pops out, then the normal sweep re-verifies and collects it.
+                if (containerDigPos != null && !mod.miningBlockState(containerDigPos).isAir()) {
+                    if (mc.player.getEyePos().distanceTo(containerDigPos.toCenterPos()) > mod.interactionRange.get()) {
+                        mod.checkpoints.addFirst(new Pair<>(containerDigPos.toCenterPos(), new Pair<>("containerDig", null)));
+                        mod.state = State.Walking;
+                        return true;
+                    }
+                    mod.nextBlockPos = containerDigPos;
+                    mod.engine.sendHybridBreak(containerDigPos);
+                    mod.checkpoints.addFirst(new Pair<>(mc.player.getEntityPos(), new Pair<>("containerDig", null)));
+                    mod.state = State.Mining;
+                } else {
+                    containerDigPos = null;
+                    mod.checkpoints.addFirst(new Pair<>(mc.player.getEntityPos(), new Pair<>("batchExit", null)));
+                    mod.state = State.Walking;
+                }
+                return true;
             case "resetPass":
             case "resetStation":
                 return reset.handleResetArrival(checkpointAction);
@@ -587,12 +665,15 @@ final class SlaveEngine {
         }
         ItemEntity next = scan.nearestCollectTarget();
         if (next == null) {
-            // only unreachable/blacklisted drops remain - hand off to the exit
-            // gate HERE (finishBatch census will name them)
+            // only unreachable/blacklisted or below-floor drops remain - hand off to
+            // the exit gate HERE (finishBatch census names them; sub-floor drops arm
+            // the recovery dig there instead of burning walk attempts)
             mod.checkpoints.removeIf(cp -> "batchExit".equals(cp.getRight().getLeft()));
             mod.checkpoints.addFirst(new Pair(mc.player.getEntityPos(), new Pair("batchExit", null)));
+            int subFloor = scan.countSubFloorDropsInWindow();
             mod.warning("§6[BREAKALL-VERIFY]§e batch " + mod.currentBatch + ": " + cCensus[0]
-                + " drops unreachable in the collection run - exiting to the gate in place.");
+                + " drops unreachable in the collection run (" + subFloor + " below the pickup band)"
+                + " - exiting to the gate in place.");
             return true;
         }
         mod.checkpoints.addFirst(new Pair(new Vec3d(next.getX(), next.getY(), next.getZ()), new Pair("collectRun", null)));
@@ -610,7 +691,7 @@ final class SlaveEngine {
                 if (dist < blockDist) { blockDist = dist; nearestBlock = pos; }
             }
         }
-        ItemEntity nearestItem = mod.restock.mod.restock.freeInventoryCapacity() > 0 ? scan.findNearestGroundItem(3) : null;
+        ItemEntity nearestItem = mod.restock.mod.restock.freeInventoryCapacity() > 0 ? scan.findNearestSurfaceDrop(3) : null;
         double itemDist = nearestItem != null
             ? mc.player.getEyePos().distanceTo(nearestItem.getEntityPos()) : Double.MAX_VALUE;
         if (sweepBudget > 0 && mod.restock.mod.restock.freeInventoryCapacity() > 0) {
@@ -647,8 +728,10 @@ final class SlaveEngine {
         // COMBINED SWEEP: check both remaining blocks and ground items at once.
         // sweepTick handles whichever is nearest (block → break, item → collect).
         // No separate retry walks, no zigzag — one spatial-awareness pass.
+        // Out-of-scope drops (failed/never-dug recoveries, named in the log) do
+        // not gate completion - the run auto-continues (user rule: never stuck).
         int remainingBlocks = scan.countRemainingPlanBlocks();
-        int groundItems = scan.countGroundItemsInWindow();
+        int groundItems = scan.countGroundItemsInWindow(recoveryOutOfScope);
         int[] census = scan.itemCensusInBatchWindow();
         int pendBrk = scan.countPendingInRange(scan.batchWindowWestX() - 2, scan.batchWindowWestX() + 5,
             mod.lowerMapCorner.getZ() - 3, mod.lowerMapCorner.getZ() + 129);
@@ -705,6 +788,15 @@ final class SlaveEngine {
                 return;
             }
         }
+        // NEVER SKIP (user rule, 2026-10-21): drops below the pickup band route to
+        // the recovery dig, not the walk sweep - no walker can ever touch them
+        // (the 08:54 batch-17 stall burned 8 sweep re-arms + 44s of collection
+        // attempts against 4 drops under the NW gate floor).
+        int subFloorDrops = scan.countSubFloorDropsInWindow(recoveryOutOfScope);
+        if (subFloorDrops > 0 && recoveryCount < RECOVERY_MAX_PER_BATCH) {
+            armDropRecovery(subFloorDrops);
+            return;
+        }
         // Re-arm the sweep. PROGRESS-AWARE: a retry is only consumed when the sweep
         // mod.state (blocks + item states + position) is unchanged since the last re-arm —
         // a sweep that is still breaking/collecting re-arms freely instead of racing
@@ -727,13 +819,35 @@ final class SlaveEngine {
                     + " - re-arm " + (frozen ? "(FROZEN) " : "") + "retry " + batchPassRetries + "/8.");
                 return;
             }
-            mod.warning("§6[SWEEP-VERIFY]§c batch " + mod.currentBatch + ": sweep FROZEN after " + batchPassRetries
-                + " re-arms with blocks=" + remainingBlocks + " items ready=" + census[0]
-                + " - completing with content remaining (PERSISTENT REJECTION logs should name the culprit).");
+            // AUTO-RECOVERY ESCALATION (user rule: never stuck, auto-continue): an
+            // encased drop gets its containing block dug out (inside the bounding
+            // area only); with nothing diggable left the batch completes below with
+            // the remainder NAMED - the run never stalls.
+            BlockPos encased = scan.findEncasedDropCellInWindow();
+            if (encased != null) {
+                batchPassRetries = 0;
+                sweepReArmSig = null;
+                containerDigPos = encased;
+                mod.checkpoints.clear();
+                mod.checkpoints.add(new Pair(new Vec3d(encased.getX() + 0.5, mod.lowerMapCorner.getY(), encased.getZ() + 0.5),
+                    new Pair("containerDig", null)));
+                mod.state = State.Walking;
+                mod.info("§6[SWEEP-VERIFY]§7 batch " + mod.currentBatch
+                    + ": sweep frozen - digging the block encasing a drop at " + encased.toShortString() + ".");
+                return;
+            }
+            mod.warning("§6[SWEEP-VERIFY]§e batch " + mod.currentBatch
+                + ": sweep frozen with blocks=" + remainingBlocks + " items[ready=" + census[0]
+                + " sub-floor=" + subFloorDrops + "] and every legal recovery exhausted - "
+                + "completing with a NAMED remainder (see the lines above for locations).");
         }
         sweepWaitRounds = 0;
         sweepWaitLogged = false;
         sweepReArmSig = null;
+        recoveryCount = 0;
+        recoveryOutOfScope.clear();
+        recoveryAttempts.clear();
+        containerDigPos = null;
         mod.info("§aBatch " + mod.currentBatch + " COMPLETE: printed and fully recycled.");
         int doneBatch = mod.currentBatch;
         mod.currentBuildPlan = null;
@@ -741,6 +855,289 @@ final class SlaveEngine {
         mod.state = State.StandBy;
         Utils.setForwardPressed(false);
         SlaveSystem.sendMessageToMaster("step:done:" + doneBatch);
+    }
+
+    // ------------------------------------------------------------------
+    // Sub-floor drop recovery (NEVER-SKIP + AUTO-CONTINUE). Armed by
+    // finishBatch when a census drop sits below the pickup band; drives
+    // itself from onTick via recoveryTick(), fully bypassing the walking/work
+    // dispatch while active. NO stuck state exists: bounded retries, then the
+    // drop is named out of scope and the run continues. Every break/place is
+    // inside the map bounding area (print-box x/z footprint).
+    // ------------------------------------------------------------------
+
+    void armDropRecovery(int subFloorCount) {
+        ItemEntity drop = scan.findNearestSubFloorDrop(3, recoveryOutOfScope);
+        if (drop == null) {   // census raced (despawn/merge) - plain re-verify
+            mod.checkpoints.addFirst(new Pair<>(mc.player.getEntityPos(), new Pair<>("batchExit", null)));
+            mod.state = State.Walking;
+            return;
+        }
+        BlockPos d = BlockPos.ofFloored(drop.getX(), drop.getY(), drop.getZ());
+        mod.checkpoints.clear();
+        mod.checkpoints.add(new Pair<>(new Vec3d(d.getX() + 0.5, mod.lowerMapCorner.getY(), d.getZ() + 0.5),
+            new Pair<>("recoverStart", null)));
+        mod.state = State.Walking;
+        mod.breakStage = 0;   // recovery digs directly; the break-all inv-full pause must not hijack it
+        mod.info("§6[DROP-RECOVERY]§7 batch " + mod.currentBatch + ": " + subFloorCount
+            + " drop(s) below the pickup band (nearest at " + d.toShortString()
+            + ", y=" + String.format("%.1f", drop.getY()) + ", attempt "
+            + (recoveryAttempts.getOrDefault(d, 0) + 1) + "/" + RECOVERY_ATTEMPTS_PER_DROP + ") - recovery dig armed.");
+    }
+
+    boolean handleRecoverStartArrival() {
+        ItemEntity drop = scan.findNearestSubFloorDrop(3, recoveryOutOfScope);
+        if (drop == null) { finishDropRecovery("no in-scope sub-floor drop left (despawned/merged)"); return true; }
+        BlockPos d = BlockPos.ofFloored(drop.getX(), drop.getY(), drop.getZ());
+        boolean inBox = d.getX() >= mod.lowerMapCorner.getX() && d.getX() < mod.lowerMapCorner.getX() + 128
+            && d.getZ() >= mod.lowerMapCorner.getZ() && d.getZ() < mod.lowerMapCorner.getZ() + 128;
+        // BOUNDING-AREA RULE (user, 2026-10-21): never break outside the box - such
+        // drops are never dug, named as out-of-scope remainders, and the run continues.
+        if (!inBox) {
+            if (recoveryOutOfScope.add(d)) {
+                mod.warning("§6[DROP-RECOVERY]§e drop at " + d.toShortString()
+                    + " is OUTSIDE the map bounding area - never dug, named as remainder, continuing.");
+            }
+            finishDropRecovery("drop outside the bounding area at " + d.toShortString());
+            return true;
+        }
+        beginRecoveryAt(d, drop);
+        return true;
+    }
+
+    private void beginRecoveryAt(BlockPos d, ItemEntity drop) {
+        recoveryDropPos = d;
+        recoveryStepItem = drop.getStack().getItem() instanceof BlockItem bi ? bi : null;
+        recoveryFloorPos = new BlockPos(d.getX(), mod.lowerMapCorner.getY() - 1, d.getZ());
+        recoveryStepPos = null;
+        recoveryTicks = 0;
+        recoveryRestoreTries = 0;
+        int surfaceY = mod.lowerMapCorner.getY();
+        // Already in the pit (walked onto an air-floor column = the escape hole
+        // itself, or still falling from the dig): collect right here.
+        if (mc.player.getBlockY() <= surfaceY - 2
+            && Math.abs(mc.player.getX() - (d.getX() + 0.5)) < 1.2
+            && Math.abs(mc.player.getZ() - (d.getZ() + 0.5)) < 1.2) {
+            recoveryFloorBlock = null;
+            recoveryStage = RecoveryStage.COLLECT;
+            mod.state = State.Mining;
+            return;
+        }
+        BlockState fs = mod.miningBlockState(recoveryFloorPos);
+        // First attempt at this column: log the full column state - this is the
+        // evidence that names the hole the drops escaped through (patch target).
+        if (recoveryAttempts.getOrDefault(d, 0) == 0 && mod.debugPrints.get()) {
+            mod.info(String.format("§6[DROP-RECOVERY]§7 column %s: floor=%s, below=%s/%s, dropY=%.2f",
+                d.toShortString(), fs.getBlock().getName().getString(),
+                mod.miningBlockState(d.down()).getBlock().getName().getString(),
+                mod.miningBlockState(d.down(2)).getBlock().getName().getString(), drop.getY()));
+        }
+        recoveryFloorBlock = fs.isAir() ? null : fs.getBlock();
+        // Air floor = the hole IS the gap: walk into it and fall; solid floor = dig.
+        recoveryStage = fs.isAir() ? RecoveryStage.ENTER : RecoveryStage.DIG;
+        mod.state = State.Mining;
+    }
+
+    /** One recovery step per tick; called from onTick while recoveryStage != null. */
+    void recoveryTick() {
+        recoveryTicks++;
+        if (recoveryTicks > RECOVERY_WATCHDOG_TICKS) {
+            boolean belowSurface = mc.player.getBlockY() <= mod.lowerMapCorner.getY() - 2;
+            if (belowSurface) {
+                // A bot inside the pit is NEVER abandoned mid-climb (the exit succeeds
+                // by construction - placement). Cut whatever else is stuck and climb.
+                if (recoveryTicks % 100 == 0) {
+                    mod.warning("§6[DROP-RECOVERY]§e recovery over budget at " + recoveryDropPos.toShortString()
+                        + " - forcing the climb-out, then re-verifying.");
+                }
+                recoveryStage = RecoveryStage.EXIT;
+                recoveryExitTick();
+                return;
+            }
+            failRecoveryAttempt("watchdog (" + (RECOVERY_WATCHDOG_TICKS / 20) + "s)");
+            return;
+        }
+        switch (recoveryStage) {
+            case DIG -> recoveryDigTick();
+            case ENTER -> recoveryEnterTick();
+            case COLLECT -> recoveryCollectTick();
+            case EXIT -> recoveryExitTick();
+            case RESTORE -> recoveryRestoreTick();
+        }
+    }
+
+    /** Attempt failed: count it, retry while attempts remain, else name the drop
+     *  out of scope and CONTINUE the batch (never stuck, never silent). */
+    private void failRecoveryAttempt(String why) {
+        recoveryStage = null;
+        Utils.setJumpPressed(false);
+        Utils.setForwardPressed(false);
+        int attempts = recoveryAttempts.merge(recoveryDropPos, 1, Integer::sum);
+        if (attempts >= RECOVERY_ATTEMPTS_PER_DROP) {
+            if (recoveryOutOfScope.add(recoveryDropPos)) {
+                mod.warning("§6[DROP-RECOVERY]§e " + attempts + " attempts failed at " + recoveryDropPos.toShortString()
+                    + " (" + why + ") - drop named OUT OF SCOPE (remainder), batch continues automatically.");
+            }
+        } else {
+            mod.warning("§6[DROP-RECOVERY]§e attempt " + attempts + "/" + RECOVERY_ATTEMPTS_PER_DROP + " at "
+                + recoveryDropPos.toShortString() + " failed (" + why + ") - retrying.");
+        }
+        mod.checkpoints.clear();
+        mod.checkpoints.add(new Pair<>(mc.player.getEntityPos(), new Pair<>("batchExit", null)));
+        mod.state = State.Walking;
+    }
+
+    private void recoveryDigTick() {
+        if (mod.miningBlockState(recoveryFloorPos).isAir()) {   // server confirmed - go fall in
+            recoveryStage = RecoveryStage.ENTER;
+            return;
+        }
+        mod.nextBlockPos = recoveryFloorPos;
+        mod.engine.sendHybridBreak(recoveryFloorPos);   // self-routes pair/split/vanilla (obsidian-class floors)
+    }
+
+    private void recoveryEnterTick() {
+        if (mc.player.getBlockY() <= mod.lowerMapCorner.getY() - 2) {   // in the pit
+            recoveryStage = RecoveryStage.COLLECT;
+            return;
+        }
+        // Walk into the hole: aim at its centre and step off the edge (this covers
+        // both the air-floor gap and a dig done from an off-column stance).
+        Vec3d c = new Vec3d(recoveryFloorPos.getX() + 0.5, mc.player.getY(), recoveryFloorPos.getZ() + 0.5);
+        mc.player.setYaw((float) Rotations.getYaw(c));
+        Utils.setForwardPressed(true);
+    }
+
+    private void recoveryCollectTick() {
+        ItemEntity live = scan.findNearestSubFloorDrop(3, recoveryOutOfScope);
+        boolean targetGone = live == null
+            || !BlockPos.ofFloored(live.getX(), live.getY(), live.getZ()).equals(recoveryDropPos);
+        if (targetGone) {
+            if (mc.player.isOnGround()) {
+                recoveryStage = RecoveryStage.EXIT;
+                Utils.setForwardPressed(false);
+            }
+            return;
+        }
+        // Landed but laterally offset: step toward the drop inside the void (bounded
+        // by the watchdog; if the pocket is too tight to walk this cuts to EXIT).
+        if (mc.player.isOnGround()) {
+            Vec3d to = live.getEntityPos().subtract(mc.player.getEntityPos());
+            if (Math.hypot(to.x, to.z) > 0.8) {
+                mc.player.setYaw((float) Rotations.getYaw(live.getEntityPos()));
+                Utils.setForwardPressed(true);
+            } else {
+                Utils.setForwardPressed(false);
+            }
+        }
+    }
+
+    private void recoveryExitTick() {
+        double surfaceY = mod.lowerMapCorner.getY();
+        if (mc.player.isOnGround() && mc.player.getY() >= surfaceY - 0.01) {
+            Utils.setJumpPressed(false);
+            Utils.setForwardPressed(false);
+            recoveryStepPos = null;
+            recoveryStage = RecoveryStage.RESTORE;
+            return;
+        }
+        BlockPos d = recoveryDropPos;
+        // 1-deep pit (feet one below the surface): a plain jump toward an intact
+        // neighbour column clears it - no placement needed.
+        if (mc.player.getY() >= surfaceY - 1.01) {
+            Vec3d exit = recoveryExitGoal(d, surfaceY);
+            mc.player.setYaw((float) Rotations.getYaw(exit));
+            Utils.setForwardPressed(true);
+            Utils.setJumpPressed(true);
+            return;
+        }
+        // Deeper: at each hop's apex place a step block into the cell under the feet
+        // (the player box clears the cell top at the 1.25-block jump peak). The step
+        // cell is captured at JUMP START - floor(y) flips one cell up mid-air. One
+        // block per cell, climb iteratively; the step prefers the recovered stack,
+        // then ANY carried block (mid-collect the bot carries dozens).
+        if (mc.player.isOnGround()) {
+            recoveryStepPos = new BlockPos(d.getX(), (int) Math.floor(mc.player.getY() + 0.01), d.getZ());
+        } else if (recoveryStepPos != null
+            && mc.player.getY() >= recoveryStepPos.getY() + 1.05) {
+            if (recoveryStepItem == null) recoveryStepItem = bestCarriedBlockItem();
+            if (recoveryStepItem == null) {
+                if (recoveryTicks % 100 == 0) {
+                    mod.warning("§6[DROP-RECOVERY]§e no placeable block carried for the climb-out step - "
+                        + "keep hopping and re-scanning the inventory.");
+                }
+            } else {
+                mod.engine.placeCarriedItem(recoveryStepItem, recoveryStepPos);
+            }
+        }
+        Utils.setJumpPressed(true);
+    }
+
+    /** Exit landing spot: the first in-box neighbour column whose floor block is
+     *  solid (an open neighbour pit would swallow the jump); east fallback. */
+    private Vec3d recoveryExitGoal(BlockPos d, double surfaceY) {
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int[] dir : dirs) {
+            BlockPos n = d.add(dir[0], 0, dir[1]);
+            if (n.getX() < mod.lowerMapCorner.getX() || n.getX() >= mod.lowerMapCorner.getX() + 128
+                || n.getZ() < mod.lowerMapCorner.getZ() || n.getZ() >= mod.lowerMapCorner.getZ() + 128) continue;
+            if (!mod.miningBlockState(n.down()).isAir()) {
+                return new Vec3d(n.getX() + 0.5, surfaceY, n.getZ() + 0.5);
+            }
+        }
+        return new Vec3d(d.getX() + 1.5, surfaceY, d.getZ() + 0.5);
+    }
+
+    /** Any carried placeable block for the climb-out step; the dug floor block is
+     *  kept in reserve for the exact restore when alternatives exist. */
+    private Item bestCarriedBlockItem() {
+        Item reserve = recoveryFloorBlock != null ? recoveryFloorBlock.asItem() : null;
+        Item reserveHit = null;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (stack.isEmpty() || !(stack.getItem() instanceof BlockItem bi)) continue;
+            if (reserve != null && stack.getItem().equals(reserve)) { reserveHit = bi; continue; }
+            return bi;   // a block that is not the exact-restore reserve
+        }
+        return reserveHit;   // the reserve alone still beats nothing (exit before restore)
+    }
+
+    private void recoveryRestoreTick() {
+        BlockState fs = mod.miningBlockState(recoveryFloorPos);
+        if (!fs.isAir()) {
+            boolean exact = recoveryFloorBlock != null && fs.getBlock().equals(recoveryFloorBlock);
+            if (!exact && recoveryFloorBlock != null) {
+                mod.warning("§6[DROP-RECOVERY]§e floor restore mismatch at " + recoveryFloorPos.toShortString()
+                    + " (expected " + recoveryFloorBlock.getName().getString() + ", found "
+                    + fs.getBlock().getName().getString() + ") - continuing.");
+            }
+            finishDropRecovery(exact ? "floor restored exactly"
+                : "floor gap sealed with " + fs.getBlock().getName().getString() + " (was a hole)");
+            return;
+        }
+        Item restoreItem = recoveryFloorBlock != null ? recoveryFloorBlock.asItem() : recoveryStepItem;
+        if (restoreItem == null || !mod.engine.placeCarriedItem(restoreItem, recoveryFloorPos)) {
+            if (++recoveryRestoreTries > 40) {
+                // Open hole in the floor: safe to leave (later drops falling in are
+                // auto-recovered by the air-floor path); it also gets sealed by any
+                // later restore attempt that finds a carried block. Never stalls.
+                mod.warning("§6[DROP-RECOVERY]§e no block to seal " + recoveryFloorPos.toShortString()
+                    + " - floor hole left open (drops falling in auto-recover); continuing.");
+                finishDropRecovery("floor hole left open - no carried block");
+            }
+        }
+    }
+
+    private void finishDropRecovery(String note) {
+        recoveryStage = null;
+        recoveryCount++;
+        Utils.setJumpPressed(false);
+        Utils.setForwardPressed(false);
+        mod.info("§6[DROP-RECOVERY]§7 batch " + mod.currentBatch + " dig done (" + note
+            + ") - re-verifying the window.");
+        mod.checkpoints.clear();
+        mod.checkpoints.add(new Pair<>(mc.player.getEntityPos(), new Pair<>("batchExit", null)));
+        mod.state = State.Walking;
     }
 
 
@@ -790,6 +1187,8 @@ final class SlaveEngine {
                 mod.currentBatch = batch;
                 batchPassRetries = 0;
                 mod.engine.placementAttempts.clear();
+                mod.engine.placementRetryStart.clear();
+                mod.engine.breakRetryStart.clear();
                 mod.slave.scan.collectSkips.clear();
                 mod.clearResetPending();
                 sweepReArmSig = null;
@@ -905,6 +1304,7 @@ final class SlaveEngine {
             }
             case "abort" -> {
                 removePendingStepCommand();
+                recoveryStage = null;   // a mid-recovery abort must not keep digging
                 reset.stepAbort();
             }
             default -> removePendingStepCommand();
@@ -983,6 +1383,7 @@ final class SlaveEngine {
         }
         if (batchPassRetries >= 2) {
             mod.error("Batch " + mod.currentBatch + " break(2) incomplete after retry: " + remaining.size() + " blocks left. Stopped.");
+            mod.checkpoints.clear();   // a stopped batch must not reach awaitBreakAll behind us
             mod.state = State.StandBy;
             Utils.setForwardPressed(false);
             return false;
@@ -990,8 +1391,13 @@ final class SlaveEngine {
         batchPassRetries++;
         mod.info("§eBatch " + mod.currentBatch + " break(2) leftover (" + remaining.size() + ") - fixed-direction retry pass (S->N).");
         double lane2X = mod.lowerMapCorner.getX() + 2.0 * mod.currentBatch + 2.5;
-        mod.checkpoints.add(new Pair(new Vec3d(lane2X, mod.lowerMapCorner.getY(), mod.lowerMapCorner.getZ() + 128.7), new Pair("sprint", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(lane2X, mod.lowerMapCorner.getY(), mod.lowerMapCorner.getZ() - 2), new Pair("break2Done", null)));
+        // HEAD-insertion (addFirst, reversed): the queue still holds awaitBreakAll
+        // (north) ahead of us - tail-appending made the bot "reach" awaitBreakAll
+        // instantly, declare break(2) complete, and the retry legs were wiped by
+        // startBreakAll's clear() without ever running; the leftover stood through
+        // the master's W2 and the map recorded it (live 11:02:34, batch 19).
+        mod.checkpoints.addFirst(new Pair(new Vec3d(lane2X, mod.lowerMapCorner.getY(), mod.lowerMapCorner.getZ() - 2), new Pair("break2Done", null)));
+        mod.checkpoints.addFirst(new Pair(new Vec3d(lane2X, mod.lowerMapCorner.getY(), mod.lowerMapCorner.getZ() + 128.7), new Pair("sprint", null)));
         mod.state = State.Mining;
         return false;
     }
@@ -1027,15 +1433,24 @@ final class SlaveEngine {
         }
         boolean printing = mod.state == State.Walking && mod.breakStage == 0 && mod.currentBuildPlan != null
             && !mod.checkpoints.isEmpty() && StepCheckered.ALLOW_PLACE_ACTIONS.contains(mod.checkpoints.getFirst().getRight().getLeft());
+        // COLLECTION LEGS ARE TRANSIT (user, 2026-10-21: pickup walked at 4.3 m/s
+        // because breakStage 4 from break-all kept counting as "breaking"): after
+        // break-all the pass only walks and touches drops - no break packets are in
+        // flight to outrun, so the transit speed applies. sweepTick is deliberately
+        // NOT here: it interleaves straggler block breaks and break passes never
+        // speed-hack.
+        boolean collecting = mod.state == State.Walking && mod.breakStage != 0 && !mod.checkpoints.isEmpty() && collectSpeedActions.contains(mod.checkpoints.getFirst().getRight().getLeft());
         // BREAK PASSES NEVER SPEED-HACK (live 2026-10-21: at 7.12 bps the bot outruns
         // the server's echo AND reach — breaks expire out-of-reach into a frozen vanilla
         // queue (51 blocks stuck) and the server rubber-bands the movement itself. The
         // math cap is 30 bps / 5.25 blocks-per-row = 5.7 bps max useful pace; sprint
         // (~5.6) sits just under it).
-        boolean breaking = mod.state == State.Mining || (mod.breakStage != 0 && mod.state != State.StandBy);
+        boolean breaking = mod.state == State.Mining || (mod.breakStage != 0 && mod.state != State.StandBy && !collecting);
         boolean want = !printing && !breaking && mod.state != State.StandBy;
         if (want != transitSpeedOn) setTransitSpeed(want);
     }
+
+    private static final List<String> collectSpeedActions = Arrays.asList("collectRun", "batchExit", "recoverStart");
 
     void setTransitSpeed(boolean on) {
         try {
@@ -1140,6 +1555,14 @@ final class SlaveEngine {
 
         if (mod.restock.processDeferredInventoryIO()) return;
 
+        // Sub-floor drop recovery drives itself (dig/collect/exit/restore) and fully
+        // bypasses the walking/work dispatch below - one stage per tick, bounded by
+        // its own watchdog. Runs after the IO drain so its placement swaps settle.
+        if (recoveryStage != null) {
+            recoveryTick();
+            return;
+        }
+
         if (!(mod.state.equals(State.Walking) || mod.state.equals(State.Mining))) return;
         if (mod.checkpoints.isEmpty()) return;
 
@@ -1149,7 +1572,17 @@ final class SlaveEngine {
         Utils.setForwardPressed(!mod.engine.adaptivePaceHold() && !mod.engine.breakApproachHold());
 
         Vec3d goal = mod.checkpoints.get(0).getLeft();
-        if (PlayerUtils.distanceTo(goal.add(0, mc.player.getY() - goal.y, 0)) < mod.checkpointBuffer.get()) {
+        // COLLECTION LEGS arrive early (user, 2026-10-21: pickup homing to the 0.2
+        // buffer decelerated the bot onto every drop): the pickup box touches at
+        // ~1.4 horizontal, so arriving at 1.1 keeps the sweep at full speed and the
+        // drop is collected in passing. Sweep-block targets stay precise via the
+        // Mining approach gate (interaction range 4.5 >> 1.1).
+        String headAction = mod.checkpoints.get(0).getRight().getLeft();
+        double arrivalBuffer = mod.checkpointBuffer.get();
+        if ("collectRun".equals(headAction) || "sweepTick".equals(headAction)) {
+            arrivalBuffer = Math.max(arrivalBuffer, 1.1);
+        }
+        if (PlayerUtils.distanceTo(goal.add(0, mc.player.getY() - goal.y, 0)) < arrivalBuffer) {
             if (handleCheckpointArrival(goal)) return;
             goal = mod.checkpoints.get(0).getLeft();
         }

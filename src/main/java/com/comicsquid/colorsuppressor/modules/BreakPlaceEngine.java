@@ -39,7 +39,9 @@ final class BreakPlaceEngine {
 
     // --- Engine state (moved from the module) ---
     HashMap<BlockPos, Integer> placementCooldowns;               // litematica-style: retry timer per position
-    HashMap<BlockPos, Integer> placementAttempts;                // per-position placement attempts (adaptive-pace cap)
+    HashMap<BlockPos, Integer> placementAttempts;                // per-position placement attempts (diagnostic; gating is tick-based now)
+    HashMap<BlockPos, Integer> placementRetryStart;              // pos -> tickIndex of its first pick: the print-retry-ticks window
+    HashMap<BlockPos, Integer> breakRetryStart;                  // pos -> tickIndex of its first pending expiry: the break-retry-ticks window
     int placeHoldTicks;                                          // consecutive adaptive-pace hold ticks (watchdog)
     int approachHoldTicks;                                       // consecutive break approach-hold ticks (watchdog)
     HashMap<BlockPos, Integer> breakPending;                     // pos -> ticks until silently confirmed
@@ -64,6 +66,8 @@ final class BreakPlaceEngine {
     void resetForActivation() {
         placementCooldowns = new HashMap<>();
         placementAttempts = new HashMap<>();
+        placementRetryStart = new HashMap<>();
+        breakRetryStart = new HashMap<>();
         placeHoldTicks = 0;
         approachHoldTicks = 0;
         breakPending = new HashMap<>();
@@ -83,6 +87,16 @@ final class BreakPlaceEngine {
         lastSwappedMaterial = null;
     }
 
+    /** Tick-budget check for a plan cell's print retry window (print-retry-ticks):
+     *  true once tickIndex has moved print-retry-ticks past the cell's FIRST pick.
+     *  Replaces the old attempts>=3 cap (live 13:24: three marginal sends inside
+     *  1.5s of sprinting past burned the budget before any fair stopped retry —
+     *  the repair pass then placed those cells from dz −3.4..−3.6 first try). */
+    boolean printRetryExpired(BlockPos pos) {
+        Integer start = placementRetryStart.get(pos);
+        return start != null && tickIndex - start >= mod.printRetryTicks.get();
+    }
+
     boolean adaptivePaceHold() {
         if (mod.state.equals(State.Walking) && mod.breakStage == 0 && mod.currentBuildPlan != null
             && !mod.checkpoints.isEmpty()) {
@@ -100,7 +114,7 @@ final class BreakPlaceEngine {
                     placeHoldTicks++;
                     if (placeHoldTicks > 100) {
                         // Safety net only - the attempts cap is the real bound (a block
-                        // sent 5 times without standing is force-released to the repair
+                        // sent 10 times without standing is force-released to the repair
                         // pass, which drops it out of the hold's scan).
                         mod.warning("§ePrint pace-hold watchdog: released a " + placeHoldTicks
                             + "-tick hold - walking on (retrying blocks will trail).");
@@ -119,37 +133,82 @@ final class BreakPlaceEngine {
         return false;
     }
 
-    /** PRINT FORWARD GAP + VERIFY-THEN-ADVANCE (user rules 2026-10-21: "reduce the
-     *  print forward gap to 1 or max 2 blocks so the bot can burst more", then "it
-     *  misses few blocks... so bot dont go past and avoid missing" — the print
-     *  mirror of the break approach-hold). One scan: the nearest still-unplaced
-     *  FORWARD plan block (route direction, 1-row behind grace; attempts-capped
-     *  skipped — the repair pass owns them) and whether ANY such block sits within
-     *  interaction range. The hold engages at ≤2.0 horizontal from the frontier AND
-     *  stays engaged while any forward in-reach block is still unplaced — INCLUDING
-     *  on-cooldown ones the picker cannot see: the old placeNow-based release freed
-     *  the walk exactly when everything left was mid-retry, and the missed few were
-     *  blocks walked past while their placement echo/cooldown cycles raced the bot.
-     *  Release = every forward in-reach block placed or capped: approach deep,
-     *  burst the whole reach sphere, verify, advance. At-goal (dir = 0, pass end)
-     *  the 2.0 gate drops — hold until the whole in-reach sphere drains (the
-     *  original pass-end semantics). A frontier whose material isn't CARRIED never
-     *  pins the bot — the on-demand swap / supply trip owns it. */
+    /** PRINT FORWARD GAP — SENT-GATED (user rules 2026-10-21: "gap 1-2 then
+     *  burst"; then "no walked-past misses" ((w)); then "same fix for placing
+     *  too" after (ai) — the print mirror of the break approach-hold). The
+     *  hold engages at ≤2.0 horizontal from the nearest UN-SENT forward plan
+     *  block and releases the moment everything in reach is placed, SENT
+     *  (on placement cooldown — the send already left; the server air-place
+     *  needs no presence, exactly like a break pair), capped (repair owns it),
+     *  body-overlapped (the picker refuses it — places en route once walked
+     *  off; also the 101-tick watchdog pin), or not carried (swap/supply owns
+     *  it). No echo waiting, no full-sphere drain before each step; blocks-per-
+     *  tick is the drain rate per stop (the place loop sends up to that many
+     *  distinct positions per tick). A failed send resurfaces after its 4-tick
+     *  cooldown and re-gates movement if still ahead; anything that trails
+     *  anyway places en route (any-direction picker) or in the repair pass.
+     *  At-goal (dir = 0, pass end) the 2.0 gate drops — hold until the whole
+     *  in-reach sphere is sent/placed (pass-end semantics). Off-lane the hold
+     *  never engages (the picker's lane gate is closed — the route re-centers). */
     boolean printFrontierWithinGap() {
+        // LANE-GATE MIRROR: the placement picker places nothing off the lane-2
+        // centreline (wall-in guard) - the hold must not pin the bot either.
+        if (mod.lowerMapCorner != null
+            && Math.abs(mc.player.getX() - mod.slave.routes.currentWalkLaneX()) > 0.3) return false;
+        // RETRY-RANGE GUARD - PRINT CASE, deliberately DIFFERENT from the break
+        // case (user rule 2026-10-21: "never walk past a block until server
+        // confirm - stop at max interaction range so a rejected print can still
+        // retry"; live 12:43 pin: the old `dist >= retryEdge` had NO upper bound
+        // and NO direction test, so far AHEAD cells - which exist along the whole
+        // 128-row lane - pinned every print leg from tick 1; the 101-tick
+        // watchdog crawled the bot ~1 walking tick per 5s with zero sends sent).
+        // A placement, unlike a break pair, has no transient server-side fate:
+        // an unlanded cell just stays air, and its retry is a FRESH send that
+        // needs the cell inside the server-reach send clamp. So the guard pins
+        // only on cells a stopped bot can still send - the [retryEdge, sendEdge)
+        // shell - and that the bot is actively walking PAST (behind/abeam);
+        // ahead cells are being approached (the 2.0 pacing gap below owns those),
+        // and beyond sendEdge is repair-pass territory, the same doctrine as
+        // attempts >= 3. The 0.6 margin = one tick of movement (creep to the
+        // edge, never past). At-goal (dir = 0) the direction filter opens into
+        // pass-end drain over the same sendable shell.
+        double sendEdge = Math.min(mod.interactionRange.get(), 4.4);   // server survival reach: sends beyond it are silently rejected (the break side's proven law)
+        double retryEdge = sendEdge - 0.6;
         int dir = breakTravelDir();
         int botZ = mc.player.getBlockZ();
+        for (BlockPos pos : placementCooldowns.keySet()) {
+            if (!mod.miningBlockState(pos).isAir()) continue;   // landed - confirm seen (was inverted: skipped the real unconfirmed cells and pinned placed ones instead)
+            if (printRetryExpired(pos)) continue;               // tick budget spent - repair owns it, never pin on it
+            double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
+            if (dist < retryEdge || dist >= sendEdge) continue;       // sendable shell only; beyond send range the repair pass owns it
+            if (dir != 0 && (pos.getZ() - botZ) * dir >= 0) continue; // ahead/abeam - being approached, not walked past
+            return true;
+        }
+        for (BlockPos pos : mod.currentBuildPlan.keySet()) {
+            if (!mod.miningBlockState(pos).isAir()) continue;                    // placed = done
+            if (printRetryExpired(pos)) continue;                               // repair owns it (print-retry-ticks budget spent - was attempts>=3, which three marginal sprint-past sends could burn in 1.5s without a single fair stopped retry)
+            if (mc.player.getBoundingBox().intersects(new Box(pos).expand(0.3))) continue;   // unplaceable while overlapped - MUST mirror the picker's margin (the (al) mismatch pinned the bot 101 ticks on blocks the picker refused but this guard counted)
+            Block planned = mod.currentBuildPlan.get(pos);
+            if (planned == null || !mod.restock.isMaterialCarried(planned.asItem())) continue;  // supply owns it
+            double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
+            if (dist < retryEdge || dist >= sendEdge) continue;       // about to leave send range while still placeable - hold and work it
+            if (dir != 0 && (pos.getZ() - botZ) * dir >= 0) continue; // ahead/abeam - the pacing gap owns the approach, it never pins
+            return true;
+        }
         BlockPos nearest = null;
         double nearestH = Double.MAX_VALUE;
         boolean reachBusy = false;
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
             if (!mod.miningBlockState(pos).isAir()) continue;           // placed = done
-            if (placementAttempts.getOrDefault(pos, 0) >= 5) continue;  // force-released - repair owns it
+            if (printRetryExpired(pos)) continue;                      // tick budget spent - move off or repair owns it (was attempts>=3)
+            if (placementCooldowns.getOrDefault(pos, 0) > 0) continue;  // SENT - echo in flight - never gates movement
             if (dir != 0 && (pos.getZ() - botZ) * dir < -1) continue;   // behind - prints en route
+            if (mc.player.getBoundingBox().intersects(new Box(pos).expand(0.3))) continue;  // picker refuses body-overlap - identical margin, or the hold pins on unsendable blocks
             double dx = pos.getX() + 0.5 - mc.player.getX();
             double dz = pos.getZ() + 0.5 - mc.player.getZ();
             double hDist = Math.sqrt(dx * dx + dz * dz);
             if (hDist < nearestH) { nearestH = hDist; nearest = pos; }
-            if (mc.player.getEyePos().distanceTo(pos.toCenterPos()) <= mod.interactionRange.get()) reachBusy = true;
+            if (mc.player.getEyePos().distanceTo(pos.toCenterPos()) <= sendEdge) reachBusy = true;   // sendable shell only - a 4.4-5.0 cell can never be sent, so it must not gate the at-goal hold either
         }
         if (nearest == null || !reachBusy) return false;
         Block planned = mod.currentBuildPlan.get(nearest);
@@ -209,7 +268,13 @@ final class BreakPlaceEngine {
         // - its pendings resolve in place. Reads the same forward-key state the
         // movement governor drives, so it cannot disagree with the hold.
         double sendClamp = mc.options.forwardKey.isPressed() ? 3.5 : Math.min(mod.interactionRange.get(), 4.4);
-        for (int pick = 0; pick < maxSends * 6 && sent < maxSends; pick++) {
+        // PICK-BUDGET FLOOR (user, setting 3 skips): each pick that is examined but
+        // not sent (walking-clamp rejects, vanilla-sticky skips, split-busy/vanilla
+        // routing, tool-missing) burns one of the maxSends*6 tries WITHOUT counting
+        // toward the send cap. At low settings 6*N shrank that headroom too (18 at
+        // 3 vs 24 at 4) and dense clusters could exhaust the picks before finding
+        // the sendable candidates - a floor of 24 keeps search headroom constant.
+        for (int pick = 0; pick < Math.max(24, maxSends * 6) && sent < maxSends; pick++) {
             BlockPos breakTarget;
             if (pick == 0 && mod.nextBlockPos != null && !attempted.contains(mod.nextBlockPos)) {
                 breakTarget = mod.nextBlockPos;
@@ -408,15 +473,7 @@ final class BreakPlaceEngine {
             if (mc.player.getInventory().getStack(slot).isEmpty()) continue;
             Item foundMaterial = mc.player.getInventory().getStack(slot).getItem();
             if (foundMaterial.equals(material)) {
-                // Direct placement via interaction manager (litematica-style air-place):
-                // construct a BlockHitResult on the target position itself (inside-block
-                // hit = true). This works through walls because we don't rely on a visible
-                // neighbor face — soft anticheats (6b6t) accept this without rotation.
-                mc.player.getInventory().setSelectedSlot(slot);
-                BlockHitResult hitResult = new BlockHitResult(
-                    mod.nextBlockPos.toCenterPos(), Direction.UP, mod.nextBlockPos, true);
-                mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hitResult);
-                mc.player.swingHand(Hand.MAIN_HAND);
+                sendAirPlace(slot, mod.nextBlockPos);
                 if (material == lastSwappedMaterial) lastSwappedMaterial = null;
                 return 1;
             }
@@ -433,9 +490,57 @@ final class BreakPlaceEngine {
             }
         }
         if (lastSwappedMaterial == material) return 0;    //Wait for swapped material
+        // ECHO-GRACE before the emergency trip (live 11:04:41, batch 20): the last
+        // stack of a material can be consumed by a send whose confirmation echo is
+        // still in flight - the position re-demands while the client still reads
+        // air, the "missing" material trips a FULL north-corridor supply run, and
+        // the post-restock re-place bounces off the block that stood all along
+        // (Brown Concrete deficit 1; sends at 11:04:40 success, :41 phantom-miss,
+        // 11:05:12 bounce). Arm a 2s grace: keep placing other materials; a real
+        // stockout trips 40 ticks later, a phantom one never re-demands.
+        if (mod.slave.restockCooldown == 0) {
+            mod.slave.restockCooldown = 40;
+            return 0;
+        }
         // Mid-print supply run: refill the missing material via the north checkpoint
         mod.slave.routes.pauseForRestockTrip(false);
         return -1;
+    }
+
+    /** Shared air-place core (litematica-style): a BlockHitResult on the target cell
+     *  itself (inside-block hit = true) works through walls because we don't rely on
+     *  a visible neighbor face — soft anticheats (6b6t) accept it without rotation.
+     *  interactBlock also syncs the held slot server-side (handler-coords law). */
+    void sendAirPlace(int hotbarSlot, BlockPos pos) {
+        mc.player.getInventory().setSelectedSlot(hotbarSlot);
+        BlockHitResult hitResult = new BlockHitResult(pos.toCenterPos(), Direction.UP, pos, true);
+        mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hitResult);
+        mc.player.swingHand(Hand.MAIN_HAND);
+    }
+
+    /** Plan-independent placement of a CARRIED item into an arbitrary empty cell,
+     *  used only by the sub-floor drop recovery (exit step + exact floor restore).
+     *  Hotbar-first; a main-inventory stack is swapped into the selected slot and
+     *  placed on the caller's next call. Returns true when a place was sent. */
+    boolean placeCarriedItem(Item item, BlockPos pos) {
+        if (item == null || mc.player == null) return false;
+        if (placementCooldowns.getOrDefault(pos, 0) > 0) return false;
+        for (int slot = 0; slot <= 8; slot++) {
+            if (mc.player.getInventory().getStack(slot).isEmpty()) continue;
+            if (mc.player.getInventory().getStack(slot).getItem().equals(item)) {
+                sendAirPlace(slot, pos);
+                placementCooldowns.put(pos, 4);
+                return true;
+            }
+        }
+        for (int slot = 9; slot < 36; slot++) {
+            if (mc.player.getInventory().getStack(slot).isEmpty()) continue;
+            if (mc.player.getInventory().getStack(slot).getItem().equals(item)) {
+                Utils.performSwap(slot, mc.player.getInventory().getSelectedSlot());
+                return false;   // swap lands next inventory window; caller re-tries
+            }
+        }
+        return false;
     }
 
     BlockPos getNextBatchPlacementPos() {
@@ -491,7 +596,13 @@ final class BreakPlaceEngine {
                     // expiry routes to multi-tick vanilla (batch 4 ended blocks=6, all
                     // vanillaQ, 19s of gate round trips - user: 100% in one pass).
                     int expiryCount = vanillaBreakRetries.getOrDefault(pending, 0);
-                    if (expiryCount == 0
+                    // BREAK-RETRY TICK WINDOW (break-retry-ticks): opens at the FIRST
+                    // expiry; past the budget the clean fastBreak re-send is off the
+                    // table and the block falls to vanilla (in reach) or the sweep —
+                    // never a skip, just the end of the in-pass fast-retry budget.
+                    Integer chaseStart = breakRetryStart.putIfAbsent(pending, tickIndex);
+                    boolean chaseWithinBudget = tickIndex - (chaseStart == null ? tickIndex : chaseStart) < mod.breakRetryTicks.get();
+                    if (expiryCount == 0 && chaseWithinBudget
                         && mc.player.getEyePos().distanceTo(pending.toCenterPos()) <= Math.min(mod.interactionRange.get(), 4.4)
                         && ensureBestToolFor(pending)) {
                         // the ONE break-rules copy (pair / split / vanilla routing)
@@ -755,6 +866,18 @@ final class BreakPlaceEngine {
         // on the bot's path; blocks intersecting its body are retried once it moves on.
         BlockPos best = null;
         double bestDist = Double.MAX_VALUE;
+        // WALKING SEND CLAMP (mirror of the break-side lesson): a placement sent
+        // while WALKING at the far edge lands its echo behind the advancing bot —
+        // and when the send raced the echo (52% of burst placements need >1 send),
+        // its RETRY then sits behind the bot in fading reach = the trail-off
+        // misses the pass-end verify reports. Walking placements only within 3.5;
+        // the HELD stationary burst keeps the full range (its echoes resolve in
+        // place, and the (w) hold stands until they do).
+        // Standing clamp mirrors the server's survival reach: sends beyond ~4.4 are
+        // silently rejected (the break side's proven law) - at range 5 they only
+        // burn attempts and trail off behind the bot. Walking clamp unchanged
+        // (echo-race lesson: far-edge sends while walking land behind the bot).
+        double placeClamp = mc.options.forwardKey.isPressed() ? 3.5 : Math.min(mod.interactionRange.get(), 4.4);
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
             if (!mod.miningBlockState(pos).isAir()) continue;
             if (exclude.contains(pos)) continue;
@@ -762,8 +885,16 @@ final class BreakPlaceEngine {
             // same failed block — let the timeout expire, then retry)
             if (placementCooldowns.getOrDefault(pos, 0) > 0) continue;
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
-            if (dist > mod.interactionRange.get()) continue;
-            if (mc.player.getBoundingBox().intersects(new Box(pos))) continue;
+            if (dist > placeClamp) continue;
+            // SELF-COLLISION MARGIN (live hammer loop: same floor block re-sent
+            // every 4-tick cooldown ~15x while parked): the server's canPlace
+            // rejects solid blocks clipping an ENTITY using ITS view of the bot's
+            // box, which lags/rounds differently than this client check - marginal
+            // dz 0.2-0.8 feet-level blocks passed here and were server-rejected in
+            // a loop. expand(0.3) (one movement tick) treats anything that CLOSE to
+            // the body as walk-clear territory: it places en route once the bot has
+            // moved off, or the repair pass owns it - never hammered in place.
+            if (mc.player.getBoundingBox().intersects(new Box(pos).expand(0.3))) continue;
             if (dist < bestDist) {
                 bestDist = dist;
                 best = pos;
@@ -794,7 +925,11 @@ final class BreakPlaceEngine {
             // after it (the proven runner flow). The (r) full-column absorption
             // is rolled back.
             if (break2Only && (pos.getX() >= westX + 2 || pos.getY() < mod.lowerMapCorner.getY() + 2)) continue;
-            if (dir != 0 && (pos.getZ() - botZ) * dir < -1) continue;   // behind us (1-row grace for the standing row)
+            // Behind = sweep territory, EXCEPT outstanding vanilla-queued blocks:
+            // the retry-range guard holds the bot in their 4.4 range, and the ONE
+            // sticky target must stay reachable by the picker to be worked (the
+            // forward rule exists to stop ping-pong WALKING, not retry sends).
+            if (dir != 0 && (pos.getZ() - botZ) * dir < -1 && !needsVanillaBreak.contains(pos)) continue;
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist > mod.interactionRange.get()) continue;
             if (dist < bestDist) { bestDist = dist; best = pos; }
@@ -812,16 +947,16 @@ final class BreakPlaceEngine {
         return 0;
     }
 
-    /** FORWARD-ONLY BREAK CADENCE (user rule, live 2026-10-21: "go close to the next
-     *  batch of blocks - closest ~1 block, not 2-3 far - break ALL in reach, verify,
-     *  then move on, no skips"). Holds forward movement once the bot is ~1 row from
-     *  the nearest still-standing FORWARD target, and releases only when every forward
-     *  target within the server-reach clamp is confirmed air. The old continuous walk
-     *  broke from 2-3 blocks out and strode past blocks whose confirms lagged - the
-     *  skips the straggler sweeps then had to chase. Sends still fire while approaching
-     *  (walking TOWARD targets never outruns their confirms), so each stop arrives
-     *  already half-cleared; blocks beyond the 4.4 server-reach clamp are simply the
-     *  next cluster after one more step. */
+    /** FORWARD-ONLY BREAK CADENCE — SENT-GATED verify-then-advance (user rules
+     *  2026-10-21: "no skips"; then "too slow, even 5 per tick"). Holds forward
+     *  movement only while an UN-SENT standing FORWARD target sits within the
+     *  walking send clamp (3.5) — the invariant "nothing inside send range goes
+     *  un-sent" is the no-skip guarantee. Blocks already sent (pair broken
+     *  server-side same tick; split STOP flushing next tick, still well inside
+     *  the server's ~5.5 reach at walk pace) need no presence and never cost
+     *  travel time: no echo waiting, no full-sphere drain before each step.
+     *  breaks-per-tick sets the drain rate, not the skip count. Vanilla-queued
+     *  blocks are the one presence-needing class (held until air). */
     boolean breakApproachHold() {
         if (mod.breakStage == 0 || mod.currentBuildPlan == null || mod.lowerMapCorner == null) return false;
         if (mod.fullSweepActive) return false;   // RESET runs its own segment feed + gates
@@ -836,6 +971,17 @@ final class BreakPlaceEngine {
         boolean reachBusy = false;
         boolean vanillaBusy = false;
         double sendReach = Math.min(mod.interactionRange.get(), 4.4);
+        // PENDING-AWARE DRAIN GATE (user: "it became too slow... even 5 per tick"):
+        // (ah)'s first cut held until every in-reach target showed confirmed AIR -
+        // waiting out the block-update echo (1-3 ticks per sphere) AND the whole
+        // sphere drain before every step. But a SENT block never needs the bot
+        // present anymore: pairs complete same-tick server-side, and a split's
+        // STOP flushes one tick later well inside the server's ~5.5 reach even at
+        // full walk pace. So movement is only gated by UN-SENT standing targets
+        // within the walking send clamp (3.5, mirrors sendDistinctBreaks) - the
+        // invariant "nothing within send range goes un-sent" keeps the no-skip
+        // guarantee, while sent-but-unconfirmed blocks stop costing travel time.
+        double walkClamp = 3.5;
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
             if ((pos.getZ() - botZ) * dir < -1) continue;   // behind - sweep territory
             // TOPS ONLY, same filter as getNextBatchBreakPos (see the revert note there).
@@ -845,18 +991,75 @@ final class BreakPlaceEngine {
             double dz = pos.getZ() + 0.5 - mc.player.getZ();
             double hDist = Math.sqrt(dx * dx + dz * dz);
             if (hDist < nearestH) { nearestH = hDist; nearest = pos; }
-            if (mc.player.getEyePos().distanceTo(pos.toCenterPos()) <= sendReach) reachBusy = true;
-            // A forward VANILLA-queued block in reach holds the bot AT ANY distance:
-            // multi-tick vanilla mining only completes while the bot stays in server
-            // reach, and walking past one (the 1.3 cluster threshold never stopped
-            // for side-lane stragglers) is exactly how passes ended with blocks for
-            // the gate to round-trip (user: 100% cleanup in one pass).
-            if (needsVanillaBreak.contains(pos)
-                && mc.player.getEyePos().distanceTo(pos.toCenterPos()) <= sendReach) vanillaBusy = true;
+            double eyeDist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
+            // A forward VANILLA-queued block in reach holds the bot until air:
+            // multi-tick vanilla mining only completes while the bot stays in
+            // server reach - the one class that genuinely needs presence.
+            if (needsVanillaBreak.contains(pos) && eyeDist <= sendReach) vanillaBusy = true;
+            if (breakPending.containsKey(pos)) continue;   // SENT - echo/STOP in flight - never gates movement
+            if (eyeDist <= walkClamp) reachBusy = true;
         }
-        boolean atCluster = nearest != null && nearestH <= 1.3 && reachBusy;
-        if (!atCluster && !vanillaBusy) {
-            approachHoldTicks = 0;   // clean ahead / still approaching / cluster verified
+        // LAUNCH CLEARANCE (live "misses or never breaks south most block", batch
+        // 19's -410,101,-193): at break(2) start the bot stands ~1.7 rows south of
+        // the southernmost west-top row and immediately sprints north. That row is
+        // BEHIND the travel direction (past the 1-row grace), so the forward-only
+        // scan above - and the verify-then-advance hold built on it - never covers
+        // it: this pass-start hold suppresses movement until every break(2) target
+        // within server reach (this row included, no behind filter) is confirmed
+        // air. The watchdog below releases a never-confirming block.
+        if (break2Only && dir == -1 && botZ >= mod.lowerMapCorner.getZ() + 125) {
+            boolean launchBusy = false;
+            for (BlockPos pos : mod.currentBuildPlan.keySet()) {
+                if (pos.getX() >= westX + 2 || pos.getY() < mod.lowerMapCorner.getY() + 2) continue;
+                if (mod.miningBlockState(pos).isAir()) continue;
+                if (breakPending.containsKey(pos)) continue;   // sent - breaks behind us fine
+                if (mc.player.getEyePos().distanceTo(pos.toCenterPos()) <= sendReach) { launchBusy = true; break; }
+            }
+            if (launchBusy) {
+                approachHoldTicks++;
+                if (approachHoldTicks > 150) {
+                    mod.warning("§eBreak(2) launch watchdog: released a " + approachHoldTicks
+                        + "-tick start hold - walking on (verify retry owns the rest).");
+                    approachHoldTicks = 0;
+                    return false;
+                }
+                return true;
+            }
+        }
+        // RETRY-RANGE GUARD - BREAK CASE, deliberately DIFFERENT from the print
+        // case (user rule 2026-10-21: "never walk past a block until server
+        // confirm - even if the bot moves front, it stops at max interaction
+        // range so a rejected break can still retry"): break pendings are
+        // TRANSIENT (a pair resolves same-tick server-side, the pending window
+        // is 10 ticks, expiry is reach-gated, vanilla sticky auto-clears beyond
+        // reach) and direction-IGNORED by design - they trail behind/side while
+        // the echo is in flight, so the any-direction rule STAYS. What the guard
+        // adds here is the server-reach UPPER BOUND: beyond sendReach the
+        // expiry-resend already drops the block to the pass gate/sweep and the
+        // vanilla sticky already cleared it, so a pending out there can never be
+        // retried - pinning on it could only crawl (the print-side 12:43 lesson).
+        // The 0.6 margin = one tick of movement, so the bot CREEPS to the edge
+        // instead of overshooting it. The picker's behind-filter exempts
+        // vanilla-queued blocks so the held bot can still work them.
+        double retryEdge = Math.min(mod.interactionRange.get(), 4.4) - 0.6;
+        boolean pendingEdge = false;
+        for (BlockPos pos : breakPending.keySet()) {
+            double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
+            if (dist >= retryEdge && dist < sendReach) { pendingEdge = true; break; }
+        }
+        if (!pendingEdge) {
+            for (BlockPos pos : needsVanillaBreak) {
+                double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
+                if (dist >= retryEdge && dist < sendReach) { pendingEdge = true; break; }
+            }
+        }
+        // VERIFY-THEN-ADVANCE: any standing forward target within server reach holds
+        // the bot (see the method comment). vanillaBusy keeps its any-distance rule
+        // for in-reach vanilla-queued blocks (multi-tick progress needs the bot in
+        // server reach for the whole break).
+        boolean mustDrain = reachBusy || vanillaBusy || pendingEdge;
+        if (!mustDrain) {
+            approachHoldTicks = 0;   // clean ahead / still approaching / sphere verified
             return false;
         }
         approachHoldTicks++;

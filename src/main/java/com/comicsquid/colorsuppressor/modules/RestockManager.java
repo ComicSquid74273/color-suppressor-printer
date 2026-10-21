@@ -58,6 +58,14 @@ final class RestockManager {
     // after queueing); the stack selection re-derives live at every chest-open.
     boolean filteredDumpActive;
     HashMap<Item, Integer> filteredDumpNeed;
+    // SERVER-TRUTH PREP RECHECK (live batch 19, 10:30): the client inventory can
+    // carry phantom stacks (performSwap's no-screen clicks predict client-side;
+    // a lost/reordered sync on the ~300ms link never corrects them - prep
+    // counted ~50 Pink Terracotta the server never had, withdrew nothing, and
+    // the print stocked out into an emergency run). The FIRST chest of every
+    // prep trip opens with the AUTHORITATIVE player inventory in the packet -
+    // recount the deficits from that, once per prep.
+    boolean prepServerRecheckPending;
 
     RestockManager(StepCheckered mod) {
         this.mod = mod;
@@ -75,6 +83,7 @@ final class RestockManager {
         toBeHandledInvPacket = null;
         closeNextInvPacket = false;
         clearFilteredDump();
+        prepServerRecheckPending = false;
     }
 
     void clearFilteredDump() {
@@ -175,16 +184,21 @@ final class RestockManager {
             roomHere.put(item, room - stack.getCount());
         }
         if (depositBacklogSlots.isEmpty()) {
-            // Nothing THIS chest can take: if excess items remain, hop to the next
-            // chest stocking them (the nearly-full station rarely fits every item
-            // at one chest); otherwise the dump leg is done, route continues.
+            // Nothing THIS chest can take: blacklist it (no room for ANY excess
+            // item - the selection already checked each one) so the hop set
+            // strictly shrinks, then if excess items remain hop to the next chest
+            // stocking them. Without the blacklist the chooser ping-ponged between
+            // the same full chests until the generic anti-stuck killed the leg
+            // (live 10:30:12-25: 13 opens, zero deposits, recheck bypassed).
             HashSet<Item> excess = excessItemsBeyondNeed();
+            if (!excess.isEmpty()) fullDepositChests.add(lastInteractedChest);
             Pair<BlockPos, Vec3d> nextFiltered = excess.isEmpty() ? null : getNextFilteredDepositChest(excess);
             if (nextFiltered != null) {
                 queueDepositChestAtHead(nextFiltered);
                 mod.timeoutTicks = mod.postRestockDelay.get();
                 mod.state = State.Walking;
             } else {
+                if (!excess.isEmpty()) mod.warning("§ePrep dump: every stocking chest is full for the remaining excess - carrying it on.");
                 finishFilteredDump();
             }
             return;
@@ -226,6 +240,34 @@ final class RestockManager {
     void refillDeficitsAfterDump() {
         HashMap<Item, Integer> requiredItems = getRequiredItems();
         HashMap<Item, Integer> carried = Utils.getInvInformation(requiredItems, mod.availableSlots).getRight();
+        if (mergeDeficitEntries(requiredItems, carried)) {
+            mod.info("§7Post-dump recheck: whole-stack overshoot left a deficit - refill merged into this trip.");
+        }
+    }
+
+    /** First-chest server-truth recount (ghost-immune prep supply): recounts the
+     *  per-item deficits from the CHEST-OPEN packet's player-inventory section -
+     *  the server's authoritative view, immune to the client-side phantom
+     *  stacks that no-screen SWAP predictions can leave behind. */
+    void recheckDeficitsFromServerPacket(InventoryS2CPacket packet) {
+        HashMap<Item, Integer> requiredItems = getRequiredItems();
+        HashMap<Item, Integer> carried = new HashMap<>();
+        for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
+            ItemStack stack = packet.contents().get(slot);
+            if (stack.isEmpty() || ToolUtils.isTool(stack) || stack.contains(DataComponentTypes.FOOD)) continue;
+            if (!requiredItems.containsKey(stack.getItem())) continue;
+            carried.merge(stack.getItem(), stack.getCount(), Integer::sum);
+        }
+        if (mergeDeficitEntries(requiredItems, carried)) {
+            mod.info("§7Prep recheck at chest-open: the server inventory differs from the client view - refill entries updated.");
+        }
+    }
+
+    /** Shared deficit merge (dump overshoot + server-truth recheck): adds or
+     *  grows restockList entries so the CURRENT deficit is covered, queues a
+     *  refill chest if none is queued. Never wipes pending tool/food entries;
+     *  max-semantics prevents double-counting on unserved entries. */
+    boolean mergeDeficitEntries(HashMap<Item, Integer> requiredItems, HashMap<Item, Integer> carried) {
         boolean added = false;
         for (Map.Entry<Item, Integer> req : requiredItems.entrySet()) {
             int deficit = req.getValue() - carried.getOrDefault(req.getKey(), 0);
@@ -245,13 +287,19 @@ final class RestockManager {
             added = true;
         }
         if (added) {
+            // NEVER queue a refill chest while a refill session is LIVE (state
+            // AwaitRestockResponse): the live session's endRestocking chaining
+            // serves these merged entries itself, and a duplicate checkpoint
+            // outlives the drained list - its chest-open then hits the
+            // empty-list crash path (live 11:27:41, batch 23).
+            if (mod.state == State.AwaitRestockResponse) return true;
             boolean refillQueued = false;
             for (Pair<Vec3d, Pair<String, BlockPos>> cp : mod.checkpoints) {
                 if ("refill".equals(cp.getRight().getLeft())) { refillQueued = true; break; }
             }
             if (!refillQueued) addClosestRestockCheckpoint();
-            mod.info("§7Post-dump recheck: whole-stack overshoot left a deficit - refill merged into this trip.");
         }
+        return added;
     }
 
     Pair<BlockPos, Vec3d> getBestChest(Item item) {
@@ -436,6 +484,12 @@ final class RestockManager {
     }
 
     void endRestocking() {
+        if (restockList.isEmpty()) {   // drained elsewhere (merge/recheck races) - the leg is over
+            checkedChests.clear();
+            mod.timeoutTicks = mod.postRestockDelay.get();
+            mod.state = State.Walking;
+            return;
+        }
         if (restockList.get(0).getMiddle() > 0) {
             checkedChests.add(lastInteractedChest);
             // Stop the re-search cycle once every chest stocking this item has been tried
@@ -481,6 +535,16 @@ final class RestockManager {
     void handleInventoryPacket(InventoryS2CPacket packet) {
         if (mod.debugPrints.get()) mod.info("Handling InvPacket for: " + mod.state);
         closeNextInvPacket = true;
+        // One-shot per prep trip: the FIRST chest opens with the server's
+        // authoritative player inventory in the packet - recount the supply
+        // deficits from it before dump/refill decisions execute on phantom
+        // client-side stacks.
+        if (prepServerRecheckPending
+            && (mod.state == State.AwaitDepositResponse || mod.state == State.AwaitRestockResponse
+                || mod.state == State.AwaitFoodChestResponse)) {
+            prepServerRecheckPending = false;
+            recheckDeficitsFromServerPacket(packet);
+        }
         switch (mod.state) {
             case AwaitRestockResponse:
                 handleRestockResponse(packet);
@@ -565,6 +629,24 @@ final class RestockManager {
 
     void handleRestockResponse(InventoryS2CPacket packet) {
         interactTimeout = 0;
+        // EMPTY-LIST GUARD (live crash 11:07 + 11:27, batches 21/23): a refill
+        // chest-open can arrive with the restock list already drained - the (ac)
+        // recheck's merge once queued a DUPLICATE refill checkpoint while a
+        // session was live; the withdrawal chain emptied the list, the stale
+        // checkpoint still fired, and this method's restockList.get(0) threw
+        // IndexOutOfBounds and killed the client. An empty list means the leg
+        // is over: finish it instead of indexing.
+        if (restockList.isEmpty()) {
+            if (mc.player.currentScreenHandler != null && mc.player.currentScreenHandler.slots.size() > 46
+                && mc.currentScreen != null) {
+                mc.player.closeHandledScreen();
+            }
+            checkedChests.clear();
+            mod.timeoutTicks = mod.postRestockDelay.get();
+            mod.state = State.Walking;
+            mod.info("§7Restock leg already complete at chest-open - continuing the route.");
+            return;
+        }
         // TOOL RETURN (user rule 2026-10-20): used pickaxes go back to their OWN
         // chest ONLY at this restock-phase visit, one deposit per sync - never
         // mid-batch, never into a material chest. A pending take is a SWAP: the

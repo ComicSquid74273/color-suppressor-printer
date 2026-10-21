@@ -106,6 +106,31 @@ public class StepCheckered extends Module {
         .build()
     );
 
+    // RETRY TICK BUDGETS (user rule 2026-10-21: "make retry configurable tick base,
+    // for both printing and breaking" - live 13:24 proof the old 3-attempt cap burned
+    // a cell on three marginal sends within 1.5s of sprinting past: one walking
+    // far-edge send, one mid-pass, one at the 4.4 server-reach margin - the cell was
+    // released before the bot ever STOPPED and re-sent from a converged position).
+    // Ticks, not counts: the echo-window cooldown already spaces re-sends 10 ticks
+    // apart, so the budget = how many spaced retries the in-pass loop may spend.
+    final Setting<Integer> printRetryTicks = sgGeneral.add(new IntSetting.Builder()
+        .name("print-retry-ticks")
+        .description("How long (ticks) an unconfirmed print placement keeps being retried in-pass before the repair pass owns it. 20 ticks = 1s.")
+        .defaultValue(60)
+        .min(0)
+        .sliderRange(0, 600)
+        .build()
+    );
+
+    final Setting<Integer> breakRetryTicks = sgGeneral.add(new IntSetting.Builder()
+        .name("break-retry-ticks")
+        .description("How long (ticks) an unconfirmed break keeps its fastBreak re-send eligibility after expiry before falling to vanilla/sweep. 20 ticks = 1s.")
+        .defaultValue(60)
+        .min(0)
+        .sliderRange(0, 600)
+        .build()
+    );
+
     final Setting<List<Block>> startBlocks = sgGeneral.add(new BlockListSetting.Builder()
         .name("start-blocks")
         .description("Which block to interact with to start the printing process.")

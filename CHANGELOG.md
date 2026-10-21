@@ -92,6 +92,467 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-10-21 (ao) — RETRY WENT TICK-BASED + CONFIGURABLE both sides (user: "IS IT BECAUSE BLOCK IS OUT OF REACH?? CAUSE 3 TIMES SAME BLOCK CANT BE REJECTED. ALSO, MAKE RETRY CONFIGURABLE TICK BASE, WHICH USER CAN MODIFY, FOR BOTH PRINTING AND BREAKING")
+**User's out-of-reach suspicion CONFIRMED by per-send forensics** (batch 31's
+8 walked-past cells, from [dbg] PLACE dz values): every capped cell burned its
+3 attempts within ~1.5 s of the bot sprinting past — send 1 at dz +2.2..+2.7
+AHEAD (walking far-edge, echo-race zone), send 2 at dz −1.7..−1.9 one second
+later, send 3 at dz −4.0..−4.4 = eye distance ≈ 4.2–4.6, the marginal
+server-reach band where Folia's lagged view of a still-moving bot silently
+rejects. The old attempts≥3 cap released the cell before the bot ever STOPPED
+and re-sent from a converged position — the repair pass then placed those same
+cells from dz −3.4..−3.6 first try, proving a fair stopped retry lands.
+**Fix — tick budgets replace attempt counts, user-editable in the GUI:**
+- `print-retry-ticks` (default 60, slider 0-600): a plan cell's retry window
+  opens at its FIRST pick (`placementRetryStart`, set in the place loop) and
+  the guard (on-cooldown clause, trailing clause, and the forward-gap scan —
+  all three former attempts≥3 sites) now skips a cell only once the budget is
+  spent → repair owns it. Re-sends space 10 ticks apart, so 60 ticks ≈ 6
+  stopped, cooldown-spaced retries.
+- `break-retry-ticks` (default 60, slider 0-600): a break's fastBreak re-send
+  eligibility window opens at its FIRST pending expiry (`breakRetryStart`);
+  past the budget the clean re-send is skipped and the block falls to vanilla
+  (in reach) or the sweep — never a skip, just the end of the fast-retry
+  budget. Vanilla progress itself is never deadline-killed (wood legitimately
+  grinds ~60 ticks/block).
+- Both maps cleared at every placementAttempts reset site (beginBatch,
+  beginPriming, batch-0 split, resetForActivation). attempts counter kept as
+  a diagnostic only. New settings/fields = STRUCTURAL → restart-deploy
+  required (hotswap cannot carry this one). Build green 13:41. NOT
+  deployed/committed.
+
+### 2026-10-21 (an) — 12:43 PRINT-LEG PIN: retry-range guard was unbounded — print and break cases now deliberately DIFFERENT (user: "CHECK WHY BOT IS NOT PRINTING OR BREAKING... CURRENTLY ITS STUCK, EVEN THOUGH NEXT PRINTING IS YET TO COME"; then "different case for printing and different for breaking")
+**The (ak) guard's print clause pinned every print leg from tick 1.** Live
+evidence (slave latest.log, batch-30 resume, first deployment carrying (ak)):
+three CONTINUOUS 101-tick holds (12:43:22/27/32 — the counter resets on any
+free tick, so the condition was true every tick), bot advanced 1.4 blocks in
+20s, and ZERO `[dbg] PLACE`/`[RATE]` lines the whole session — the place loop
+picked nothing (resume batch: north rows already placed, nearest air cells
+out of range) while the guard still pinned. Root cause:
+`printFrontierWithinGap`'s trailing loop was `dist >= interactionRange−0.6`
+with NO upper bound and NO direction test — far AHEAD unplaced cells exist
+along the whole 128-row lane, so the guard held permanently; the watchdog
+admitted ~1 walking tick per 101. Also found in the same audit: the on-
+cooldown loop's air-check was INVERTED (`isAir → skip // placed` — it ignored
+real unconfirmed sends and briefly pinned placed cells instead), and the
+picker's STANDING send clamp was full `interactionRange` (5.0) while the
+server silently rejects beyond ~4.4 (the break side's proven law) — 4.4-5.0
+sends only burned attempts.
+**Fix — PRINT case** (a placement has no transient server-side fate: an
+unlanded cell just stays air, its retry is a FRESH send needing the cell in
+send range): the guard now pins only on cells a stopped bot can still SEND —
+the `[retryEdge, sendEdge)` shell with `sendEdge = min(interactionRange, 4.4)`
+— and only cells being WALKED PAST (behind/abeam by travel dir; ahead cells
+belong to the 2.0 pacing gap, never pin). On-cooldown polarity corrected.
+Picker standing clamp → `min(interactionRange, 4.4)`; the forward-gap
+`reachBusy` (at-goal pass-end semantics) bounded to the same shell — a
+4.4-5.0 cell can never be sent, so it must not gate the at-goal hold either.
+**Fix — BREAK case** (deliberately different: pendings are TRANSIENT — pairs
+resolve same-tick server-side, 10-tick window, reach-gated expiry, vanilla
+sticky auto-clears beyond reach — and direction-IGNORED by design since they
+trail behind/side): `breakApproachHold`'s pendingEdge loops KEEP the any-
+direction rule but gain the `dist < sendReach` upper bound — beyond server
+reach the expiry-resend already drops the block to the pass gate/sweep, so
+pinning there could never retry anything, only crawl.
+Mirror invariant honored per side: print hold considers exactly what the
+print picker can send; break hold considers exactly what the break resend/
+vanilla paths can still work. Body-only changes (hotswap-compatible). Build
+green 13:14. NOT deployed/committed.
+
+### 2026-10-21 (am) — STUCK-ON-WATCHDOG FIXED: (al)'s margin mismatch (live: 101-tick hold loops, place 1/s, bot crawling; user: "STILL SAME WATCHDOG ISSUE, BOT IS STUCK")
+**(al) introduced the pin it meant to kill.** The picker's self-collision check
+was widened to `Box(pos).expand(0.3)` (walk-clear territory), but the two HOLD
+scans — `printFrontierWithinGap`'s frontier loop and the (ak) retry-range
+guard's trailing loop — kept the UNEXPANDED box. Any block in that 0.3 shell
+around the bot's body (typically the walking-lane floor cell the bot
+straddles at x = 2k+2.5) was then REFUSED by the picker (unsendable) yet
+COUNTED by the hold (nearest ≤2.0, never air, attempts never increment
+because no send ever fires) → hold 100 ticks → watchdog releases one step →
+still overlapped → hold again. The bot crawled one watchdog-step per ~5s
+([RATE] place 1/s: only the far y101 tops sent; the 1/s rate itself was a
+symptom — the picker had almost nothing eligible while pinned).
+**Fix:** both hold scans use `new Box(pos).expand(0.3)` — eligibility is now
+IDENTICAL between picker and holds: whatever the picker refuses can never
+gate movement. The straddled floor cell is walk-clear territory: it places
+from the next row via the en-route picker (any-direction, no attempts
+filter), repair verifies at pass end — no skip, no pin.
+Build green. NOT deployed/committed.
+
+### 2026-10-21 (al) — PLACE HAMMER-LOOP killed (live screenshot: same floor block re-SENT ~15x, bot parked)
+**Symptom (live):** `[dbg] PLACE Red Terracotta x=-409 y=99 z=-299 (dz=+0.2..0.8
+AHEAD)` repeating every cooldown cycle while the bot stood still. **Mechanism:**
+feet-level blocks marginally clear of the CLIENT's bounding box (dz ~0.2-0.8
+ahead, floor y99 — y-overlap is permanent) pass the picker's self-collision
+check, but the server's `canPlace` rejects solid blocks clipping an ENTITY
+using ITS view of the bot's box (lags/rounds differently) → placement
+rejected → still air → 4-tick cooldown expiry → re-pick → re-send. The
+(aj)/(ak) holds kept the bot parked for the whole loop (un-sent carried block
+in reach), so it hammered until the 10-attempt cap (~2.5s), then repair placed
+it once the bot moved off ("Batch 0 repair complete" in the same log).
+**Fixes (BreakPlaceEngine):**
+- Picker self-collision margin: `new Box(pos)` → `new Box(pos).expand(0.3)` —
+  anything within one movement tick of the body is walk-clear territory
+  (places en route once moved off; repair as the net), never sent while pinned.
+- Hold-release threshold 10 → 3 failed sends (both `printFrontierWithinGap`
+  gates incl. the (ak) retry-range guard): 3 rejections while standing means
+  geometry only movement can fix — release 3.5x sooner. The en-route picker
+  still offers the block (no attempts filter there); repair verifies at pass
+  end. No-skip invariant unchanged.
+Build green. NOT deployed/committed.
+
+### 2026-10-21 (ak) — RETRY-RANGE GUARD both sides (user: "never walk past a block until server confirm... stop at max interaction range so a rejected print/break can still retry — never skip")
+The (ai)/(aj) sent-gating freed movement the moment a send left — but a
+REJECTED send then expired behind the bot, out of the retry gates' reach
+(break resend needs ≤4.4, the place re-pick ≤ interaction range): the exact
+skip vector left. New guard in BOTH holds: the bot may creep forward, but no
+outstanding block may leave its retry range —
+- **breakApproachHold:** any breakPending (pair/split awaiting echo) or
+  vanilla-queued block whose eye distance reaches `min(range, 4.4) − 0.6`
+  (0.6 = one tick of movement — creep to the edge, never past it) holds the
+  bot until confirmed. Bounded: pendings live 10 ticks, watchdog is the net.
+- **getNextBatchBreakPos:** the forward-only behind-filter now EXEMPTS
+  vanilla-queued blocks — the retry-range guard holds the bot inside their
+  4.4 progress range, so the ONE sticky target must stay pickable to be
+  worked (the forward rule exists to stop ping-pong WALKING, not retries).
+- **printFrontierWithinGap:** the same guard for placements — on-cooldown
+  (sent, echo in flight) and trailing unplaced CARRIED blocks hold the bot
+  at `interactionRange − 0.6`. Capped (10 attempts → repair) and
+  body-overlapped blocks never pin; cooldowns live 4 ticks — bounded hold.
+Net behavior: walk freely → creep to the range edge while a confirm is in
+flight → stop there → confirm lands (normal: 1-3 ticks) → walk on; a REJECT
+stays in range and the resend/re-pick/vanilla machinery retries it in place.
+Never-skip invariant complete: un-sent-in-reach hold + sent-in-retry-range
+hold + en-route picker + sweeps/repair as the final nets. Build green.
+NOT deployed/committed.
+
+### 2026-10-21 (aj) — PRINT HOLD SENT-GATED TOO (user: "same fix for placing too, make sure it support block per tick, also make sure it dont misses blocks")
+The (w) print hold was the confirmed-PLACED gate — the same slowness shape as
+(ah): it held through placement-cooldown cycles (echo waiting) and pinned on
+blocks the picker refuses. Now the exact (ai) mirror in `printFrontierWithinGap`:
+- **Sent ≠ busy:** a position on placement cooldown (send already left; the
+  server air-place needs no presence, like a break pair) never gates movement.
+  Failed sends resurface after their 4-tick cooldown and re-gate if still
+  ahead; anything that trails anyway places en route (any-direction picker) or
+  in the repair pass.
+- **Picker-eligibility mirror:** body-overlapped positions (the picker's
+  bounding-box refusal — the source of the live 101-tick watchdog pins) and
+  off-lane moments (the picker's lane gate — the route re-centers) no longer
+  pin the bot. Attempts-capped (10) and not-carried skips unchanged.
+- **blocks-per-tick support (verified, no change needed):** the place loop
+  sends up to `blocksPerTick` DISTINCT positions per tick
+  (SlaveEngine.java:324, `placed < blocksPerTick`); the picker pre-filters
+  cooldown/bbox/range so every candidate either places or breaks the loop for
+  swap/supply — the setting is the drain rate per stop, never the miss count.
+- Release = everything forward in reach is placed / sent / capped / refused /
+  not-carried; at-goal (dir=0) the 2.0 approach gate still drops for the
+  pass-end full drain. No-miss net: un-sent-in-reach hold + en-route
+  any-direction picker + repair passes (planDefects).
+Build green. NOT deployed/committed.
+
+### 2026-10-21 (ai) — (ah) TIGHTENED: sent-gated hold — no echo waiting, no full-sphere drain (user: "it became too slow... even 5 break per tick")
+**Why (ah) was slow:** its hold released only on CONFIRMED AIR — every sphere
+cost the block-update echo wait (1-3 ticks) plus the full sphere drain before
+each step, and in concrete spheres the drain itself is split-capped at 1/tick.
+**Fix:** the hold is now gated by UN-SENT standing targets within the walking
+send clamp (3.5, mirrors `sendDistinctBreaks`) — `breakPending.containsKey`
+positions (pairs already broken server-side same-tick; splits whose STOP
+flushes next tick, still well inside the server's ~5.5 reach at walk pace) no
+longer gate movement at all. The no-skip invariant becomes "nothing inside
+send range goes un-sent": any un-sent target within 3.5 stops movement that
+tick, sends fire the same tick, next tick it's pending → walk resumes. No echo
+waiting, no drain-before-step. The (af) launch clearance is pending-aware the
+same way. vanillaBusy unchanged (the one presence-needing class: multi-tick
+vanilla breaks need the bot in server reach until air). Watchdog 150 kept.
+**Expected:** near-continuous walking on terracotta/powder/mixed spheres
+(sends outpace approach); brief batched stops on dense concrete (the 20/s
+split-law ceiling — setting-independent). Breaks-per-tick = drain rate, never
+skip count. Build green. NOT deployed/committed.
+
+### 2026-10-21 (ah) — BREAK VERIFY-THEN-ADVANCE + pick-budget floor (user: "we don't want skips... if i reduce breakpertick, bot should take stops more frequent right??")
+**Answer to the question: NO, it didn't.** The old approach hold was
+distance-triggered — `atCluster = nearestH <= 1.3 && reachBusy` — completely
+blind to breaks-per-tick. Targets at 1.4-4.4 were cleared only by on-the-fly
+walking sends, so a lower setting didn't buy more stops; it bought walk-past
+misses (the setting-3 first-pass skips): the smaller budget drained the reach
+sphere slower than the bot walked, blocks fell behind the forward 1-row grace,
+and the pass-end sweep/gate owned them.
+**Fix 1 — verify-then-advance (`breakApproachHold`):** the hold now engages on
+ANY still-standing FORWARD target within the 4.4 server-reach clamp
+(`mustDrain = reachBusy || vanillaBusy`), releasing only when all are confirmed
+air. breaks-per-tick now sets the DRAIN RATE PER STOP (more/longer stops at low
+settings) and never the skip count — the user's mental model, made true. Sends
+still fire while approaching (the hold only gates movement); pending positions
+whose echo is in flight still read standing client-side and linger a tick or
+two per stop (bounded by the 150-tick watchdog). The (af) break(2) launch
+clearance is preserved (it covers the southmost row that sits behind the
+travel direction and is excluded from the forward scan — restored immediately
+after an accidental removal in this same edit).
+**Fix 2 — pick-budget floor (`sendDistinctBreaks`):** the candidate-search loop
+was `pick < maxSends * 6` — 18 tries at setting 3 vs 24 at 4 — and every
+examined-but-not-sent pick (walking-clamp rejects, vanilla-sticky skips,
+split-busy/vanilla routing, tool-missing) burns a try without counting toward
+the send cap. Dense clusters could exhaust 18 tries before finding the
+sendables. Now floored: `pick < Math.max(24, maxSends * 6)` — search headroom
+constant at any setting.
+**Note:** pure below-cliff spheres (concrete/wood) drain at 1 split/tick (20/s,
+the vanilla single-session law) regardless of the setting — stops there last
+proportionally longer at ANY setting; watch [RATE]. Method-body changes only;
+rides the structural jar. Build green. NOT deployed/committed.
+
+### 2026-10-21 (ag) — REFILL CRASH: empty restockList at chest-open (live 11:07:57 + 11:27:42, batches 21/23) + the tool-exchange question
+**Crash:** `IndexOutOfBoundsException: Index 0 out of bounds for length 0` at
+`RestockManager.handleRestockResponse:702` (`restockList.get(0)` in the
+withdrawal loop). Mechanism: the (ac) server-truth recheck fired DURING an
+active refill chest session (11:27:37) and `mergeDeficitEntries` queued a
+DUPLICATE refill checkpoint via `addClosestRestockCheckpoint`; the withdrawal
+chain then drained the list (endRestocking removes entries as served), the
+stale checkpoint still fired, its chest-open hit `handleRestockResponse` with
+an empty list → crash. Two crashes, same signature, one run.
+
+- **Source fix** (`mergeDeficitEntries`): never queue a refill chest while a
+  refill session is LIVE (state AwaitRestockResponse) — the live session's
+  endRestocking chaining serves the merged entries itself.
+- **Belt guards**: `handleRestockResponse` and `endRestocking` now finish the
+  leg cleanly (close screen, timeout, Walking) when the list is already empty
+  instead of indexing into it.
+
+**Tool exchange (user: "AXE AND PICKAXE MIN-DURABILITY didn't trigger... or
+did it run in emergency run??"):** log shows ZERO exchange lines across
+batches 21-23 — at every prep scan the best pickaxe AND axe were still ABOVE
+the min-durability threshold (the rule is strictly-below). No tool broke
+("Pickaxe moved to slot 8" at 11:26:01 re-staged a living pickaxe) and NO tool
+emergency ran — the 11:25:35 interruption was a MATERIALS refill during
+break-all. The setting's DEFAULT is 20 (≈ "exchange only when nearly dead");
+its own description recommends ~800+ to guarantee no mid-batch breakage. If
+exchanges should fire at visible wear, raise min-durability on the slave's
+module screen — no code change needed.
+
+### 2026-10-21 (af) — BREAK(2) LAUNCH CLEARANCE: why the south-most west-top always survived the pass (user: "it missed always... misses or never breaks south most block")
+Geometry of the miss (proven against batch 19's leftover -410,101,-193): at
+break(2) arm the bot stands ~1.7 rows south of the southernmost west-top row and
+immediately sprints north. That row is the pass's ONLY target the bot moves
+AWAY from, and four mechanisms conspire against exactly it:
+
+- Its split session (terracotta delta ~0.24 → STOP at +2 ticks) plus the
+  Folia confirmation echo routinely outlast the ~2 rows of travel before the
+  row falls behind the picker's 1-row grace (`(posZ-botZ)*dir < -1` — never
+  re-offered; the approach-hold's scan uses the same filter).
+- The expiry resend is gated on ≤4.4 eye-reach — at the +10-tick expiry the
+  sprinting bot is 6-10 blocks past it → "behind the bot -> drop it".
+- The approach-hold's cluster threshold is 1.3 HORIZONTAL, but the bot walks
+  lane 2's center: west LANE-0 blocks sit dx=2.0 away and can NEVER satisfy it
+  (the leftover was lane 0). Lane 1 (dx=1.0) gets only a ~2-4-tick crossing
+  window at sprint.
+- Batch 19's moment had a client render stall too (Meteor "Resizing Mesh UBO"
+  spam at 11:02:16) stretching the start window further.
+
+`sendDistinctBreaks`' split-session wire exclusivity was checked and is sound —
+this is not a concurrent-abort.
+
+- **Fix — launch clearance in `breakApproachHold`**: while the pass is in its
+  first rows (botZ ≥ cornerZ+125, travelling north) and ANY break(2) target is
+  within server reach and still standing, movement is suppressed — the bot
+  stands at the south end (where it already waited ~20 s for the master) and
+  keeps sending until the start zone is CONFIRMED air, then launches. The
+  existing 150-tick watchdog releases a never-confirming block (never stuck);
+  (ad)'s now-working verify retry remains the safety net. Body-only edit →
+  hotswap-compatible. Build green, jar 11:16. UNTESTED live.
+
+### 2026-10-21 (ae) — EMERGENCY-TRIP ECHO-GRACE: the 1-block phantom stockout (user: "why it still emergency restock... why not in first supply"; live 11:04:41, batch 20)
+First supply WORKED this run — batch 19: zero emergencies (queue-time 0 entries
++ multi-chest dump with (z) keep-gate + (y) post-dump recheck merged the
+overshoot); batch 20: 11 queue-time entries + the (ac) server-truth recheck
+FIRED ("Prep recheck at chest-open: the server inventory differs from the
+client view - refill entries updated") + a 12-chest withdrawal chain incl. a
+Granite shortage resolved by chest-chaining. The one remaining emergency was
+NOT a planning miss: **Brown Concrete (1)** tripped at 11:04:41 on an echo
+race — three sends hit the same position (-407,99,-225): 11:04:40 (succeeded
+server-side, consumed the last BC), 11:04:41 (echo still in flight, position
+read air → "material missing" → full north-corridor trip), 11:05:12 after
+restocking (bounced off the block that stood all along — the withdrawn BC
+turned into surplus for the next prep's dump).
+
+- **Fix** (BreakPlaceEngine material-missing branch): before tripping
+  `pauseForRestockTrip`, arm a 40-tick (2s) grace via `restockCooldown` — the
+  bot keeps placing other materials while the confirmation echo lands; a
+  PHANTOM demand never re-demands (position reads solid once the echo arrives),
+  a REAL stockout trips 40 ticks later (2s cost). `restockCooldown` already
+  decrements every tick and gates re-triggers, so the grace rides existing
+  machinery.
+- Body-only edit → hotswap-compatible. Build green, jar 11:10. UNTESTED live.
+
+### 2026-10-21 (ad) — BREAK(2) LEFTOVER RETRY NEVER RAN: tail-append behind awaitBreakAll (user: "BREAKING IN BREAK(2), MISSED SOUTH SIDE BLOCK"; live 11:02:34, batch 19)
+Evidence: 11:02:34 "break(2) leftover (1) - fixed-direction retry pass (S->N)"
+followed ONE TICK LATER by "checkpoint → awaitBreakAll → Reached" (the bot was
+already standing at the north end) and "break(2) complete. Waiting for master's
+break-all permission" — zero break activity, zero southward movement. The
+retry's sprint-south + break2Done-north legs were TAIL-appended to a queue whose
+head still held awaitBreakAll (queued by beginBatch after break2Done): the bot
+"reached" it instantly, the awaitBreakAll arrival declared the phase complete
+without re-verifying, and when break-all permission later arrived
+`startBreakAll`'s `checkpoints.clear()` wiped the retry legs unexecuted. The
+leftover west-top stood through the master's W2 suppression walk — the map
+RECORDED it (south-side pixel damage); break-all removed the block only after
+the damage was done.
+
+- **Fix** (`verifyBreak2`): head-insertion — `addFirst(break2Done)` then
+  `addFirst(sprint)`, giving [sprint-south, break2Done-north, awaitBreakAll].
+  The retry now actually runs (Mining state breaks the leftover on the way
+  south or on the return north) and awaitBreakAll is only reached after a
+  re-verified break2Done. Belt: the ≥2-retries error branch now clears the
+  queue so a stopped batch cannot slide into awaitBreakAll behind it.
+- Audited the family: every other tail-append (`checkpoints.add(new Pair…)`)
+  is a fresh-route builder running after `clear()` (beginBatch/priming/closing/
+  RESET ladder/master routes); all other verify-style re-arms (printDone repair,
+  breakAllDone gate, sweep re-arm, collectRun) already head-insert. This was
+  the only mid-queue tail-append.
+- Body-only edit → hotswap-compatible (jar must already carry the class
+  baseline). Build green. UNTESTED live — pending user go-ahead.
+
+### 2026-10-21 (ac) — PREP SUPPLY vs PHANTOM CLIENT STACKS + dump-hop chest blacklist (user: "bot still missing blocks while restocking... cant keep track of blocks in chest, doesnt check all chests"; live 10:23-10:31, batches 17-19)
+Forensics (batch 19, deployed jar a81b96c3 = (y)+(z)): queue-time restock had
+ONLY Warped Hyphae(2)+Deepslate(1) (both served at 10:30:26/:28), yet the print
+stocked out of Gray Concrete(1) @10:30:40, Pink Terracotta(50), Green
+Terracotta(5) @10:31:11. Arithmetic: PT had 41 distinct positions placed when it
+ran dry with 50 unplaced → real carried_prep(PT) ≈ need−50, but the excess
+listing claimed carried > need → **the client inventory view counted ~50 PT the
+server never had**. Mechanism: `Utils.performSwap` clicks with NO screen open
+(Meteor's no-screen trick) — client-side prediction that a lost/reordered sync
+on the ~300ms link never corrects. The restock list is computed from that view
+→ under-withdraws → mid-print emergency runs. (The 4.4 sends/position churn is
+(bb)'s echo-parity, separate.)
+
+- **Server-truth prep recheck** (`recheckDeficitsFromServerPacket` + shared
+  `mergeDeficitEntries`, one-shot `prepServerRecheckPending` armed in
+  `queueStepBuildPreparation`): the FIRST chest of every prep trip (dump,
+  refill, or food) opens with the AUTHORITATIVE player inventory in the packet
+  — deficits are recounted from it and merged (max-semantics, tool/food entries
+  never wiped, refill chest queued if none). Immune to phantom stacks
+  regardless of their origin.
+- **Dump-hop chest blacklist**: with every station chest full, the room-aware
+  selection came up empty and `getNextFilteredDepositChest` (excluding only the
+  ONE last-interacted chest) ping-ponged the same chests — 13 opens, zero
+  deposits, until the generic anti-stuck killed the leg and BYPASSED the (y)
+  finish-recheck (live 10:30:12-25). An empty selection now blacklists the
+  chest (`fullDepositChests`), so the hop set strictly shrinks; hop exhaustion
+  warns and finishes cleanly through `finishFilteredDump`.
+- STRUCTURAL (new field) → RESTART-deploy. UNTESTED live.
+
+### 2026-10-21 (ab) — COLLECTION PASS SPEED: monotonic S→N targeting + transit speed + no per-drop homing (user: "optimize the move of pickup to shortest path S->N way while sweep, its so slow")
+Three compounding causes, all fixed — the print/break engines untouched
+(parallel to (bb), which owns the print pass):
+
+- **Walking speed (4.3 m/s) during collection:** `updateTransitSpeed` counted
+  `breakStage != 0` as "breaking" — and breakStage stays 4 from break-all
+  through the whole collect run/exit walk, so the Speed module never engaged.
+  Collection legs are pure transit (no break packets in flight to outrun):
+  `collectRun`/`batchExit`/`recoverStart` walking heads now count as transit
+  and get the standard 7.19 transit pace. `sweepTick` is deliberately NOT
+  included — it interleaves straggler block breaks and break passes never
+  speed-hack.
+- **Nearest-first zigzag:** `nearestCollectTarget` re-targeted the single
+  NEAREST drop each arrival, weaving east-west and backtracking south. Rewritten
+  as a monotonic S→N sweep: among drops not more than 1 block behind, always
+  take the SOUTHERNMOST (the next one the northward pass meets); within a
+  same-row ±0.5 z band take the nearest x to minimize side-steps. Drops that
+  end up behind (touch-missed or blacklisted) fall out of the filter and the
+  end-of-run gate + sweep re-verify collect them — the pass never reverses.
+- **Per-drop homing:** collection checkpoints arrived at the 0.2
+  checkpoint-buffer — the bot decelerated onto every one of the ~75 drops even
+  though the pickup box touches at ~1.4 horizontal. `collectRun`/`sweepTick`
+  arrivals now use max(buffer, 1.1): the bot sweeps past at full speed and the
+  drop is collected in passing (sweep-block targets stay precise — the Mining
+  approach gate is 4.5 >> 1.1). `snapToCheckpoints` no longer snaps from
+  beyond 0.5 (a 1.1-block snap would be a position jerk).
+Expected effect: the ~75-drop collection pass goes from a nearest-first zigzag
+at 4.3 m/s with ~75 decelerations to a monotonic sweep at transit pace with
+none. Build green (jar 10:34, merged with (bb)). NOT deployed/committed.
+
+### 2026-10-21 (bb) — PLACEMENT ECHO-PARITY: first print pass clean (user: "still bot misses, and moves forward with confirmation"; batch-18 send histogram)
+**Forensics (batch 18, [dbg] PLACE, jar a81b96c3):** 619 distinct positions sent,
+1138 sends — **only 297 (48%) stuck on the first send**; 154 needed 2, 145
+needed 3, 17 needed 4, 6 hit 5 and stopped (never exceeded 5 → abandoned to the
+repair pass). Pass-end world-verify reported 9 missing (b17) / 1 missing (b18),
+then the lane -1 + printDone2 repair fixed them — the confirmation gate works,
+but the FIRST pass was racing the server's block-update echo: 52% of burst
+placements re-sent at the 4-tick cooldown INTO the still-in-flight echo, and
+far-edge sends made while walking landed their retries behind the advancing bot.
+**Fixes (break-side recipes mirrored):** (1) placement cooldown 4 → **10 ticks**
+(the break side's proven echo window — retries now land after the echo had time
+to arrive; the multi-place loop always has other distinct positions to fill the
+tick); (2) **walking send clamp 3.5** in `getNextBatchPlacementPos`
+(`forwardKey.isPressed() ? 3.5 : interactionRange`) — walking placements stay in
+the ahead-of-bot zone where retries are feasible; the HELD stationary burst
+keeps the full range; (3) hold-scan attempts runway 5 → **10** (a stubborn block
+gets a full watchdog's worth of echo-safe retries before the repair pass owns
+it). Body-only edits → hotswap-compatible. Build green, jar 10:33. NOT
+deployed/committed. **Verify bar:** next batch's pass-end line reads
+"printed: N blocks placed (world-verified)" with NO repair walk and no
+"print has X missing" line.
+
+### 2026-10-21 (aa) — NEVER-SKIP DROPS + AUTO-RECOVERY: sub-floor recovery dig replaces the spin and the force-complete skip (user: "we dont ever want to skip any droped blocks" + "bot will never break outside its map bounding area" + "i dont want any stuck, DROP-RECOVERY STUCK, i want auto recovery/continue")
+**Incident (slave log 08:53-08:55, batch 17, deployed 08:42 jar):** break-all
+clean (blocks=0), 75 ready drops collected, but 4 drops rested BELOW the pickup
+band (under the floor at the NW gate, within 0.2 blocks horizontally of the
+bot). The collection run burned 44 s on them (10 tries each, `collectSkips`
+blacklist), then the sweep looped `sweepTick` ~13×/s for 2+ minutes: the
+arrival check is HORIZONTAL-ONLY (`goal.add(0, player.y - goal.y, 0)` vs
+checkpoint-buffer 0.2), so the bot "arrived" at the drop every tick while
+standing a floor above it; vanilla pickup (player box grown 1.0/0.5) can never
+touch a drop ≥1 below the feet. The FROZEN ladder (retry 0/8→3/8 observed)
+would have force-completed at 8/8 — silently abandoning the 4 drops. User
+closed the clients at 08:55:11 (server log: clean "Disconnected"); the drops
+despawned ~08:58 (5-min item timer).
+
+**User rules adopted:** (1) NO drop is ever skipped; (2) the bot NEVER breaks
+outside the map bounding area (print-box x/z footprint); (3) NO stuck state —
+every failure auto-recovers and the run auto-continues.
+
+- **Classification** (WorldScanner): a drop is *sub-floor* iff its box cannot
+  intersect the pickup box from the surface band (`drop.y < cornerY − 0.625`).
+  `nearestCollectTarget` and the sweep's item targeting now consider surface
+  drops ONLY — a sub-floor drop is never queued as a walk target, killing the
+  spin and the collect-run hammering at the source. Normal batches (drops rest
+  ON the floor) take the exact same code path as before — zero hot-path cost.
+- **Recovery dig** (SlaveEngine, `recoveryTick`: DIG → ENTER → COLLECT → EXIT →
+  RESTORE): walk onto the drop's column → `sendHybridBreak` the floor block
+  above it (obsidian-class floors take the vanilla path, ~9 s worst case) →
+  walk/fall into the pit (ENTER covers both the dug hole and a pre-existing
+  air-floor escape hole) → touch pickup (the bot lands on the drop's own
+  ground; lateral offset steps toward it) → climb out on a buried step block
+  placed at jump apex (1-deep pits: plain jump toward the solid-floor
+  neighbour; the step prefers the recovered stack, then ANY carried block —
+  mid-collect the bot carries dozens) → air-place the dug floor block back
+  (exact-material restore; an open escape hole is sealed with the recovered
+  block; if truly no block is carried the hole stays open — later drops
+  falling in auto-recover through the air-floor path) → re-verify via the
+  normal finishBatch census. Recovery drives itself from onTick (before the
+  walking/work dispatch) so the print/break engines are untouched.
+- **Bounding-area rule, structural:** every recovery break/place is inside the
+  print-box footprint by construction (the arm validates the drop's column;
+  the escalation validates the encased cell). A sub-floor drop OUTSIDE the
+  footprint is never dug — it is named as an out-of-scope remainder and the
+  run continues.
+- **No stuck state anywhere:** bounded auto-retries — 3 full attempts per drop
+  (60 s watchdog each; a bot already inside the pit is never abandoned
+  mid-climb: the watchdog forces EXIT and keeps placing), 16 recoveries per
+  batch, then the drop is declared out of scope (named in the log) and the
+  batch continues. The frozen-sweep terminal (old force-complete skip) became
+  an escalation: encased surface drops get their containing block dug out
+  (`containerDig`); with nothing legally diggable the batch completes with a
+  NAMED remainder. `parkStuck`/`step:stuck`/the parked idle do not exist.
+- **Diagnostics:** the first recovery at a column logs the column's block
+  states (floor / below / below²) — the evidence that names the escape hole to
+  patch. Placement mechanics deduped: `sendAirPlace` extracted from
+  `tryPlacingBlock` and shared with the new `placeCarriedItem` (hotbar-first,
+  main-inv swap, 4-tick cooldown). `Utils.setJumpPressed` added (same pattern
+  as forward/sneak). `step:abort` clears a mid-recovery dig.
+- World-safety note: recovery digs BELOW print-box y0 (the floor block) but
+  strictly inside the box footprint, with exact-state restore and the buried
+  step logged — the sanctioned exception to "never break below y0". RESET-path
+  sub-floor drops are NOT yet recovered (known gap; the RESET ladder's own
+  sweep is unchanged). Build green, NOT deployed/committed.
+
 ### 2026-10-21 (z) — DUMP OVERSHOOT FIXED AT THE SOURCE + pace-hold print-leg scope (user: "no still misses so many block in first run"; log forensics batch 17)
 **blocks-per-tick verified OBEYED:** [RATE] place peaked exactly 80/s = 4/tick ×
 20 — the config cap, saturated. The misses were not placement-rate misses.
