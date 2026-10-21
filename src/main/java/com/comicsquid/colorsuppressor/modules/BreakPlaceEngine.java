@@ -85,47 +85,62 @@ final class BreakPlaceEngine {
 
     boolean adaptivePaceHold() {
         if (mod.state.equals(State.Walking) && mod.breakStage == 0 && mod.currentBuildPlan != null
-            && !mod.checkpoints.isEmpty()
-            && StepCheckered.ALLOW_PLACE_ACTIONS.contains(mod.checkpoints.getFirst().getRight().getLeft())) {
-            BlockPos placeNow = getNextBatchPlacementPos();
-            if (placeNow != null && placementAttempts.getOrDefault(placeNow, 0) < 5) {
-                Block planned = mod.currentBuildPlan.get(placeNow);
-                if (planned != null && mod.restock.isMaterialCarried(planned.asItem())
-                    && printFrontierWithinGap()) {
+            && !mod.checkpoints.isEmpty()) {
+            String legAction = mod.checkpoints.getFirst().getRight().getLeft();
+            // PRINT-LEG SCOPE (live 08:49:07-17: three 101-tick watchdogs while the
+            // bot crept north on a PREP sprint leg at ~4 places/s — the hold was
+            // fighting the very supply trip it exists to enable). The cadence
+            // governs print legs only ("printDone" = every batch/priming/repair
+            // print leg, "stepClosingReady" = the closing print); transits (sprint,
+            // batchBegin, refill, deposit legs) walk full speed and still place
+            // opportunistically en route — the hold only gates movement.
+            if ("printDone".equals(legAction) || "printDone2".equals(legAction)
+                || "stepClosingReady".equals(legAction)) {
+                if (printFrontierWithinGap()) {
                     placeHoldTicks++;
                     if (placeHoldTicks > 100) {
-                        placementAttempts.put(placeNow, 5);   // force-release: treat as capped
+                        // Safety net only - the attempts cap is the real bound (a block
+                        // sent 5 times without standing is force-released to the repair
+                        // pass, which drops it out of the hold's scan).
                         mod.warning("§ePrint pace-hold watchdog: released a " + placeHoldTicks
-                            + "-tick hold on " + placeNow.toShortString() + " - walking on.");
+                            + "-tick hold - walking on (retrying blocks will trail).");
                         placeHoldTicks = 0;
                         return false;
                     }
                     return true;
                 }
+                placeHoldTicks = 0;
+            } else {
+                placeHoldTicks = 0;
             }
-            placeHoldTicks = 0;
         } else {
             placeHoldTicks = 0;
         }
         return false;
     }
 
-    /** PRINT FORWARD GAP (user rule 2026-10-21: "reduce the print forward gap to 1
-     *  or max 2 blocks so the bot can burst more"): the pace hold engages only once
-     *  the bot has walked UP TO the work — nearest still-unplaced FORWARD plan block
-     *  within 2 horizontal blocks. The old hold fired at first contact (interaction
-     *  range 5 ≈ 4+ horizontal ahead), stopping the bot 2-3 blocks short with only
-     *  the front hemisphere of the reach printable per stop; walking in first and
-     *  bursting from close range covers nearly the whole reach sphere per stop, and
-     *  blocks that fall behind print en route anyway (the picker is any-direction).
-     *  Direction from the live route like the break cadence; 0 = at-goal (pass-end
-     *  drain holds until the sphere is dry). Attempts-capped and not-carried
-     *  positions never pin the bot — standing on them wastes the stop. */
+    /** PRINT FORWARD GAP + VERIFY-THEN-ADVANCE (user rules 2026-10-21: "reduce the
+     *  print forward gap to 1 or max 2 blocks so the bot can burst more", then "it
+     *  misses few blocks... so bot dont go past and avoid missing" — the print
+     *  mirror of the break approach-hold). One scan: the nearest still-unplaced
+     *  FORWARD plan block (route direction, 1-row behind grace; attempts-capped
+     *  skipped — the repair pass owns them) and whether ANY such block sits within
+     *  interaction range. The hold engages at ≤2.0 horizontal from the frontier AND
+     *  stays engaged while any forward in-reach block is still unplaced — INCLUDING
+     *  on-cooldown ones the picker cannot see: the old placeNow-based release freed
+     *  the walk exactly when everything left was mid-retry, and the missed few were
+     *  blocks walked past while their placement echo/cooldown cycles raced the bot.
+     *  Release = every forward in-reach block placed or capped: approach deep,
+     *  burst the whole reach sphere, verify, advance. At-goal (dir = 0, pass end)
+     *  the 2.0 gate drops — hold until the whole in-reach sphere drains (the
+     *  original pass-end semantics). A frontier whose material isn't CARRIED never
+     *  pins the bot — the on-demand swap / supply trip owns it. */
     boolean printFrontierWithinGap() {
         int dir = breakTravelDir();
         int botZ = mc.player.getBlockZ();
         BlockPos nearest = null;
         double nearestH = Double.MAX_VALUE;
+        boolean reachBusy = false;
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
             if (!mod.miningBlockState(pos).isAir()) continue;           // placed = done
             if (placementAttempts.getOrDefault(pos, 0) >= 5) continue;  // force-released - repair owns it
@@ -134,10 +149,12 @@ final class BreakPlaceEngine {
             double dz = pos.getZ() + 0.5 - mc.player.getZ();
             double hDist = Math.sqrt(dx * dx + dz * dz);
             if (hDist < nearestH) { nearestH = hDist; nearest = pos; }
+            if (mc.player.getEyePos().distanceTo(pos.toCenterPos()) <= mod.interactionRange.get()) reachBusy = true;
         }
-        if (nearest == null) return false;
+        if (nearest == null || !reachBusy) return false;
         Block planned = mod.currentBuildPlan.get(nearest);
-        return planned != null && mod.restock.isMaterialCarried(planned.asItem()) && nearestH <= 2.0;
+        if (planned == null || !mod.restock.isMaterialCarried(planned.asItem())) return false;
+        return dir == 0 || nearestH <= 2.0;
     }
 
     int sendDistinctBreaks(int maxSends, boolean fullSweep) {
@@ -771,17 +788,12 @@ final class BreakPlaceEngine {
             if (mod.miningBlockState(pos).isAir()) continue;
             if (exclude.contains(pos)) continue;
             if (breakPending.containsKey(pos)) continue;   // awaiting server confirm - not sendable
-            // BREAK(2) ABSORBS THE WEST LANES - FULL columns, tops AND floors
-            // (optimization 2026-10-21): break(2) is gated on W1's completion, and the
-            // only walk active during it is W2 on lane 2k+129, from which the west
-            // lanes sit at index-distance 128-129 - past the dominant-record edge, so
-            // the recorded west art can never be re-recorded regardless of timing.
-            // Clearing the west half here moves its break volume out of the post-W2
-            // serial tail into break(2)'s shadowed window; break-all air-skips what
-            // is already gone and is left with the east half only (the east lanes
-            // still gate on W2-complete - their borrow tops are dominant-class and
-            // re-recordable from W2's lane).
-            if (break2Only && pos.getX() >= westX + 2) continue;
+            // TOPS ONLY (reverted 2026-10-21 per user order "we need bottom part"):
+            // break(2) = the window's y2/y3 (101/102) tops only - the floors stay
+            // standing through W2's suppression walk and are cleared by break-all
+            // after it (the proven runner flow). The (r) full-column absorption
+            // is rolled back.
+            if (break2Only && (pos.getX() >= westX + 2 || pos.getY() < mod.lowerMapCorner.getY() + 2)) continue;
             if (dir != 0 && (pos.getZ() - botZ) * dir < -1) continue;   // behind us (1-row grace for the standing row)
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist > mod.interactionRange.get()) continue;
@@ -826,8 +838,8 @@ final class BreakPlaceEngine {
         double sendReach = Math.min(mod.interactionRange.get(), 4.4);
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
             if ((pos.getZ() - botZ) * dir < -1) continue;   // behind - sweep territory
-            // BREAK(2) absorbs the west lanes' full columns (see getNextBatchBreakPos).
-            if (break2Only && pos.getX() >= westX + 2) continue;
+            // TOPS ONLY, same filter as getNextBatchBreakPos (see the revert note there).
+            if (break2Only && (pos.getX() >= westX + 2 || pos.getY() < mod.lowerMapCorner.getY() + 2)) continue;
             if (mod.miningBlockState(pos).isAir()) continue;
             double dx = pos.getX() + 0.5 - mc.player.getX();
             double dz = pos.getZ() + 0.5 - mc.player.getZ();

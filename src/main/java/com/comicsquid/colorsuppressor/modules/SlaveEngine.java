@@ -972,15 +972,13 @@ final class SlaveEngine {
         int westX = mod.lowerMapCorner.getX() + 2 * mod.currentBatch;
         ArrayList<BlockPos> remaining = new ArrayList<>();
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
-            // BREAK(2) absorbs the west lanes' FULL columns (optimization 2026-10-21):
-            // break2done now certifies the whole west half clear - tops AND floors -
-            // so break-all is left with the east half only. The retry pass re-enters
-            // breakStage 2 and uses the same full-column picker filter.
-            if (pos.getX() >= westX + 2) continue;
+            // TOPS ONLY (reverted 2026-10-21 per user order): break(2) certifies the
+            // window's y2/y3 tops clear; the floors are break-all's job after W2.
+            if (pos.getX() >= westX + 2 || pos.getY() < mod.lowerMapCorner.getY() + 2) continue;
             if (!mod.miningBlockState(pos).isAir()) remaining.add(pos);
         }
         if (remaining.isEmpty()) {
-            mod.info("§aBatch " + mod.currentBatch + " break(2) complete (west lanes fully cleared).");
+            mod.info("§aBatch " + mod.currentBatch + " break(2) complete (west Y2/Y3 down).");
             return true;
         }
         if (batchPassRetries >= 2) {

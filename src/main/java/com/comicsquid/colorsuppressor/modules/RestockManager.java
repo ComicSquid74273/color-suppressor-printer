@@ -130,39 +130,128 @@ final class RestockManager {
     void buildFilteredDumpBacklog(InventoryS2CPacket packet) {
         depositBacklogSlots.clear();
         if (filteredDumpNeed == null) {
-            clearFilteredDump();
-            mod.timeoutTicks = mod.postRestockDelay.get();
-            mod.state = State.Walking;
+            finishFilteredDump();
             return;
         }
-        HashMap<Item, Integer> surplus = new HashMap<>();
+        HashMap<Item, Integer> carried = new HashMap<>();
         for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
             ItemStack stack = packet.contents().get(slot);
             if (stack.isEmpty() || ToolUtils.isTool(stack) || stack.contains(DataComponentTypes.FOOD)) continue;
             if (!mod.materialDict.containsKey(stack.getItem())) continue;
-            surplus.merge(stack.getItem(), stack.getCount(), Integer::sum);
+            carried.merge(stack.getItem(), stack.getCount(), Integer::sum);
         }
-        for (Map.Entry<Item, Integer> ent : new ArrayList<>(surplus.entrySet())) {
-            int over = ent.getValue() - filteredDumpNeed.getOrDefault(ent.getKey(), 0);
-            if (over > 0) surplus.put(ent.getKey(), over);
-            else surplus.remove(ent.getKey());
+        // ROOM-AWARE selection (live 08:45:26-38: the nearly-full station made a
+        // mixed selection bounce chest-to-chest - six "chest is full" hops for one
+        // dump). Only select stacks of items THIS chest can actually take (matching
+        // partial stacks / empty slots); items without room here stay carried and
+        // the chain's next chest retries them.
+        HashMap<Item, Integer> roomHere = new HashMap<>();
+        for (Map.Entry<Item, Integer> ent : carried.entrySet()) {
+            int room = chestRoomForItem(packet, ent.getKey());
+            if (room > 0) roomHere.put(ent.getKey(), room);
         }
         for (int slot = packet.contents().size() - 36; slot < packet.contents().size(); slot++) {
             ItemStack stack = packet.contents().get(slot);
             if (stack.isEmpty() || ToolUtils.isTool(stack) || stack.contains(DataComponentTypes.FOOD)) continue;
-            int rem = surplus.getOrDefault(stack.getItem(), 0);
-            if (rem <= 0) continue;
+            Item item = stack.getItem();
+            int need = filteredDumpNeed.getOrDefault(item, 0);
+            int remaining = carried.getOrDefault(item, 0);
+            int room = roomHere.getOrDefault(item, 0);
+            if (room <= 0) continue;
+            // KEEP-LOAD-BEARING GATE (root cause of the overshoot finishFilteredDump
+            // re-checks away): deposit a whole stack only when the REST still covers
+            // the build's need. The old gate queued any stack of an item whose
+            // over-count was >0 — when the excess was SMALLER than the stack
+            // (carried 129 / need 100 / excess 29), the 64-stack went in anyway and
+            // the kept supply landed below need by (stack - excess) — live batch 17
+            // 08:49: mid-print shortages Blue 61, Green 48, PinkConcrete 26, Pink 12,
+            // Resin 9, LightBlue 1 all fit that arithmetic. With the remainder gate
+            // the small-excess stack simply stays carried — under-dumping is safe
+            // (the queue-time refill snapshot counted the same stacks, and the
+            // finish-recheck still catches any world-view drift).
+            if (remaining - stack.getCount() < need) continue;
             depositBacklogSlots.add(slot);
-            surplus.put(stack.getItem(), rem - stack.getCount());
+            carried.put(item, remaining - stack.getCount());
+            roomHere.put(item, room - stack.getCount());
         }
         if (depositBacklogSlots.isEmpty()) {
-            // Nothing beyond need (any more) - the dump leg is done, route continues
-            clearFilteredDump();
-            mod.timeoutTicks = mod.postRestockDelay.get();
-            mod.state = State.Walking;
+            // Nothing THIS chest can take: if excess items remain, hop to the next
+            // chest stocking them (the nearly-full station rarely fits every item
+            // at one chest); otherwise the dump leg is done, route continues.
+            HashSet<Item> excess = excessItemsBeyondNeed();
+            Pair<BlockPos, Vec3d> nextFiltered = excess.isEmpty() ? null : getNextFilteredDepositChest(excess);
+            if (nextFiltered != null) {
+                queueDepositChestAtHead(nextFiltered);
+                mod.timeoutTicks = mod.postRestockDelay.get();
+                mod.state = State.Walking;
+            } else {
+                finishFilteredDump();
+            }
             return;
         }
         mod.info("§7Prep dump: depositing §b" + depositBacklogSlots.size() + "§7 excess stack(s) beyond this build's need.");
+    }
+
+    /** Free slots/stack-space the OPEN chest has for one item (from the same
+     *  packet the selection reads - chest slots are 0..size-37). */
+    int chestRoomForItem(InventoryS2CPacket packet, Item item) {
+        int room = 0;
+        for (int slot = 0; slot < packet.contents().size() - 36; slot++) {
+            ItemStack chestStack = packet.contents().get(slot);
+            if (chestStack.isEmpty()) { room += 64; continue; }
+            if (chestStack.isStackable() && chestStack.getItem().equals(item)) room += chestStack.getMaxCount() - chestStack.getCount();
+        }
+        return room;
+    }
+
+    /** Common exit for the filtered dump: clear the mode, then RE-CHECK the
+     *  deficit. Whole-stack deposits OVERSHOOT (a surplus of 32 leaves as one
+     *  64-stack, cutting 32 into the need), and the queue-time restockList was
+     *  computed BEFORE the dump executed - it never saw that deficit, which
+     *  resurfaced as mid-print emergency supply runs (live batch 16, 08:45:57:
+     *  Blue Terracotta/Resin ran out 10 s into the print; the emergency withdrew
+     *  exactly 32). The recheck merges the fresh deficit into the SAME trip's
+     *  refill so the print starts fully stocked. */
+    void finishFilteredDump() {
+        clearFilteredDump();
+        mod.timeoutTicks = mod.postRestockDelay.get();
+        mod.state = State.Walking;
+        refillDeficitsAfterDump();
+    }
+
+    /** Post-dump deficit merge - never wipes the list (pending tool/food entries
+     *  live there) and never double-counts: an unwithdrawn entry's raw amount is
+     *  raised to the CURRENT deficit only when overshoot grew it (max semantics;
+     *  the dump runs before any refill chest, so entries are still unserved). */
+    void refillDeficitsAfterDump() {
+        HashMap<Item, Integer> requiredItems = getRequiredItems();
+        HashMap<Item, Integer> carried = Utils.getInvInformation(requiredItems, mod.availableSlots).getRight();
+        boolean added = false;
+        for (Map.Entry<Item, Integer> req : requiredItems.entrySet()) {
+            int deficit = req.getValue() - carried.getOrDefault(req.getKey(), 0);
+            if (deficit <= 0) continue;
+            boolean merged = false;
+            for (int i = 0; i < restockList.size(); i++) {
+                Triple<Item, Integer, Integer> t = restockList.get(i);
+                if (t.getLeft().equals(req.getKey())) {
+                    if (deficit > t.getRight()) {
+                        restockList.set(i, Triple.of(t.getLeft(), (int) Math.ceil(deficit / 64f), deficit));
+                    }
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) restockList.add(Triple.of(req.getKey(), (int) Math.ceil(deficit / 64f), deficit));
+            added = true;
+        }
+        if (added) {
+            boolean refillQueued = false;
+            for (Pair<Vec3d, Pair<String, BlockPos>> cp : mod.checkpoints) {
+                if ("refill".equals(cp.getRight().getLeft())) { refillQueued = true; break; }
+            }
+            if (!refillQueued) addClosestRestockCheckpoint();
+            mod.info("§7Post-dump recheck: whole-stack overshoot left a deficit - refill merged into this trip.");
+        }
     }
 
     Pair<BlockPos, Vec3d> getBestChest(Item item) {
@@ -646,7 +735,7 @@ final class RestockManager {
             if (filteredDumpActive) {
                 HashSet<Item> excess = excessItemsBeyondNeed();
                 redoChest = excess.isEmpty() ? null : getNextFilteredDepositChest(excess);
-                if (redoChest == null) clearFilteredDump();   // nowhere to put it - carry the excess
+                if (redoChest == null) finishFilteredDump();   // nowhere to put it - carry the excess
             } else {
                 redoChest = getNextDepositChest();
             }
@@ -666,7 +755,7 @@ final class RestockManager {
                 HashSet<Item> excess = excessItemsBeyondNeed();
                 Pair<BlockPos, Vec3d> nextFiltered = excess.isEmpty() ? null : getNextFilteredDepositChest(excess);
                 if (nextFiltered != null) queueDepositChestAtHead(nextFiltered);
-                else clearFilteredDump();   // nowhere to put it - carry the excess, prep accounting tolerates it
+                else finishFilteredDump();   // nowhere to put it - carry the excess, prep accounting tolerates it
             } else {
                 Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();
                 if (nextDepositChest != null) queueDepositChestAtHead(nextDepositChest);
@@ -692,9 +781,7 @@ final class RestockManager {
                     }
                     mod.warning("§ePrep dump: no chest with room for the remaining excess - carrying it on.");
                 }
-                clearFilteredDump();
-                mod.timeoutTicks = mod.postRestockDelay.get();
-                mod.state = State.Walking;
+                finishFilteredDump();
                 return true;
             }
             Pair<BlockPos, Vec3d> nextDepositChest = getNextDepositChest();

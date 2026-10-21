@@ -92,6 +92,106 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-10-21 (z) — DUMP OVERSHOOT FIXED AT THE SOURCE + pace-hold print-leg scope (user: "no still misses so many block in first run"; log forensics batch 17)
+**blocks-per-tick verified OBEYED:** [RATE] place peaked exactly 80/s = 4/tick ×
+20 — the config cap, saturated. The misses were not placement-rate misses.
+**Root cause (the "so many" misses): the prep dump's whole-stack overshoot.**
+`buildFilteredDumpBacklog` gated stack selection on `over > 0` but never checked
+the REMAINDER: when the excess was smaller than the stack (carried 129 / need
+100 / excess 29), the 64-stack went into the chest anyway and kept supply landed
+below need by (stack − excess). Batch 17 evidence fits exactly: mid-print
+shortages Blue 61, Green 48, PinkConcrete 26, Pink 12, Resin 9, LightBlue 1 —
+each = 64-stack dumped minus a small true excess; five mid-print supply
+round-trips (each ~60-90 s) left the pass full of holes the user watched print
+"missing". FIX: keep-load-bearing gate — a stack is deposited only when
+`remaining − stack.count ≥ need`; small-excess stacks simply stay carried
+(under-dumping is safe; the queue-time refill snapshot counted them, and (y)'s
+finish-recheck still catches world-view drift). Compensates with, not replaces,
+(y)'s post-dump deficit recheck — with the gate, that recheck goes no-op.
+**Second fix — pace-hold scope:** the (w) hold engaged on ANY allowlisted leg,
+including prep/supply SPRINT transits (live 08:49:07-17: three 101-tick
+watchdog releases while the bot crept north at ~4 places/s to the dump chest).
+`adaptivePaceHold` now governs print legs only ("printDone"/"printDone2"/
+"stepClosingReady"); transits walk full speed and still place opportunistically
+(the hold only ever gated movement). Plus a carried-guard in
+`printFrontierWithinGap`: a frontier whose material isn't carried never pins the
+bot. All body-only edits → hotswap-compatible if the running jar already carries
+(u)/(w); else restart-deploy. Build green, jar 09:05. NOT deployed/committed.
+
+### 2026-10-21 (y) — EMERGENCY-RESTOCK ROOT CAUSE: dump overshoot unseen by the queue-time restock list (live 08:44-08:51, batches 16-17)
+Evidence (slave log): batch 16 prep 08:44:51 planned "excess of 18 items" with
+deficit ZERO (no "Restocking" lines — carried covered the plan, so NO refill
+chest was queued). The dump then deposited 30 whole stacks across SEVEN chest
+visits (08:45:26-38, six "chest is full" hops — the station is nearly full and
+a mixed selection bounces until it finds matching partial stacks). At 08:45:57,
+10 s into the print, Blue Terracotta + Block of Resin ran out → "Mid-batch
+supply run" withdrawing EXACTLY the overshoot ("Restocking 1 stacks Blue
+Terracotta (32)"). Batch 17 identical: dump 10+4 stacks → four supply runs in
+25 s.
+
+- **Mechanism**: whole-stack deposits overshoot — surplus 32 leaves as one
+  64-stack, cutting 32 INTO the need. The restock list was computed at queue
+  time, BEFORE the dump executed, so the deficit the dump itself created was
+  never withdrawn → mid-print stockout → emergency run (which recomputes vs
+  world truth, hence "exactly 32").
+- **Fix 1 — post-dump recheck** (`finishFilteredDump` → `refillDeficitsAfterDump`
+  at every filtered-mode exit): recompute the deficit AFTER the dump completes
+  and merge it into the SAME trip's refill (queue a refill chest if none is
+  queued). Merge-only — never wipes pending tool/food entries, never
+  double-counts (unwithdrawn entry raw raised to current deficit via max; the
+  dump runs before any refill chest so entries are unserved).
+- **Fix 2 — room-aware selection** (`buildFilteredDumpBacklog` +
+  `chestRoomForItem`): only select surplus stacks of items the OPEN chest can
+  actually take (matching partial stacks / empty slots, read from the same
+  packet); items without room here stay carried and the chain's next chest
+  retries them. Kills most of the bounce hops; an empty selection with excess
+  remaining hops to the next stocking chest instead of ending the dump.
+- Method-body + new methods only (no new fields vs (t)) → still the (t)
+  RESTART-deploy jar family. UNTESTED live — pending user go-ahead.
+
+### 2026-10-21 (x) — (r) REVERTED: break(2) back to TOPS-ONLY (user: "we need bottom part")
+User saw break(2) clearing the west lanes' floors too (live) and ordered the (r)
+full-column absorption rolled back. All three (r) sites restored to the pre-(r)
+246628b shapes: both `break2Only` picker filters (`getNextBatchBreakPos` +
+`breakApproachHold`) regain the `y >= cornerY+2` tops-only restriction alongside
+`x < westX+2`, and `verifyBreak2` certifies west Y2/Y3 only (log line back to
+"west Y2/Y3 down"; retry passes inherit the filter). The floors are cleared by
+break-all after W2 (the proven runner flow) — bottoms still get broken, just
+after the suppression walk instead of during it. The (r) entry's timing win
+(−30–45s/batch) is forfeited. Method-body-only → hotswap-compatible in
+principle, but rides the structural (v) jar anyway. Build green.
+NOT deployed/committed.
+
+### 2026-10-21 (w) — PRINT VERIFY-THEN-ADVANCE: no more walked-past misses (user: "misses few blocks... check how breakAll handles it so bot dont go past")
+**blocks-per-tick answer (verified in code):** YES, printing obeys it —
+`actOnWorkTarget`'s multi-place loop sends up to `mod.blocksPerTick.get()`
+DIFFERENT positions per tick (the `* 3` pick budget only lets it skip
+cooldown/failed candidates while searching for placeable ones;
+SlaveEngine.java:282).
+**The miss mechanism:** every placement send parks its position on a 4-tick
+cooldown (echo blind-window) — and the (u) pace hold's release conditions were
+picker-based: it released when `getNextBatchPlacementPos()` returned null, which
+happens exactly when everything left in range is MID-RETRY on cooldown. The bot
+resumed walking; a block whose echo lagged past its cooldown could then fail its
+retry behind the advancing bot, fall out of reach, and land in the repair pass.
+The break side solved this exact shape with `breakApproachHold`'s reachBusy term
+(hold while ANY forward standing target is in send-reach — pending/queued
+included; release only when all forward in-reach are confirmed air).
+**Fix (print mirror):** `printFrontierWithinGap()` now also computes reachBusy =
+any still-air FORWARD (non-capped) plan block within interaction range, and the
+hold reads `engaged at ≤2.0 AND reachBusy` — on-cooldown blocks keep the bot
+standing until their retry lands. `adaptivePaceHold` drops the placeNow/
+carried-material conjuncts (subsumed; missing-material frontiers route through
+the swap path's own stop machinery or the refill route change, so no deadlock).
+At-goal (dir = 0, pass end) the 2.0 gate drops: hold until the whole in-reach
+sphere drains — the original pass-end semantics, which (u) had weakened. The
+100-tick watchdog stays as a plain release (the attempts cap is the real bound:
+5 sends without the block standing force-releases it to the repair pass, which
+also drops it from the hold's scan). Approach-to-2 burst speed from (u) is
+unchanged. Body-only edit (two existing methods) → hotswap-compatible IFF the
+running jar already carries (u); otherwise restart-deploy. Build green, jar
+08:37. NOT deployed/committed.
+
 ### 2026-10-21 (v) — DELTA-ROUTED BREAKS: slot sync + split pair (the multi-attempt straggler root cause)
 **Diagnosis (bytecode-verified against 1.21.11 vanilla, both directions):** the
 server's `ServerPlayerInteractionManager.processBlockBreakingAction` breaks a
