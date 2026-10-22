@@ -6,19 +6,16 @@ import com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
-import net.minecraft.entity.ItemEntity;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.util.Hand;
-import net.minecraft.util.Pair;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -193,8 +190,12 @@ final class BreakPlaceEngine {
         // attempts >= 3. The 0.6 margin = one tick of movement (creep to the
         // edge, never past). At-goal (dir = 0) the direction filter opens into
         // pass-end drain over the same sendable shell.
+        // RETRY-RANGE GUARD edge at interaction range − 1 (user rule 2026-10-22
+        // (cj): "instead of waiting for unconfirmed block to wait for interaction
+        // range distance, wait til interaction range -1" — hold a full block
+        // before the cell would leave reach, not the old 0.6 creep margin).
         double sendEdge = Math.min(mod.interactionRange.get(), 4.4);   // server survival reach: sends beyond it are silently rejected (the break side's proven law)
-        double retryEdge = sendEdge - 0.6;
+        double retryEdge = sendEdge - 1.0;
         int dir = breakTravelDir();
         int botZ = mc.player.getBlockZ();
         // In-flight UNCONFIRMED sends (placePending removes on confirm): the walking
@@ -204,6 +205,14 @@ final class BreakPlaceEngine {
         // placed ones instead).
         for (BlockPos pos : placePending.keySet()) {
             if (!mod.miningBlockState(pos).isAir()) continue;   // landed - confirm seen
+            // (am) MIRROR, missing here since (cd) (live batch 38: the x=-369 borrow
+            // tops 0.2 above the head pinned the bot IN the picker's overlap margin —
+            // standing, sending NOTHING, while the ladder counted phantom rejections
+            // to 5x): never pin where the picker refuses to send — overlapped cells
+            // are the vantage rung's job, not the pin's.
+            if (mc.player.getBoundingBox().intersects(new Box(pos).expand(0.3))) continue;
+            Block planned = mod.currentBuildPlan.get(pos);
+            if (planned == null || !mod.restock.isMaterialCarried(planned.asItem())) continue;   // not this plan / supply owns it
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist < retryEdge || dist >= sendEdge) continue;       // sendable shell only; beyond send range the repair pass owns it
             if (dir != 0 && (pos.getZ() - botZ) * dir >= 0) continue; // ahead/abeam - being approached, not walked past
@@ -739,12 +748,11 @@ final class BreakPlaceEngine {
                 int rejects = placeRejects.get(pending);
                 if (rejects == CONFIRMED_PRINT_REJECTS) {
                     mod.info("§e[CONFIRM-PRINT]§7 " + pending.toShortString() + " rejected "
-                        + rejects + "x - holding for a standing confirmed send.");
-                    tryDropRescue(pending);
+                        + rejects + "x - retry-first picker owns it inside range-" + 1 + ".");
                 } else if (rejects == 3) {
                     // BREAK-CLEAR RUNG (2026-10-22 (ch), live batch 37's lone miss:
                     // Brown Concrete (-374,99,-226) rejected 12+ sends across the
-                    // print pass AND both repair passes — standing at dz -3.6
+                    // pass AND both repair passes — standing at dz -3.6
                     // included — with no drop in the cell and the client reading
                     // air the whole time). When converged standing sends keep
                     // failing, the SERVER sees something in the cell the client
@@ -756,8 +764,8 @@ final class BreakPlaceEngine {
                     // hidden concrete-class block (delta 0.648) can never clear the
                     // 0.7 cliff same-tick. On server-air the START is a no-op. The
                     // STOP+ABORT flush is the ONE split copy, in
-                    // tickBreakConfirmations. The broken block's drop lands in the
-                    // cell and feeds the drop rescue at the next rung.
+                    // tickBreakConfirmations. The broken block's drop falls near
+                    // the lane and rides the normal pickup radius.
                     if (splitPendingPos == null && ensureBestToolFor(pending)) {
                         syncSelectedSlotNow();
                         mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
@@ -768,17 +776,21 @@ final class BreakPlaceEngine {
                         mod.info("§e[CONFIRM-PRINT]§7 " + pending.toShortString()
                             + " rejects standing sends - break-clearing the cell (hidden server-side block or encased entity?).");
                     }
-                } else if (rejects == 4) {
-                    // post-break-clear re-check: the cleared block's own drop just
-                    // appeared inside the cell (and a drop whose pickup delay made
-                    // it invisible to the ==2 check becomes pickupable by now) —
-                    // collect it, then the standing re-send lands
-                    tryDropRescue(pending);
                 } else if (rejects == 5) {
                     mod.warning("§6[CONFIRM-PRINT]§c PERSISTENT REJECTION: " + pending.toShortString()
                         + " rejected " + rejects + "x even standing - the pace-hold watchdog will release it to the repair pass.");
                 }
-                if (rejects < 5) placePending.put(pending, 10);
+                // RUNG-PACED RE-ARM (2026-10-22 (cj), live batch 39: rungs 2→5
+                // fired within ONE SECOND — the vantage walk alone takes 1-2s and
+                // a standing send's echo 8-15t, so the ladder condemned cells
+                // before any rung's effect could land, and rung 3's break-clear
+                // could even break a healthy slow-echo block). Each rung gets its
+                // physical time before the next verdict: plain cells 10t,
+                // escalated 20t (echo-truth), post-break-clear 30t (split flush +
+                // echo + drop spawn), post-vantage 40t (walk + standing send +
+                // echo). Still bounded by the 5x terminal.
+                int rearm = rejects >= 4 ? 40 : rejects == 3 ? 30 : rejects >= 2 ? 20 : 10;
+                if (rejects < 5) placePending.put(pending, rearm);
                 else pendingIt.remove();
             } else {
                 placePending.put(pending, ticksLeft);
@@ -790,24 +802,6 @@ final class BreakPlaceEngine {
                 + "§3 expired-rejected=§e" + rejectedThisTick
                 + "§3 inFlight=" + placePending.size() + " rejectedCells=" + placeRejects.size());
         }
-    }
-
-    /** One shared rung of the place ladder (live batch 36 root cause): the server
-     *  rejects a placement clipping an entity, so a drop sitting INSIDE the
-     *  rejected cell blocks every send — standing or not — until collected. Walk
-     *  onto the drop (vanilla proximity pickup en route), then the resumed leg's
-     *  standing re-send lands. addFirst keeps the print leg queued;
-     *  "printDropPickup" is outside adaptivePaceHold's leg scope so the escalation
-     *  pin cannot deadlock the walk; sub-floor drops route to the recovery dig
-     *  instead; the head-check prevents stacking while one pickup is queued. */
-    private void tryDropRescue(BlockPos cell) {
-        ItemEntity blocker = mod.slave.scan.findDropInCell(cell);
-        if (blocker == null || mod.slave.scan.isSubFloorDrop(blocker)) return;
-        if (mod.checkpoints.isEmpty()) return;
-        if ("printDropPickup".equals(mod.checkpoints.getFirst().getRight().getLeft())) return;
-        mod.checkpoints.addFirst(new Pair(new Vec3d(blocker.getX(), blocker.getY(), blocker.getZ()),
-            new Pair("printDropPickup", null)));
-        mod.info("§e[CONFIRM-PRINT]§7 cell blocked by a ground drop - walking onto it to pick it up, then re-printing.");
     }
 
     /** ROLLING HOTBAR LOOKAHEAD — Belady WITH stack arithmetic (user rule
@@ -1016,55 +1010,52 @@ final class BreakPlaceEngine {
         return false;
     }
 
+    /** Shared placement eligibility — the ONE copy (hold/picker drift is the (am)
+     *  bug class): returns the eye distance when the cell is pickable now, else -1. */
+    private double placeableDist(BlockPos pos, Set<BlockPos> exclude, double placeClamp) {
+        if (!mod.miningBlockState(pos).isAir()) return -1;          // placed = done
+        if (exclude.contains(pos)) return -1;
+        if (placementCooldowns.getOrDefault(pos, 0) > 0) return -1; // echo-window spacing
+        if (pos.equals(splitPendingPos)) return -1;                 // mid break-clear (2-tick window)
+        double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
+        if (dist > placeClamp) return -1;
+        if (mc.player.getBoundingBox().intersects(new Box(pos).expand(0.3))) return -1;   // self-collision margin (the (al) law)
+        return dist;
+    }
+
     BlockPos getNextBatchPlacementPos(Set<BlockPos> exclude) {
         if (mod.currentBuildPlan == null) return null;
         // LANE GATE: no printing unless the bot stands centered on the phase's lane-2
         // centerline. Off-center (e.g. after a sweep left it straddling lanes), freshly
         // placed floor blocks on the west lanes can catch the bot's side and wall it in.
         if (mod.lowerMapCorner != null && Math.abs(mc.player.getX() - mod.slave.routes.currentWalkLaneX()) > 0.3) return null;
-        // Litematica-style: any plan block is placed the moment it enters interaction
-        // range — ahead, beside, or behind. The walking lane (2, the east borrow lane)
-        // only carries y2 blocks above the head, so nothing is ever placed at feet level
-        // on the bot's path; blocks intersecting its body are retried once it moves on.
-        BlockPos best = null;
-        double bestDist = Double.MAX_VALUE;
         // WALKING SEND CLAMP (mirror of the break-side lesson): a placement sent
         // while WALKING at the far edge lands its echo behind the advancing bot —
         // and when the send raced the echo (52% of burst placements need >1 send),
         // its RETRY then sits behind the bot in fading reach = the trail-off
         // misses the pass-end verify reports. Walking placements only within 3.5;
         // the HELD stationary burst keeps the full range (its echoes resolve in
-        // place, and the (w) hold stands until they do).
-        // Standing clamp mirrors the server's survival reach: sends beyond ~4.4 are
-        // silently rejected (the break side's proven law) - at range 5 they only
-        // burn attempts and trail off behind the bot. Walking clamp unchanged
-        // (echo-race lesson: far-edge sends while walking land behind the bot).
+        // place). Standing clamp mirrors the server's survival reach (~4.4).
         double placeClamp = mc.options.forwardKey.isPressed() ? 3.5 : Math.min(mod.interactionRange.get(), 4.4);
+        // RETRY-FIRST (user rule 2026-10-22 (cj): "give priority to retry Then
+        // closest new prints"): a sent-but-unconfirmed cell re-sends the MOMENT
+        // its cooldown expires — before any new cell is picked. Rejections die
+        // young, well inside send range; the confirmation ladder (placePending)
+        // IS the retry set.
+        BlockPos retry = null;
+        double retryDist = Double.MAX_VALUE;
+        for (BlockPos pos : placePending.keySet()) {
+            if (!mod.currentBuildPlan.containsKey(pos)) continue;   // not this plan
+            double dist = placeableDist(pos, exclude, placeClamp);
+            if (dist >= 0 && dist < retryDist) { retryDist = dist; retry = pos; }
+        }
+        if (retry != null) return retry;
+        // New cells: litematica-style nearest-first, any direction.
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
-            if (!mod.miningBlockState(pos).isAir()) continue;
-            if (exclude.contains(pos)) continue;
-            // Skip positions on placement cooldown (litematica-style: don't hammer the
-            // same failed block — let the timeout expire, then retry)
-            if (placementCooldowns.getOrDefault(pos, 0) > 0) continue;
-            // Mid break-clear (2-tick window): a place landing now would hand the
-            // split's STOP our own fresh block to break — the ladder re-sends it
-            // the moment the clear completes.
-            if (pos.equals(splitPendingPos)) continue;
-            double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
-            if (dist > placeClamp) continue;
-            // SELF-COLLISION MARGIN (live hammer loop: same floor block re-sent
-            // every 4-tick cooldown ~15x while parked): the server's canPlace
-            // rejects solid blocks clipping an ENTITY using ITS view of the bot's
-            // box, which lags/rounds differently than this client check - marginal
-            // dz 0.2-0.8 feet-level blocks passed here and were server-rejected in
-            // a loop. expand(0.3) (one movement tick) treats anything that CLOSE to
-            // the body as walk-clear territory: it places en route once the bot has
-            // moved off, or the repair pass owns it - never hammered in place.
-            if (mc.player.getBoundingBox().intersects(new Box(pos).expand(0.3))) continue;
-            if (dist < bestDist) {
-                bestDist = dist;
-                best = pos;
-            }
+            double dist = placeableDist(pos, exclude, placeClamp);
+            if (dist >= 0 && dist < bestDist) { bestDist = dist; best = pos; }
         }
         return best;
     }

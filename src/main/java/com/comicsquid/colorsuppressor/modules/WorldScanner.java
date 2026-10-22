@@ -305,16 +305,18 @@ final class WorldScanner {
         return null;
     }
 
-    /** A pickupable drop sitting INSIDE one specific plan cell — the unplaceable-
+    /** An ItemEntity sitting INSIDE one specific plan cell — the unplaceable-
      *  cell case (live 2026-10-22 batch 36: a reprint after an INTERRUPTED
      *  collection had ~140 drops still lying in the box; the server rejects a
      *  placement clipping an entity ((al)'s law), so every send into a
-     *  drop-occupied cell fails until the drop is picked up). Null = clear. */
+     *  drop-occupied cell fails until picked up). Deliberately UNFILTERED by
+     *  isPickupable ((ci)): a drop still in pickup delay or mid-air blocks the
+     *  placement just the same, and walking onto it picks it up the moment it
+     *  settles. Null = clear. */
     ItemEntity findDropInCell(BlockPos cell) {
         if (mc.world == null) return null;
         for (Entity entity : mc.world.getEntities()) {
             if (!(entity instanceof ItemEntity itemEntity)) continue;
-            if (!isPickupable(itemEntity)) continue;
             if (BlockPos.ofFloored(itemEntity.getX(), itemEntity.getY(), itemEntity.getZ()).equals(cell)) return itemEntity;
         }
         return null;

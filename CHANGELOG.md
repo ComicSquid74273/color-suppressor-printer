@@ -93,6 +93,74 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-10-22 (cj) — RETRY-FIRST PICKER + RANGE−1 EDGE + PRINT-PHASE CHECKPOINTS REMOVED (user: "instead of waiting for unconfirmed block to wait for interaction range distance, wait til interaction range -1, and remove that u added small checkpoints in print phase, and give priority to retry Then closest new prints"; includes the rung-pacing half observed live on batch 39)
+
+**Live evidence (batch 39, jar 31c653b1):** batch 38 printed 664/664
+world-verified 0-miss (the previously-failing batch!), but batch 39 verified
+4 missing — forensics: the ladder rungs 2→3→4→5 fired within ONE SECOND
+(escalated windows were 10t while a vantage walk takes 1-2s and an echo 8-15t),
+condemning cells before any rung's effect could land.
+
+**The user's simplification (implemented, replacing the detour machinery):**
+- **RETRY-FIRST PICKER:** `getNextBatchPlacementPos` now scans the
+  confirmation ladder (`placePending`) FIRST — a sent-but-unconfirmed cell
+  re-sends the moment its cooldown expires, BEFORE any new cell is picked.
+  Rejections die young, well inside send range: no pins, no detours, no
+  repair. Eligibility filters extracted to ONE shared `placeableDist` helper
+  (air / exclude / cooldown / break-clear window / clamp / self-collision) —
+  no hold-vs-picker drift possible.
+- **Edge at interaction range − 1:** the trailing-shell hold engages a full
+  block before the cell would leave reach (was range − 0.6).
+- **Print-phase micro-checkpoints REMOVED:** the `printVantage` and
+  `printDropPickup` inserted legs are gone (with `tryDropRescue`); a
+  break-cleared block's drop falls near the lane and rides the normal pickup
+  radius.
+- **Rung-paced re-arm (the batch-39 fix):** plain cells re-arm at 10t,
+  escalated 20t, post-break-clear 30t — escalated windows are now echo-true.
+  Ladder: 2 = escalate log, 3 = break-clear split, 5 = terminal → watchdog →
+  repair (re-armed).
+
+NOT live-verified yet — jar ca5beba3 in build/libs + both mods folders, bots
+closed, launch when ready.
+
+### 2026-10-22 (ci) — DEAD-PIN FIXED + VANTAGE RUNG + ECHO-TRUE WINDOWS (user: "STILL MISSING, I DONT WANT MISSING IN FIRST PASS... MUST HONOR BLOCKS PER TICK... VERY FAST. with 0 misses"; live batch-38 forensics, jar f32755c3)
+
+**Live evidence (07:41-07:43, user stopped mid-pass):** batch 37 printed 648/648
+clean with (ch) live — the previous stuck-cell class resolved — and its
+collection COMPLETED ("window clean", no leftover drops for batch 38). Batch
+38 then produced 13 escalations in ~40 rows, 4 cells reaching 5× PERSISTENT
+((-369,102,-306), (-369,101,-305), (-372,99,-306), (-372,101,-275)); confirms
+trailed sends 26/s vs 43/s. Forensics on the re-pick pattern (same cell PLACE'd
+at 4-tick cadence while still reading AIR at pick time = no client prediction
+ever stuck) + the geometry of the persistent cells (x=-369 borrow tops sit 0.2
+above the bot's head on its own straddle column):
+
+- **DEAD-PIN ((am) invariant violation in my own (cd) loop 1):** the trailing
+  shell pin had NO body-overlap mirror check — it pinned the bot right where
+  the picker's overlap margin refuses to send (head-margin cells), so the bot
+  stood sending NOTHING while the ladder counted phantom rejections 2→5.
+  Fixed: loop 1 now mirrors the picker (overlap expand(0.3) skip + carried
+  check).
+- **ONE-VANTAGE blindness:** every standing send for a stubborn cell left
+  from the single position where the pin stopped the bot. NEW RUNG at
+  rejects==4: walk 3 rows PAST the cell (travel direction, no backtracking) to
+  a clean standing vantage ("printVantage" leg, outside the hold's scope so
+  pins can't deadlock it), then re-send standing from there — different z =
+  different server entity check + clean client margin.
+- **ECHO-TRUE first window 10→20t:** under load Folia's block-update echo runs
+  8-15t, so the 10t window false-rejected HEALTHY cells (the 13-escalation
+  storm = mostly slow echoes that then confirmed) — every false escalation was
+  a pin = lost pace. Escalated cells still re-arm at 10t.
+- **findDropInCell unfiltered:** a drop still in pickup delay or mid-air
+  blocks placement exactly the same; the rescue now sees it (walking onto it
+  picks it up once it settles).
+
+Ladder now: 2 = pin + drop rescue → 3 = break-clear → 4 = drop re-check +
+vantage walk → 5 = terminal warning → watchdog → repair (re-armed). Pace
+untouched: the blocks-per-tick send loop and the walking cadence are unchanged,
+and the false-escalation storm (the main new slowdown) is gone at the source.
+NOT deployed/committed.
+
 ### 2026-10-22 (cg) — PIXEL-ARRIVAL DWELL GATE: master leaves a checkpoint the moment the held map's pixel stream goes quiet (user: "MASTER HELD THE MAPS AT EVERY CHECKPOINTS, FOR SOME TIME, ITS SOO LONG, WHICH IS DEDRADING OUR 90 MINUTES OPTIMIZATION... MAKING SURE WE DONT LOST ANY PIXEL. ONE PIXEL LOST AND WHOLE MAPS GETS DISCARDED.")
 
 **The waste:** every sweep station burned a blind fixed `STEP_DWELL_TICKS = 80`
@@ -119,8 +187,8 @@ running (the gate waits, it can never lose a pixel).
   changed byte resets the quiet timer; release once `elapsed >= 10` (floor, so
   the first render packets always get a chance) AND the stream has been quiet.
   COLD-START RULE: a dwell that has SEEN changes needs quiet ≥ `dwell-quiet-ticks`
-  (new setting, default 20 = 1 s — silence after activity proves the flush
-  finished); a dwell that has seen ZERO changes needs 2× that (2 s), because
+  (silence after activity proves the flush finished); a dwell that has seen
+  ZERO changes needs 2× that, because
   "quiet from tick 0" can also mean the server has not started flushing yet
   (hold swap just landed / region hiccup), and releasing a not-yet-started
   flush could strand pixels outside every later station's band.
@@ -138,16 +206,26 @@ running (the gate waits, it can never lose a pixel).
   next-pair lane at ~127 blocks) and the data hook for any future v2.
 
 **Settings (Advanced group):** `adaptive-dwell` (default ON) + `dwell-quiet-ticks`
-(default 20). With the OFF toggle the flow is bit-identical to (cf).
+(default **5** = 0.25 s, slider 2–40; tightened from the first draft's 20 after the
+user pushed for near-zero post-arrival waiting — the server streams a held map's
+pixels every tick, so a few ticks of dead air after the last change is already a
+finished-flush proof on the localhost rig; no count-tripwire exists because the
+arrival count is NOT fixed per dwell — overlap pixels never arrive, foreign
+mid-build pixels do — and the protocol has no flush-complete marker). Cold-start
+rule doubles the window for zero-change dwells (10t at default 5). The `[DWELL]`
+release line also reports the dwell's LARGEST inter-arrival gap — the live run
+therefore MEASURES the real arrival cadence: healthy = 0–2t gaps (setting can then
+drop to the 2–3 floor); any dwell showing larger gaps = raise the slider. With the
+OFF toggle the flow is bit-identical to (cf).
 
 **Ordering safety re-audited:** all downstream transitions are event-driven, not
 time-driven — W1 completion still stows BEFORE break(2) is sent, W2 still gates
 on break2done/echo, the batch-0 S-fill terminus still needs pass-done. Nothing
 anywhere assumes the master was slow.
 
-**Expected effect:** dwell ≈ flush time + 1 s instead of 4 s → roughly half the
-standing time removed (~20+ minutes per full run). STRUCTURAL change (new
-settings + tick-path) → restart-deploy; jar rebuilt clean 07:32.
+**Expected effect:** dwell ≈ flush (~5–10t) + 0.25 s ≈ 0.5 s instead of 4 s →
+~85% of the standing time removed (~36 min per full run). STRUCTURAL change (new
+settings + tick-path) → restart-deploy; jar rebuilt clean 08:03.
 
 ### 2026-10-22 (ch) — BREAK-CLEAR RUNG for hidden server-side blocks (user: "NICE IMPROVED, BUT STILL MISED ONCE, I DONT [WANT] ANY MISSED IN FIRST PLACE"; live batch-37 forensics; letter (cg) reserved for the parallel session's pending adaptive-dwell gate)
 

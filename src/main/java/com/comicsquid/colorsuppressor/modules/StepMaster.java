@@ -81,6 +81,7 @@ final class StepMaster {
     byte[] stepDwellPrevPixels;
     int stepDwellQuietTicks;
     int stepDwellChangeCount;
+    int stepDwellMaxGap;
     boolean stepDwellGateFired;
 
     // ECHO CHECKPOINTS (user design, 2026-10-21): slave pass progress counters
@@ -125,6 +126,7 @@ final class StepMaster {
         stepDwellPrevPixels = null;
         stepDwellQuietTicks = 0;
         stepDwellChangeCount = 0;
+        stepDwellMaxGap = 0;
         stepDwellGateFired = false;
         stepMasterSweepCompletionPending = false;
         stepSweepQueuePending = false;
@@ -1056,6 +1058,7 @@ final class StepMaster {
                 stepDwellPrevPixels = snapshotHeldMapColors();
                 stepDwellQuietTicks = 0;
                 stepDwellChangeCount = 0;
+                stepDwellMaxGap = 0;
                 stepDwellGateFired = false;
                 stepMasterWaitTicks = 0;   // the hold gate (if any) just released
                 // The echo feeder keeps unreleased stations OUT of the queue, so an
@@ -1103,6 +1106,10 @@ final class StepMaster {
         }
         if (changes > 0) {
             stepDwellChangeCount += changes;
+            // Largest inter-arrival gap seen this dwell - the [DWELL] log reports
+            // it on release, so a live run MEASURES whether the quiet setting
+            // covers the server's real arrival cadence (healthy: 0-2t gaps).
+            stepDwellMaxGap = Math.max(stepDwellMaxGap, stepDwellQuietTicks);
             stepDwellQuietTicks = 0;
             return;
         }
@@ -1121,7 +1128,7 @@ final class StepMaster {
             stepDwellGateFired = true;
             mod.info("§7[DWELL] §abatch " + stepMasterBatch + " " + stepMasterStage
                 + ": pixel stream quiet - released at §f" + elapsed + "/" + STEP_DWELL_TICKS
-                + "t§7 (" + stepDwellChangeCount + " px arrived).");
+                + "t§7 (" + stepDwellChangeCount + " px arrived, max arrival gap " + stepDwellMaxGap + "t).");
             stepMasterDwellTicks = 2;
         }
     }

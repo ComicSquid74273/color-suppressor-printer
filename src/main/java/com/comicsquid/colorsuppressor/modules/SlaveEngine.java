@@ -344,7 +344,12 @@ final class SlaveEngine {
                         // Arm the ladder ONLY on a real send: code 0 (swap pending /
                         // echo-grace) sends nothing, and a pending armed for it would
                         // expire into a FALSE rejection count and phantom escalations.
-                        mod.engine.placePending.putIfAbsent(target, 10);
+                        // FIRST window 20t (ci): under load Folia's block-update echo
+                        // runs 8-15t (live batch 38: confirms trailed sends 26 vs 43/s
+                        // with 13 escalations in 40 rows — most were healthy cells
+                        // whose echo simply outlived the old 10t window). Escalated
+                        // cells re-arm at 10t in the ladder itself.
+                        mod.engine.placePending.putIfAbsent(target, 20);
                     }
                     else break;  // swap pending or material missing — tick handles it
                 }

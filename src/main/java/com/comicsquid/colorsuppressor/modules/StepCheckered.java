@@ -353,9 +353,9 @@ public class StepCheckered extends Module {
 
     final Setting<Integer> dwellQuietTicks = sgAdvanced.add(new IntSetting.Builder()
         .name("dwell-quiet-ticks")
-        .description("Quiet window (in ticks) with zero pixel changes anywhere on the held map before an adaptive dwell releases early. 20 ticks = 1 full second of server silence.")
-        .defaultValue(20)
-        .sliderRange(5, 40)
+        .description("Minimum quiet window (ticks) with zero pixel changes anywhere on the held map before an adaptive dwell releases early. The server streams a held map's pixels every tick, so a few ticks of dead air after the last change proves the flush finished. A dwell that has seen no changes at all waits double this. 5 ticks = 0.25s.")
+        .defaultValue(5)
+        .sliderRange(2, 40)
         .build()
     );
 
