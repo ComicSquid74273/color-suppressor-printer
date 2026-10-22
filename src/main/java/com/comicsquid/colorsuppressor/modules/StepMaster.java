@@ -9,6 +9,7 @@ import net.minecraft.item.FilledMapItem;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.item.map.MapState;
 import net.minecraft.network.packet.c2s.play.PlayerInteractItemC2SPacket;
 import net.minecraft.screen.CartographyTableScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
@@ -66,6 +67,21 @@ final class StepMaster {
     long stepBuildMs, stepW1Ms, stepBreak2Ms, stepW2Ms, stepBreakAllMs;
     static final int[] STEP_CHECKPOINT_Z = {14, 40, 64, 88, 112};
     static final int STEP_DWELL_TICKS = 80;
+    // PIXEL-ARRIVAL DWELL GATE (user request, 2026-10-22): while the map is held
+    // the server re-renders and pushes every in-range pixel to the client, so
+    // "no byte anywhere in MapState.colors changed for N ticks" proves the
+    // pixels this standing records have ALL arrived. Full-array diff on purpose:
+    // a held map only ever receives updates for pixels within record range of
+    // the holder, so the whole array is the exact superset of anything this
+    // dwell can record - no band model to get wrong, no late pixel can slip
+    // past it. Early release clamps the countdown to 2 so the proven ==1-stow /
+    // ==0-completion choreography runs verbatim; the fixed 80-tick cap stays as
+    // the fail-safe. The gate can only END a dwell early, never extend one.
+    static final int STEP_DWELL_FLOOR_TICKS = 10;
+    byte[] stepDwellPrevPixels;
+    int stepDwellQuietTicks;
+    int stepDwellChangeCount;
+    boolean stepDwellGateFired;
 
     // ECHO CHECKPOINTS (user design, 2026-10-21): slave pass progress counters
     // consumed by the sweep station gate. Written from the TCP reader thread like
@@ -106,6 +122,10 @@ final class StepMaster {
         stepMasterBatch = -1;
         stepMasterDwellTicks = 0;
         stepMasterWaitTicks = 0;
+        stepDwellPrevPixels = null;
+        stepDwellQuietTicks = 0;
+        stepDwellChangeCount = 0;
+        stepDwellGateFired = false;
         stepMasterSweepCompletionPending = false;
         stepSweepQueuePending = false;
         stepPendingSweepLane = -1;
@@ -688,9 +708,20 @@ final class StepMaster {
                     maps.stepStowMap();
                 }
             }
+            // PIXEL-ARRIVAL GATE: only while above the clamp target - a release
+            // sets the countdown to 2, so the ==1 stow / ==0 completion path one
+            // tick later runs byte-for-byte identical to a natural expiry.
+            if (stepMasterDwellTicks > 2 && mod.adaptiveDwell.get()) tickDwellGate();
             stepMasterDwellTicks--;
-            if (stepMasterDwellTicks == 0 && stepMasterSweepCompletionPending) {
-                stepHandleSweepComplete();
+            if (stepMasterDwellTicks == 0) {
+                if (mod.adaptiveDwell.get() && stepDwellPrevPixels != null && !stepDwellGateFired) {
+                    mod.warning("§7[DWELL] §ebatch " + stepMasterBatch + " " + stepMasterStage
+                        + ": released at the " + STEP_DWELL_TICKS + "-tick cap - pixel stream never went quiet ("
+                        + stepDwellChangeCount + " px changed).");
+                }
+                if (stepMasterSweepCompletionPending) {
+                    stepHandleSweepComplete();
+                }
             }
             return;
         }
@@ -1022,6 +1053,10 @@ final class StepMaster {
                     return;
                 }
                 stepMasterDwellTicks = STEP_DWELL_TICKS;
+                stepDwellPrevPixels = snapshotHeldMapColors();
+                stepDwellQuietTicks = 0;
+                stepDwellChangeCount = 0;
+                stepDwellGateFired = false;
                 stepMasterWaitTicks = 0;   // the hold gate (if any) just released
                 // The echo feeder keeps unreleased stations OUT of the queue, so an
                 // empty queue no longer means "sweep over" - only the tagged final
@@ -1032,6 +1067,62 @@ final class StepMaster {
             default -> {
                 if (mod.debugPrints.get()) mod.info("Unknown step master checkpoint action: " + action);
             }
+        }
+    }
+
+    /** Copy of the held map's colour array (the same bytes /status dumps as
+     *  mapPixels), or null when no filled map is readable right now. */
+    private byte[] snapshotHeldMapColors() {
+        MapState ms = Utils.getHeldMapState();
+        if (ms == null) return null;
+        byte[] snap = new byte[ms.colors.length];
+        System.arraycopy(ms.colors, 0, snap, 0, snap.length);
+        return snap;
+    }
+
+    /** PIXEL-ARRIVAL GATE: one dwell tick of the quiescence check. Any changed
+     *  byte anywhere in the held map's colours resets the quiet timer; once the
+     *  stream has been silent for the configured window (after a small floor so
+     *  the first render packets always get a chance to arrive), the dwell
+     *  releases early. Unreadable map this tick = plain countdown, never an
+     *  extension and never a crash. */
+    private void tickDwellGate() {
+        if (stepDwellPrevPixels == null) {
+            stepDwellPrevPixels = snapshotHeldMapColors();
+            return;
+        }
+        MapState ms = Utils.getHeldMapState();
+        if (ms == null) return;
+        byte[] cur = ms.colors;
+        int changes = 0;
+        for (int i = 0; i < cur.length && i < stepDwellPrevPixels.length; i++) {
+            if (cur[i] != stepDwellPrevPixels[i]) {
+                stepDwellPrevPixels[i] = cur[i];
+                changes++;
+            }
+        }
+        if (changes > 0) {
+            stepDwellChangeCount += changes;
+            stepDwellQuietTicks = 0;
+            return;
+        }
+        stepDwellQuietTicks++;
+        // COLD-START RULE: once ANY byte has changed, the render stream provably
+        // started, so silence after activity means it finished. A dwell that has
+        // seen ZERO changes can also mean "the server has not started flushing
+        // yet" (hold swap just landed / region hiccup) - releasing that on the
+        // short window could strand un-flushed pixels outside every later
+        // station's band, so the cold case demands double silence (2s).
+        int quiet = stepDwellChangeCount > 0
+            ? mod.dwellQuietTicks.get()
+            : 2 * mod.dwellQuietTicks.get();
+        int elapsed = STEP_DWELL_TICKS - stepMasterDwellTicks;
+        if (elapsed >= STEP_DWELL_FLOOR_TICKS && stepDwellQuietTicks >= quiet) {
+            stepDwellGateFired = true;
+            mod.info("§7[DWELL] §abatch " + stepMasterBatch + " " + stepMasterStage
+                + ": pixel stream quiet - released at §f" + elapsed + "/" + STEP_DWELL_TICKS
+                + "t§7 (" + stepDwellChangeCount + " px arrived).");
+            stepMasterDwellTicks = 2;
         }
     }
 

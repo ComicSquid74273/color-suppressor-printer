@@ -740,22 +740,40 @@ final class BreakPlaceEngine {
                 if (rejects == CONFIRMED_PRINT_REJECTS) {
                     mod.info("§e[CONFIRM-PRINT]§7 " + pending.toShortString() + " rejected "
                         + rejects + "x - holding for a standing confirmed send.");
-                    // DROP RESCUE (live batch 36 root cause): the server rejects a
-                    // placement clipping an entity — a leftover drop INSIDE the cell
-                    // blocks every send, standing or not, until collected. Walk onto
-                    // it (vanilla proximity pickup en route), then the resumed leg's
-                    // standing re-send lands. addFirst keeps the print leg queued;
-                    // "printDropPickup" is outside adaptivePaceHold's leg scope so
-                    // the escalation pin does not deadlock the walk. Sub-floor drops
-                    // route to the recovery dig instead.
-                    ItemEntity blocker = mod.slave.scan.findDropInCell(pending);
-                    if (blocker != null && !mod.slave.scan.isSubFloorDrop(blocker)
-                        && !mod.checkpoints.isEmpty()
-                        && !"printDropPickup".equals(mod.checkpoints.getFirst().getRight().getLeft())) {
-                        mod.checkpoints.addFirst(new Pair(new Vec3d(blocker.getX(), blocker.getY(), blocker.getZ()),
-                            new Pair("printDropPickup", null)));
-                        mod.info("§e[CONFIRM-PRINT]§7 cell blocked by a ground drop - walking onto it to pick it up, then re-printing.");
+                    tryDropRescue(pending);
+                } else if (rejects == 3) {
+                    // BREAK-CLEAR RUNG (2026-10-22 (ch), live batch 37's lone miss:
+                    // Brown Concrete (-374,99,-226) rejected 12+ sends across the
+                    // print pass AND both repair passes — standing at dz -3.6
+                    // included — with no drop in the cell and the client reading
+                    // air the whole time). When converged standing sends keep
+                    // failing, the SERVER sees something in the cell the client
+                    // cannot: a hidden server-side block (inverse ghost) or an
+                    // encased entity. Every placement into an occupied server cell
+                    // is rejected forever — re-sending can never fix it — so break
+                    // it instead. A SPLIT pair, deliberately NOT a same-tick pair:
+                    // the server validates the STOP against ITS own state, and a
+                    // hidden concrete-class block (delta 0.648) can never clear the
+                    // 0.7 cliff same-tick. On server-air the START is a no-op. The
+                    // STOP+ABORT flush is the ONE split copy, in
+                    // tickBreakConfirmations. The broken block's drop lands in the
+                    // cell and feeds the drop rescue at the next rung.
+                    if (splitPendingPos == null && ensureBestToolFor(pending)) {
+                        syncSelectedSlotNow();
+                        mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(
+                            PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, pending, Direction.UP));
+                        mc.player.swingHand(Hand.MAIN_HAND);
+                        splitPendingPos = pending;
+                        splitStopDueTick = tickIndex + 2;   // elapsed+1 = 3 server ticks: every palette delta with its proper tool clears 0.7
+                        mod.info("§e[CONFIRM-PRINT]§7 " + pending.toShortString()
+                            + " rejects standing sends - break-clearing the cell (hidden server-side block or encased entity?).");
                     }
+                } else if (rejects == 4) {
+                    // post-break-clear re-check: the cleared block's own drop just
+                    // appeared inside the cell (and a drop whose pickup delay made
+                    // it invisible to the ==2 check becomes pickupable by now) —
+                    // collect it, then the standing re-send lands
+                    tryDropRescue(pending);
                 } else if (rejects == 5) {
                     mod.warning("§6[CONFIRM-PRINT]§c PERSISTENT REJECTION: " + pending.toShortString()
                         + " rejected " + rejects + "x even standing - the pace-hold watchdog will release it to the repair pass.");
@@ -772,6 +790,24 @@ final class BreakPlaceEngine {
                 + "§3 expired-rejected=§e" + rejectedThisTick
                 + "§3 inFlight=" + placePending.size() + " rejectedCells=" + placeRejects.size());
         }
+    }
+
+    /** One shared rung of the place ladder (live batch 36 root cause): the server
+     *  rejects a placement clipping an entity, so a drop sitting INSIDE the
+     *  rejected cell blocks every send — standing or not — until collected. Walk
+     *  onto the drop (vanilla proximity pickup en route), then the resumed leg's
+     *  standing re-send lands. addFirst keeps the print leg queued;
+     *  "printDropPickup" is outside adaptivePaceHold's leg scope so the escalation
+     *  pin cannot deadlock the walk; sub-floor drops route to the recovery dig
+     *  instead; the head-check prevents stacking while one pickup is queued. */
+    private void tryDropRescue(BlockPos cell) {
+        ItemEntity blocker = mod.slave.scan.findDropInCell(cell);
+        if (blocker == null || mod.slave.scan.isSubFloorDrop(blocker)) return;
+        if (mod.checkpoints.isEmpty()) return;
+        if ("printDropPickup".equals(mod.checkpoints.getFirst().getRight().getLeft())) return;
+        mod.checkpoints.addFirst(new Pair(new Vec3d(blocker.getX(), blocker.getY(), blocker.getZ()),
+            new Pair("printDropPickup", null)));
+        mod.info("§e[CONFIRM-PRINT]§7 cell blocked by a ground drop - walking onto it to pick it up, then re-printing.");
     }
 
     /** ROLLING HOTBAR LOOKAHEAD — Belady WITH stack arithmetic (user rule
@@ -1010,6 +1046,10 @@ final class BreakPlaceEngine {
             // Skip positions on placement cooldown (litematica-style: don't hammer the
             // same failed block — let the timeout expire, then retry)
             if (placementCooldowns.getOrDefault(pos, 0) > 0) continue;
+            // Mid break-clear (2-tick window): a place landing now would hand the
+            // split's STOP our own fresh block to break — the ladder re-sends it
+            // the moment the clear completes.
+            if (pos.equals(splitPendingPos)) continue;
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist > placeClamp) continue;
             // SELF-COLLISION MARGIN (live hammer loop: same floor block re-sent

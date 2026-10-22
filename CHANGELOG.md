@@ -93,6 +93,99 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-10-22 (cg) — PIXEL-ARRIVAL DWELL GATE: master leaves a checkpoint the moment the held map's pixel stream goes quiet (user: "MASTER HELD THE MAPS AT EVERY CHECKPOINTS, FOR SOME TIME, ITS SOO LONG, WHICH IS DEDRADING OUR 90 MINUTES OPTIMIZATION... MAKING SURE WE DONT LOST ANY PIXEL. ONE PIXEL LOST AND WHOLE MAPS GETS DISCARDED.")
+
+**The waste:** every sweep station burned a blind fixed `STEP_DWELL_TICKS = 80`
+(4 s) hold — ~640 dwells over a full run ≈ 42 minutes of pure standing, with no
+connection to whether the pixels had already arrived.
+
+**The signal (already on the master, zero new infrastructure):** while the map
+is held, the server re-renders and pushes every in-range pixel to the client —
+the exact bytes `/status` dumps as `mapPixels` (`Utils.getHeldMapState()` →
+`MapState.colors`). "Did pixels arrive" is a byte-diff of that array.
+
+**The law that makes a quiet array a PROOF (not a heuristic):** a held map only
+ever receives updates for pixels within record range (~128.5) of the holder.
+So the FULL 16384-byte array is the exact superset of anything the current
+standing can record — diffing all of it needs NO band/kernel model, so no
+modelling bug can ever hide a late pixel. Anything the slave does farther out
+cannot touch the array at all; anything marginal inside keeps the timer
+running (the gate waits, it can never lose a pixel).
+
+**Implementation (StepMaster, build green, NOT deployed/committed):**
+- dwell start (`stepDwell`/`stepDwellFinal` handler): snapshot the whole colour
+  array, zero the quiet/change counters;
+- each dwell tick (`tickDwellGate`): diff current vs snapshot in place; any
+  changed byte resets the quiet timer; release once `elapsed >= 10` (floor, so
+  the first render packets always get a chance) AND the stream has been quiet.
+  COLD-START RULE: a dwell that has SEEN changes needs quiet ≥ `dwell-quiet-ticks`
+  (new setting, default 20 = 1 s — silence after activity proves the flush
+  finished); a dwell that has seen ZERO changes needs 2× that (2 s), because
+  "quiet from tick 0" can also mean the server has not started flushing yet
+  (hold swap just landed / region hiccup), and releasing a not-yet-started
+  flush could strand pixels outside every later station's band.
+  Release CLAMPS the countdown to 2, so the proven `==1`-stow → `==0`-complete
+  choreography (incl. batch-0 hold-through exemption and sweep completion)
+  runs byte-for-byte identical to a natural expiry — one tick later, nothing
+  else changes;
+- the fixed 80-tick cap stays untouched as the fail-safe: the gate can only
+  END a dwell early, never extend one. Unreadable map this tick → plain
+  countdown (never a crash, never a hang);
+- telemetry: every early release logs `[DWELL] batch N STAGE: pixel stream
+  quiet - released at T/80t (M px arrived)`; a dwell that hits the cap with
+  the stream still live logs a `[DWELL]` WARNING with the change count — that
+  line is the tell for sustained in-range streaming (e.g. the marginal
+  next-pair lane at ~127 blocks) and the data hook for any future v2.
+
+**Settings (Advanced group):** `adaptive-dwell` (default ON) + `dwell-quiet-ticks`
+(default 20). With the OFF toggle the flow is bit-identical to (cf).
+
+**Ordering safety re-audited:** all downstream transitions are event-driven, not
+time-driven — W1 completion still stows BEFORE break(2) is sent, W2 still gates
+on break2done/echo, the batch-0 S-fill terminus still needs pass-done. Nothing
+anywhere assumes the master was slow.
+
+**Expected effect:** dwell ≈ flush time + 1 s instead of 4 s → roughly half the
+standing time removed (~20+ minutes per full run). STRUCTURAL change (new
+settings + tick-path) → restart-deploy; jar rebuilt clean 07:32.
+
+### 2026-10-22 (ch) — BREAK-CLEAR RUNG for hidden server-side blocks (user: "NICE IMPROVED, BUT STILL MISED ONCE, I DONT [WANT] ANY MISSED IN FIRST PLACE"; live batch-37 forensics; letter (cg) reserved for the parallel session's pending adaptive-dwell gate)
+
+**Live evidence (slave log 07:15-07:19, (ce) jar):** batch 36 printed 644/644
+clean; batch 37's pass fired ~30 genuine `[CONFIRM-PRINT]` escalations — the
+ghost-fixed ladder working — and every one resolved via standing sends, except
+ONE cell: `Brown Concrete (-374,99,-226)` — 12+ sends across the pass AND both
+repair passes, from dz +2.1 to −3.6, walking and standing converged, ALL
+server-rejected; no drop in the cell; client read air the whole time; verify →
+1 missing → repair passes failed too → STOP for diagnosis.
+
+**Root cause:** when converged standing sends keep failing with the client
+reading air and no visible blocker, the SERVER has something in the cell the
+client cannot see — a hidden server-side block (inverse ghost) or an encased
+entity. Every placement into an occupied server cell is rejected forever, so no
+amount of re-sending (the only tool the ladder had) can ever clear it.
+
+**Fix — the ladder gains rungs:**
+- **rejects 2** — escalation pin + drop rescue (existing, now the shared
+  `tryDropRescue`).
+- **rejects 3 — BREAK-CLEAR:** a SPLIT pair into the cell (START now, STOP+ABORT
+  at +2 ticks via the one split-flush copy). Deliberately NOT a same-tick pair:
+  the server validates the STOP against ITS own state, and a hidden
+  concrete-class block at delta 0.648 can never clear the 0.7 cliff same-tick;
+  elapsed+1 = 3 server ticks clears every palette delta with its proper tool
+  (ensureBestToolFor + slot sync first). On server-air the START is a harmless
+  no-op. The broken block's drop lands in the cell and feeds the next rung.
+- **rejects 4 — drop re-check:** the break-clear's own drop (or a drop whose
+  pickup delay hid it from the ==2 check) gets the walk-to-pickup leg.
+- **rejects 5** — persistent warning → watchdog → repair (unchanged).
+- The placement picker skips the cell during its 2-tick clear window (a place
+  landing then would hand the STOP our own fresh block to break).
+- **Repair passes re-arm the ladder:** `placeRejects.clear()` at the repair
+  route build (spent exact-count rungs were inherited silently — the repair
+  pass could never re-escalate or break-clear).
+
+NOT deployed/committed.
+
 ### 2026-10-22 (cf) — BATCH 0 REBUILT: hold-the-map lane-125 walk to the S fill checkpoint; pre-build/split-build DELETED (user: "we dont need pre build for batch 0... master will hold the map throughout walking from N->S")
 
 **Design (user directive):** batch 0 needs exactly ONE special thing — a second FILL

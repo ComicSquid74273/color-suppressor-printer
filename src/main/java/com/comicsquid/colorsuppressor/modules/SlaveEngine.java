@@ -569,6 +569,11 @@ final class SlaveEngine {
             // (same clean feet-level corridor as the main print pass), then
             // proceed to the normal break(2) wait.
             printRepairPending = false;
+            // Re-arm the ladder rungs for the repair pass: rejection counts are
+            // spent by the exact-count hooks (2=escalation pin, 3=break-clear,
+            // 4=drop re-check) — inherited counts would silence them exactly where
+            // a second attempt has the best odds (a fresh walk, fresh world state).
+            mod.engine.placeRejects.clear();
             double repairX = mod.lowerMapCorner.getX() + 2 * mod.currentBatch + 2 + 0.5;  // lane 2 (borrow-west) center
             // FIXED CYCLE: repair pass N->S like the print pass (no mirroring)
             double rStartZ = mod.lowerMapCorner.getZ() - 2;

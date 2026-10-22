@@ -344,6 +344,21 @@ public class StepCheckered extends Module {
         .build()
     );
 
+    final Setting<Boolean> adaptiveDwell = sgAdvanced.add(new BoolSetting.Builder()
+        .name("adaptive-dwell")
+        .description("Release sweep dwells the moment the held map's pixel stream goes quiet - no byte anywhere in the map's colour array changes for the whole quiet window - instead of always burning the full 4s. While the map is held the server only ever updates pixels within record range of the holder, so a quiet full array proves every pixel this standing records has arrived. The 80-tick cap stays as the fail-safe; the gate can only end a dwell early, never extend one.")
+        .defaultValue(true)
+        .build()
+    );
+
+    final Setting<Integer> dwellQuietTicks = sgAdvanced.add(new IntSetting.Builder()
+        .name("dwell-quiet-ticks")
+        .description("Quiet window (in ticks) with zero pixel changes anywhere on the held map before an adaptive dwell releases early. 20 ticks = 1 full second of server silence.")
+        .defaultValue(20)
+        .sliderRange(5, 40)
+        .build()
+    );
+
     // Multi User
 
     final Setting<String> tcpIp = sgMultiUser.add(new StringSetting.Builder()
