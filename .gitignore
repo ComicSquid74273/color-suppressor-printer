@@ -55,4 +55,5 @@ AGENTS.md
 
 CHANGELOG.md
 
-.editorconfig.zcode/
+.editorconfig
+.zcode/
