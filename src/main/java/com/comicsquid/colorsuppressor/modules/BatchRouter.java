@@ -47,7 +47,8 @@ final class BatchRouter {
         mod.currentBatch = k;
         mod.slave.batchPassRetries = 0;
         mod.engine.placementAttempts.clear();
-        mod.engine.placementRetryStart.clear();
+        mod.engine.placePending.clear();
+        mod.engine.placeRejects.clear();
         mod.engine.breakRetryStart.clear();
         mod.slave.scan.collectSkips.clear();
         mod.clearResetPending();   // a new run supersedes any interrupted reset
@@ -174,7 +175,8 @@ final class BatchRouter {
         mod.breakStage = 0;
         mod.slave.printRepairPending = false;
         mod.engine.placementAttempts.clear();
-        mod.engine.placementRetryStart.clear();
+        mod.engine.placePending.clear();
+        mod.engine.placeRejects.clear();
         mod.engine.breakRetryStart.clear();
         mod.clearResetPending();
         // A new run kills any leftover RESET mod.state - a stale mod.fullSweepActive here made

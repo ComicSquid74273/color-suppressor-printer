@@ -54,7 +54,7 @@ relative lane (corner+2.5, its window = lanes 0-3); closing walks corner+127.5
 | # | Phase | What happens | Lane | Direction |
 |---|-------|-------------|------|-----------|
 | 1 | SUPPLY | One trip via north corridor: exact-quantity dump (keep = this build's need, deposit only the excess, 2026-10-21) + refill the deficit + pickaxe (slot 8) + food (offhand) | corridor → station | out & back |
-| 2 | PRINT | **Center on lane 2 first** (lateral `centerLane` leg; placement suppressed until centered), then walk lane 2, litematica-style in-range placement (any direction, nearest first), 4-tick cooldown retry per position; repair pass also from lane 2 | lane 2 | N → S |
+| 2 | PRINT | **Center on lane 2 first** (lateral `centerLane` leg; placement suppressed until centered), then walk lane 2, litematica-style in-range placement (any direction, nearest first), 4t-walking/10t-standing re-send cadence + place-confirmation ladder: in-reach cells never released before server confirm, escalation pin at 2 rejections, watchdog = print-retry-ticks (2026-10-22 (cc)/(cd)); repair pass also from lane 2 | lane 2 | N → S |
 | 3 | SUPPRESS | Wait master break(2) at south end, then walk north breaking west Y2/Y3 only (instamine fastBreak) | lane 2 | S → N |
 | 4 | AWAIT | Wait for master break-all permission at north end — no chest trip (dump removed 2026-10-21; carried materials ride into break-all, overflow self-heals via mid-break/finishBatch/prep deposit triggers) | north end | in place |
 | 5 | RECYCLE | Break-all pass over the whole 4×128×4 window + noobline, drops collected by proximity | lane 2 | N → S → N (batchExit) |
@@ -91,6 +91,87 @@ box (budget renews instead of declaring complete over visible work).
 ---
 
 ## Change history (most recent first)
+
+### 2026-10-22 (cd) — NEVER-RELEASE-IN-REACH + WALKING RE-SEND CADENCE (user: "still, bot misses and move forward, i need a proper fix. without any speed reduction"; forensics: the (cc) jar was deployed but the sighting session printed ZERO blocks — old jar — yet re-review found (cc) still had the walk-off mechanism in it)
+
+**The (ao) retry budget WAS the miss.** `printRetryExpired` (60 ticks from
+first pick) dropped a still-in-reach, still-air cell from EVERY pin scan with
+"repair owns it" — that hand-off is precisely "missed in the first walking".
+Deleted as a movement release entirely: a cell the bot can still act on
+(within the standing send clamp, carried, not body-overlapped) now pins the
+hold until **server-confirmed**, per the user's (ak) rule verbatim ("never
+walk past a block until server confirm — never skip"). Out-of-reach cells
+still fall to the repair pass — the scans' existing distance checks do that
+naturally. `print-retry-ticks` survives, redefined: it is now the WATCHDOG
+bound on one continuous hold (default 60 = 3s, floored at 20) — the single
+release valve for a cell rejecting even standing sends. `placementRetryStart` /
+`printRetryExpired` removed across BreakPlaceEngine / SlaveEngine / BatchRouter.
+
+**Walking re-send cadence 4t / standing 10t — the no-speed-loss half.** A send
+fired while walking races the server's lagged view of a moving bot — that is
+where rejections come from ((ao): 52% of burst placements need >1 send). The
+old uniform 10-tick cooldown left a rejected cell air for 10 ticks while the
+bot outran it, FORCING the stop. Now: 4-tick cadence while the forward key is
+held (a duplicate into a still-in-flight echo is a harmless no-op — server
+canPlace on non-air just rejects; there is no attempt cap anymore), 10 while
+standing (the (bb)/(al) hammer-loop protection). Most rejections now resolve
+on the move, so the pins rarely bind — full pace, no stops in the common case.
+
+**Ladder hardened:** `placePending` is armed ONLY on real sends (was armed
+before `tryPlacingBlock` — swap-delayed non-sends counted as FALSE rejections
+→ phantom escalations); the window opens at the FIRST send per cell
+(putIfAbsent — cadence re-sends never reset it) and expiry re-arms the next
+observation window (rejects keep counting on persistent failure) up to the
+5× warning level, then the cell goes quiet (no warning spam; watchdog/repair
+owns it).
+
+Net behavior on a print pass: place at full walking pace → rejected cells
+re-send within 4 ticks, still on the move → anything STILL unconfirmed pins
+(shell / 2-reject escalation / pass-end drain, all confirm-gated) for standing
+sends → confirm → walk on. The repair pass only ever sees cells that rejected
+3 s of standing sends or left reach. NOT deployed/committed.
+
+### 2026-10-22 (cc) — PLACE-CONFIRMATION LADDER + CONFIRMED-PRINT ESCALATION (user: "printing is not holding the bot until last block, which is in reach, is not been confirmed from server side... if any block which missed and bot did 2 retry and still server not accepted by fast pace, it will do a print for that block with server confirmation, and hold until server confirmation receive")
+
+**The print side got the break side's confirmation bookkeeping.** Until now
+placements had NO server-confirmation tracking at all: the hold was sent-gated
+(`placementCooldowns > 0` never gated movement — `printFrontierWithinGap`), the
+[RATE] line reported place sends with no confirmed counter, and after the
+print-retry-ticks budget a still-air cell was silently handed to the repair pass
+— a second walk — which is exactly the "missed in the first walking" the user
+rejected. Three pieces, all mirroring the break-side patterns:
+
+1. **`placePending` / `placeRejects` (BreakPlaceEngine)** — the place mirror of
+   `breakPending`. Every print send arms a 10-tick echo window
+   (`SlaveEngine.actOnWorkTarget`); `tickPlaceConfirmations()` (ticked next to
+   `tickBreakConfirmations`) closes it when the cell reads non-air (confirmed),
+   counts a rejection when it expires still-air. [RATE] now reports
+   `place X/s sent Y/s confirmed`. Cleared with `placementRetryStart` at
+   beginBatch / beginPriming / buildhalf (`resetForActivation` too); the repair
+   pass deliberately inherits rejection counts.
+2. **Confirm-gated release at the two walk-off points** — (a) AT-GOAL (dir = 0,
+   pass end): the old `SENT - never gates movement` skip in the drain scan now
+   applies only while walking; in-flight sends keep the hold until their echo
+   lands or their window expires, so the leg cannot end on an unconfirmed last
+   block. (b) The trailing-shell pin's iteration source moved from
+   `placementCooldowns.keySet()` to `placePending.keySet()` (unconfirmed
+   in-flight only — confirmed cells are removed on confirm).
+3. **Confirmed-print escalation** — at `CONFIRMED_PRINT_REJECTS` (= 2, the
+   user's "did 2 retry") rejected windows on one cell, a new pin in
+   `printFrontierWithinGap` holds the bot at ANY bearing inside the standing
+   send clamp (the 0.6 trailing shell only catches a cell in its last ~2
+   walking ticks) until the cell reads non-air. No forced picker priority
+   needed: pinned = forward key off = the place clamp opens to full server
+   reach and the nearest-first picker re-sends within one cooldown window — a
+   standing, converged-position send, the one a fast-pace server reliably
+   accepts ((al)'s canPlace lagged-bbox law is why walking re-sends kept
+   racing). Release valves unchanged: confirm, print-retry-ticks budget
+   (repair owns it after that), the 100-tick pace-hold watchdog; persistent
+   rejections warn at 5x.
+
+Walking pace is untouched (sent-gated release mid-approach stays — the (ai)
+speed lesson); the confirm gates only engage where a miss would otherwise be
+walked off: pass end and the escalation threshold.
 
 ### 2026-10-21 (ao) — RETRY WENT TICK-BASED + CONFIGURABLE both sides (user: "IS IT BECAUSE BLOCK IS OUT OF REACH?? CAUSE 3 TIMES SAME BLOCK CANT BE REJECTED. ALSO, MAKE RETRY CONFIGURABLE TICK BASE, WHICH USER CAN MODIFY, FOR BOTH PRINTING AND BREAKING")
 **User's out-of-reach suspicion CONFIRMED by per-send forensics** (batch 31's

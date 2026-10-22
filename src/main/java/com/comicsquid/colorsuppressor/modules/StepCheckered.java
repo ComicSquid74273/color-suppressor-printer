@@ -107,15 +107,15 @@ public class StepCheckered extends Module {
     );
 
     // RETRY TICK BUDGETS (user rule 2026-10-21: "make retry configurable tick base,
-    // for both printing and breaking" - live 13:24 proof the old 3-attempt cap burned
-    // a cell on three marginal sends within 1.5s of sprinting past: one walking
-    // far-edge send, one mid-pass, one at the 4.4 server-reach margin - the cell was
-    // released before the bot ever STOPPED and re-sent from a converged position).
-    // Ticks, not counts: the echo-window cooldown already spaces re-sends 10 ticks
-    // apart, so the budget = how many spaced retries the in-pass loop may spend.
+    // for both printing and breaking"; REDEFINED 2026-10-22 (cd) after the
+    // first-walk-miss forensics: a BUDGET that releases still-in-reach cells to the
+    // repair pass IS the walk-off mechanism — an unconfirmed cell the bot can still
+    // send now pins the hold until server-confirmed, and this setting bounds how
+    // long any single continuous hold may persist (the watchdog) before the cell
+    // is released to the repair pass. 20 ticks = 1s; floored at 20 internally.)
     final Setting<Integer> printRetryTicks = sgGeneral.add(new IntSetting.Builder()
         .name("print-retry-ticks")
-        .description("How long (ticks) an unconfirmed print placement keeps being retried in-pass before the repair pass owns it. 20 ticks = 1s.")
+        .description("How long (ticks) one print hold may persist on an unconfirmed cell before the watchdog releases it to the repair pass. In-reach cells are never released before server confirm otherwise. 20 ticks = 1s.")
         .defaultValue(60)
         .min(0)
         .sliderRange(0, 600)

@@ -321,23 +321,34 @@ final class SlaveEngine {
                 // on a swap/restock need.
                 HashSet<BlockPos> attempted = new HashSet<>();
                 int placed = 0;
+                // RE-SEND CADENCE (2026-10-22 (cd), the no-speed-loss half of the
+                // never-miss fix): a send fired while WALKING races the server's
+                // lagged view of a moving bot — that is where rejections come from
+                // ((ao) forensics: 52% of burst placements need >1 send). A rejected
+                // cell must be re-sent FAST, while it is still inside the walking
+                // clamp, or the bot outruns it and a stop is needed. 4 ticks walking
+                // (a duplicate into a still-in-flight echo is a harmless no-op —
+                // canPlace on non-air just rejects); 10 ticks STANDING, the (bb)/(al)
+                // hammer-loop protection while parked. The rejection LADDER window
+                // (placePending) is decoupled: first send opens a 10-tick observation
+                // window, expiry re-arms the next one — cadence never falsifies it.
+                int cadence = mc.options.forwardKey.isPressed() ? 4 : 10;
                 for (int pick = 0; pick < mod.blocksPerTick.get() * 3 && placed < mod.blocksPerTick.get(); pick++) {
                     BlockPos target = mod.engine.mod.engine.getNextBatchPlacementPos(attempted);
                     if (target == null) break;
                     attempted.add(target);
                     mod.nextBlockPos = target;
-                    // ECHO-WINDOW COOLDOWN (live batch 18 histogram: 52% of burst
-                    // placements need >1 send — 322/619 positions re-sent; the old
-                    // 4-tick cooldown re-fired INTO the server's block-update echo,
-                    // burning attempts on blocks that were already coming). 10 ticks
-                    // = the break side's proven pending window; retries now land
-                    // after the echo had time to arrive. The multi-place loop always
-                    // has other distinct positions to fill the tick with.
-                    mod.engine.placementCooldowns.put(target, 10);
-                    mod.engine.placementAttempts.merge(target, 1, Integer::sum);  // diagnostic (gating is tick-based now)
-                    mod.engine.placementRetryStart.putIfAbsent(target, mod.engine.tickIndex);  // opens the print-retry-ticks window at the FIRST pick
+                    mod.engine.placementCooldowns.put(target, cadence);
+                    mod.engine.placementAttempts.merge(target, 1, Integer::sum);  // diagnostic
                     int code = mod.engine.mod.engine.tryPlacingBlock();
-                    if (code == 1) { placed++; mod.engine.placeSentPerSec++; }
+                    if (code == 1) {
+                        placed++;
+                        mod.engine.placeSentPerSec++;
+                        // Arm the ladder ONLY on a real send: code 0 (swap pending /
+                        // echo-grace) sends nothing, and a pending armed for it would
+                        // expire into a FALSE rejection count and phantom escalations.
+                        mod.engine.placePending.putIfAbsent(target, 10);
+                    }
                     else break;  // swap pending or material missing — tick handles it
                 }
             }
@@ -1187,7 +1198,8 @@ final class SlaveEngine {
                 mod.currentBatch = batch;
                 batchPassRetries = 0;
                 mod.engine.placementAttempts.clear();
-                mod.engine.placementRetryStart.clear();
+                mod.engine.placePending.clear();
+                mod.engine.placeRejects.clear();
                 mod.engine.breakRetryStart.clear();
                 mod.slave.scan.collectSkips.clear();
                 mod.clearResetPending();
@@ -1550,6 +1562,8 @@ final class SlaveEngine {
         reset.armResetFeedTarget();
 
         mod.engine.tickBreakConfirmations();
+
+        mod.engine.tickPlaceConfirmations();
 
         mod.engine.pumpArmedBreakTarget();
 

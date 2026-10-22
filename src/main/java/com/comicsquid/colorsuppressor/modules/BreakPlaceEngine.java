@@ -32,15 +32,23 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
  * placing, distinct-position multi-send for breaking), the hybrid fastBreak/vanilla
  * sender with its confirmation bookkeeping, the adaptive pace governor, the rolling
  * hotbar lookahead, and the on-demand hotbar swap. Owns the per-position cooldown /
- * attempt maps and the break-confirmation queues.
+ * attempt maps and the break- and place-confirmation queues.
  */
 final class BreakPlaceEngine {
     final StepCheckered mod;
 
+    /** Escalation threshold for the confirmed-print pin: after this many expired
+     *  send windows on one cell, the print hold stops the bot for a standing,
+     *  confirm-gated final send (user rule 2026-10-22: "did 2 retry and still
+     *  server not accepted by fast pace, it will do a print for that block with
+     *  server confirmation, and hold until server confirmation receive"). */
+    static final int CONFIRMED_PRINT_REJECTS = 2;
+
     // --- Engine state (moved from the module) ---
-    HashMap<BlockPos, Integer> placementCooldowns;               // litematica-style: retry timer per position
-    HashMap<BlockPos, Integer> placementAttempts;                // per-position placement attempts (diagnostic; gating is tick-based now)
-    HashMap<BlockPos, Integer> placementRetryStart;              // pos -> tickIndex of its first pick: the print-retry-ticks window
+    HashMap<BlockPos, Integer> placementCooldowns;               // litematica-style: retry timer per position (4t walking / 10t standing)
+    HashMap<BlockPos, Integer> placementAttempts;                // per-position placement attempts (diagnostic)
+    HashMap<BlockPos, Integer> placePending;                     // pos -> ticks of the CURRENT echo-observation window (the place mirror of breakPending)
+    HashMap<BlockPos, Integer> placeRejects;                     // pos -> windows that expired with the cell still air (server rejections)
     HashMap<BlockPos, Integer> breakRetryStart;                  // pos -> tickIndex of its first pending expiry: the break-retry-ticks window
     int placeHoldTicks;                                          // consecutive adaptive-pace hold ticks (watchdog)
     int approachHoldTicks;                                       // consecutive break approach-hold ticks (watchdog)
@@ -54,7 +62,7 @@ final class BreakPlaceEngine {
     int tickIndex;                                               // monotonic engine tick (the split-pair clock)
     int lastSyncedSelectedSlot;                                  // selected slot the server has been told about
     int rateTick;                                                // 20-tick rate-report cycle
-    int breakSentPerSec, breakConfirmedPerSec, placeSentPerSec;  // [RATE] verification counters
+    int breakSentPerSec, breakConfirmedPerSec, placeSentPerSec, placeConfirmedPerSec;  // [RATE] verification counters
     int toBeSwappedSlot;                                         // pending on-demand hotbar swap
     Item lastSwappedMaterial;
 
@@ -66,7 +74,8 @@ final class BreakPlaceEngine {
     void resetForActivation() {
         placementCooldowns = new HashMap<>();
         placementAttempts = new HashMap<>();
-        placementRetryStart = new HashMap<>();
+        placePending = new HashMap<>();
+        placeRejects = new HashMap<>();
         breakRetryStart = new HashMap<>();
         placeHoldTicks = 0;
         approachHoldTicks = 0;
@@ -83,19 +92,20 @@ final class BreakPlaceEngine {
         breakSentPerSec = 0;
         breakConfirmedPerSec = 0;
         placeSentPerSec = 0;
+        placeConfirmedPerSec = 0;
         toBeSwappedSlot = -1;
         lastSwappedMaterial = null;
     }
 
-    /** Tick-budget check for a plan cell's print retry window (print-retry-ticks):
-     *  true once tickIndex has moved print-retry-ticks past the cell's FIRST pick.
-     *  Replaces the old attempts>=3 cap (live 13:24: three marginal sends inside
-     *  1.5s of sprinting past burned the budget before any fair stopped retry —
-     *  the repair pass then placed those cells from dz −3.4..−3.6 first try). */
-    boolean printRetryExpired(BlockPos pos) {
-        Integer start = placementRetryStart.get(pos);
-        return start != null && tickIndex - start >= mod.printRetryTicks.get();
-    }
+    // (cd) The old print-retry-ticks BUDGET (window from first pick, expired ->
+    // "repair owns it") is DELETED as a movement release: it was the walk-off
+    // mechanism itself — an in-reach cell whose budget burned on walking sends
+    // was silently handed to the repair pass = the first-walk miss. Doctrine now
+    // is the user's (ak) rule verbatim: a cell the bot can still act on (within
+    // the standing send clamp, carried, not body-overlapped) pins the hold until
+    // SERVER-CONFIRMED; only out-of-reach cells fall to the repair pass (the
+    // scans' distance checks do that naturally), and print-retry-ticks lives on
+    // as the configurable WATCHDOG bound on any single continuous hold.
 
     boolean adaptivePaceHold() {
         if (mod.state.equals(State.Walking) && mod.breakStage == 0 && mod.currentBuildPlan != null
@@ -112,12 +122,14 @@ final class BreakPlaceEngine {
                 || "stepClosingReady".equals(legAction)) {
                 if (printFrontierWithinGap()) {
                     placeHoldTicks++;
-                    if (placeHoldTicks > 100) {
-                        // Safety net only - the attempts cap is the real bound (a block
-                        // sent 10 times without standing is force-released to the repair
-                        // pass, which drops it out of the hold's scan).
+                    // WATCHDOG = print-retry-ticks (cd): the ONE release valve for a
+                    // never-confirming cell (server persistently rejecting even
+                    // standing sends). Floored at 20 so a 0 setting can't
+                    // instant-release every hold; the hold itself releases freely on
+                    // confirm, so this only bites on genuinely stuck cells.
+                    if (placeHoldTicks > Math.max(20, mod.printRetryTicks.get())) {
                         mod.warning("§ePrint pace-hold watchdog: released a " + placeHoldTicks
-                            + "-tick hold - walking on (retrying blocks will trail).");
+                            + "-tick hold - walking on (the repair pass will chase the unconfirmed cell).");
                         placeHoldTicks = 0;
                         return false;
                     }
@@ -133,23 +145,29 @@ final class BreakPlaceEngine {
         return false;
     }
 
-    /** PRINT FORWARD GAP — SENT-GATED (user rules 2026-10-21: "gap 1-2 then
-     *  burst"; then "no walked-past misses" ((w)); then "same fix for placing
-     *  too" after (ai) — the print mirror of the break approach-hold). The
-     *  hold engages at ≤2.0 horizontal from the nearest UN-SENT forward plan
-     *  block and releases the moment everything in reach is placed, SENT
-     *  (on placement cooldown — the send already left; the server air-place
-     *  needs no presence, exactly like a break pair), capped (repair owns it),
-     *  body-overlapped (the picker refuses it — places en route once walked
-     *  off; also the 101-tick watchdog pin), or not carried (swap/supply owns
-     *  it). No echo waiting, no full-sphere drain before each step; blocks-per-
-     *  tick is the drain rate per stop (the place loop sends up to that many
-     *  distinct positions per tick). A failed send resurfaces after its 4-tick
-     *  cooldown and re-gates movement if still ahead; anything that trails
-     *  anyway places en route (any-direction picker) or in the repair pass.
-     *  At-goal (dir = 0, pass end) the 2.0 gate drops — hold until the whole
-     *  in-reach sphere is sent/placed (pass-end semantics). Off-lane the hold
-     *  never engages (the picker's lane gate is closed — the route re-centers). */
+    /** PRINT FORWARD GAP — SENT-GATED while walking, CONFIRM-GATED at the two
+     *  places a miss would be walked off (user rules 2026-10-21: "gap 1-2 then
+     *  burst"; "no walked-past misses" ((w)); "same fix for placing too" after
+     *  (ai); then 2026-10-22: "hold the bot until last block... confirmed from
+     *  server side... if any block did 2 retry and still server not accepted
+     *  by fast pace, do a print for that block with server confirmation, and
+     *  hold until server confirmation receive"). The hold engages at ≤2.0
+     *  horizontal from the nearest UN-SENT forward plan block and releases the
+     *  moment everything in reach is placed, SENT (walking legs — the send
+     *  already left; pace stays), watchdog-bounded (print-retry-ticks; a cell
+     *  rejecting even standing sends goes to the repair pass), body-overlapped
+     *  (the picker refuses it — places en route once walked off), or not
+     *  carried (swap/supply owns it). No echo
+     *  waiting mid-approach; blocks-per-tick is the drain rate per stop. The
+     *  two confirm gates: (1) AT-GOAL (dir = 0, pass end) the 2.0 gate drops
+     *  and in-flight sends keep the hold until their echo lands or their
+     *  window expires — the leg cannot end on an unconfirmed last block;
+     *  (2) CONFIRMED-PRINT ESCALATION — a cell with CONFIRMED_PRINT_REJECTS
+     *  expired windows pins the bot (any bearing inside the standing send
+     *  clamp) until it reads non-air; the next re-send leaves from a
+     *  converged standing position, which is the one a fast-pace server
+     *  reliably accepts. Off-lane the hold never engages (the picker's lane
+     *  gate is closed — the route re-centers). */
     boolean printFrontierWithinGap() {
         // LANE-GATE MIRROR: the placement picker places nothing off the lane-2
         // centreline (wall-in guard) - the hold must not pin the bot either.
@@ -176,9 +194,13 @@ final class BreakPlaceEngine {
         double retryEdge = sendEdge - 0.6;
         int dir = breakTravelDir();
         int botZ = mc.player.getBlockZ();
-        for (BlockPos pos : placementCooldowns.keySet()) {
-            if (!mod.miningBlockState(pos).isAir()) continue;   // landed - confirm seen (was inverted: skipped the real unconfirmed cells and pinned placed ones instead)
-            if (printRetryExpired(pos)) continue;               // tick budget spent - repair owns it, never pin on it
+        // In-flight UNCONFIRMED sends (placePending removes on confirm): the walking
+        // shell pin — a sent-but-rejected cell behind the bot in the last 0.6 before
+        // it leaves server reach. The air check is belt-and-braces against tick-order
+        // drift (was inverted once: skipped the real unconfirmed cells and pinned
+        // placed ones instead).
+        for (BlockPos pos : placePending.keySet()) {
+            if (!mod.miningBlockState(pos).isAir()) continue;   // landed - confirm seen
             double dist = mc.player.getEyePos().distanceTo(pos.toCenterPos());
             if (dist < retryEdge || dist >= sendEdge) continue;       // sendable shell only; beyond send range the repair pass owns it
             if (dir != 0 && (pos.getZ() - botZ) * dir >= 0) continue; // ahead/abeam - being approached, not walked past
@@ -186,7 +208,6 @@ final class BreakPlaceEngine {
         }
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
             if (!mod.miningBlockState(pos).isAir()) continue;                    // placed = done
-            if (printRetryExpired(pos)) continue;                               // repair owns it (print-retry-ticks budget spent - was attempts>=3, which three marginal sprint-past sends could burn in 1.5s without a single fair stopped retry)
             if (mc.player.getBoundingBox().intersects(new Box(pos).expand(0.3))) continue;   // unplaceable while overlapped - MUST mirror the picker's margin (the (al) mismatch pinned the bot 101 ticks on blocks the picker refused but this guard counted)
             Block planned = mod.currentBuildPlan.get(pos);
             if (planned == null || !mod.restock.isMaterialCarried(planned.asItem())) continue;  // supply owns it
@@ -195,13 +216,37 @@ final class BreakPlaceEngine {
             if (dir != 0 && (pos.getZ() - botZ) * dir >= 0) continue; // ahead/abeam - the pacing gap owns the approach, it never pins
             return true;
         }
+        // CONFIRMED-PRINT ESCALATION (user rule 2026-10-22): CONFIRMED_PRINT_REJECTS
+        // expired windows = past fast-pace luck — walking re-sends keep racing the
+        // server's lagged view of the bot's box ((al)'s canPlace law). Pin the bot,
+        // ANY bearing inside the standing send clamp (the 0.6 shell above only
+        // catches a cell in its last ~2 walking ticks), and keep it pinned until the
+        // cell reads non-air. No forced picker priority needed: pinned means the
+        // forward key is off, so the place clamp opens to full server reach and the
+        // nearest-first picker re-sends the cell within one cooldown window. Release
+        // valves unchanged: confirm, print-retry-ticks budget (repair owns it), the
+        // 100-tick pace-hold watchdog.
+        for (BlockPos pos : placeRejects.keySet()) {
+            if (placeRejects.get(pos) < CONFIRMED_PRINT_REJECTS) continue;
+            if (mod.currentBuildPlan.get(pos) == null) continue;          // stale entry - not this plan
+            if (!mod.miningBlockState(pos).isAir()) continue;             // confirmed since - ladder closed
+            if (mc.player.getEyePos().distanceTo(pos.toCenterPos()) >= sendEdge) continue;  // unsendable even standing - repair territory
+            if (mc.player.getBoundingBox().intersects(new Box(pos).expand(0.3))) continue;  // picker refuses overlap - pinning is futile, walk off
+            if (!mod.restock.isMaterialCarried(mod.currentBuildPlan.get(pos).asItem())) continue;  // supply owns it
+            return true;
+        }
         BlockPos nearest = null;
         double nearestH = Double.MAX_VALUE;
         boolean reachBusy = false;
         for (BlockPos pos : mod.currentBuildPlan.keySet()) {
             if (!mod.miningBlockState(pos).isAir()) continue;           // placed = done
-            if (printRetryExpired(pos)) continue;                      // tick budget spent - move off or repair owns it (was attempts>=3)
-            if (placementCooldowns.getOrDefault(pos, 0) > 0) continue;  // SENT - echo in flight - never gates movement
+            // SENT - walking legs keep the pace (the echo lands while the cell is
+            // still being approached). At-goal (dir = 0) the pass-end drain is
+            // CONFIRM-gated instead: an in-flight send keeps the hold until its
+            // echo lands or its window expires (user rule 2026-10-22 - the leg
+            // cannot end on an unconfirmed last block; a rejected send then
+            // re-enters this scan as a normal un-sent cell, standing clamp open).
+            if (dir != 0 && placementCooldowns.getOrDefault(pos, 0) > 0) continue;
             if (dir != 0 && (pos.getZ() - botZ) * dir < -1) continue;   // behind - prints en route
             if (mc.player.getBoundingBox().intersects(new Box(pos).expand(0.3))) continue;  // picker refuses body-overlap - identical margin, or the hold pins on unsendable blocks
             double dx = pos.getX() + 0.5 - mc.player.getX();
@@ -571,11 +616,11 @@ final class BreakPlaceEngine {
         }
         if (++rateTick >= 20) {
             rateTick = 0;
-            if (breakSentPerSec > 0 || breakConfirmedPerSec > 0 || placeSentPerSec > 0) {
+            if (breakSentPerSec > 0 || breakConfirmedPerSec > 0 || placeSentPerSec > 0 || placeConfirmedPerSec > 0) {
                 mod.info("§d[RATE]§7 break §f" + breakSentPerSec + "/s sent §a" + breakConfirmedPerSec
-                    + "/s confirmed§7 | place §f" + placeSentPerSec + "/s sent§7");
+                    + "/s confirmed§7 | place §f" + placeSentPerSec + "/s sent §a" + placeConfirmedPerSec + "/s confirmed§7");
             }
-            breakSentPerSec = 0; breakConfirmedPerSec = 0; placeSentPerSec = 0;
+            breakSentPerSec = 0; breakConfirmedPerSec = 0; placeSentPerSec = 0; placeConfirmedPerSec = 0;
         }
         if (!breakPending.isEmpty()) {
             int confirmedThisTick = 0, expiredThisTick = 0;
@@ -645,6 +690,55 @@ final class BreakPlaceEngine {
         // Clean vanilla-fallback set when blocks break
         if (!needsVanillaBreak.isEmpty()) {
             needsVanillaBreak.removeIf(pos -> mod.miningBlockState(pos).isAir());
+        }
+    }
+
+    /** PLACE-CONFIRMATION LADDER — the print mirror of the break side's pending
+     *  bookkeeping. The FIRST send on a cell opens a 10-tick observation window
+     *  (putIfAbsent — cadence re-sends never reset it); the cell reading non-air
+     *  closes it (the echo landed). An expired window = one REJECTED observation
+     *  — the echo had its chance and the cell is still air. Rejections drive the
+     *  confirmed-print escalation: at CONFIRMED_PRINT_REJECTS the print hold pins
+     *  the bot for a standing final send (see printFrontierWithinGap). The ONE
+     *  bound is the pace-hold watchdog (print-retry-ticks): a cell rejecting
+     *  even standing sends is released to the repair pass — never before. */
+    void tickPlaceConfirmations() {
+        if (placePending.isEmpty()) return;
+        int confirmedThisTick = 0, rejectedThisTick = 0;
+        Iterator<BlockPos> pendingIt = placePending.keySet().iterator();
+        while (pendingIt.hasNext()) {
+            BlockPos pending = pendingIt.next();
+            int ticksLeft = placePending.get(pending) - 1;
+            if (!mod.miningBlockState(pending).isAir()) {
+                pendingIt.remove();
+                placeRejects.remove(pending);   // a confirmed cell's rejection history is spent
+                confirmedThisTick++;
+            } else if (ticksLeft <= 0) {
+                // Window expired still-air = one REJECTED observation window. Re-arm
+                // the next window (rejects keep counting while failure persists) up
+                // to the warning level, then stop cycling — the cell is quiet, the
+                // watchdog release / repair pass owns it, no warning spam.
+                placeRejects.merge(pending, 1, Integer::sum);
+                rejectedThisTick++;
+                int rejects = placeRejects.get(pending);
+                if (rejects == CONFIRMED_PRINT_REJECTS) {
+                    mod.info("§e[CONFIRM-PRINT]§7 " + pending.toShortString() + " rejected "
+                        + rejects + "x at pace - holding for a standing confirmed send.");
+                } else if (rejects == 5) {
+                    mod.warning("§6[CONFIRM-PRINT]§c PERSISTENT REJECTION: " + pending.toShortString()
+                        + " rejected " + rejects + "x even standing - the pace-hold watchdog will release it to the repair pass.");
+                }
+                if (rejects < 5) placePending.put(pending, 10);
+                else pendingIt.remove();
+            } else {
+                placePending.put(pending, ticksLeft);
+            }
+        }
+        placeConfirmedPerSec += confirmedThisTick;
+        if (mod.debugPrints.get() && (confirmedThisTick + rejectedThisTick) > 0) {
+            mod.info("§3[dbg] place-confirmation: §aserver-confirmed=" + confirmedThisTick
+                + "§3 expired-rejected=§e" + rejectedThisTick
+                + "§3 inFlight=" + placePending.size() + " rejectedCells=" + placeRejects.size());
         }
     }
 
