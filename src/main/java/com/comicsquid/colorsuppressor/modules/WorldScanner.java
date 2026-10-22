@@ -305,6 +305,21 @@ final class WorldScanner {
         return null;
     }
 
+    /** A pickupable drop sitting INSIDE one specific plan cell — the unplaceable-
+     *  cell case (live 2026-10-22 batch 36: a reprint after an INTERRUPTED
+     *  collection had ~140 drops still lying in the box; the server rejects a
+     *  placement clipping an entity ((al)'s law), so every send into a
+     *  drop-occupied cell fails until the drop is picked up). Null = clear. */
+    ItemEntity findDropInCell(BlockPos cell) {
+        if (mc.world == null) return null;
+        for (Entity entity : mc.world.getEntities()) {
+            if (!(entity instanceof ItemEntity itemEntity)) continue;
+            if (!isPickupable(itemEntity)) continue;
+            if (BlockPos.ofFloored(itemEntity.getX(), itemEntity.getY(), itemEntity.getZ()).equals(cell)) return itemEntity;
+        }
+        return null;
+    }
+
     void targetGroundItem(ItemEntity item, String reEvalAction) {
         mod.checkpoints.clear();
         mod.checkpoints.add(new Pair(new Vec3d(item.getX(), item.getY(), item.getZ()), new Pair(reEvalAction, null)));
@@ -315,8 +330,16 @@ final class WorldScanner {
         int missing = 0;
         int wrong = 0;
         for (Map.Entry<BlockPos, Block> entry : mod.currentBuildPlan.entrySet()) {
-            BlockState worldState = mod.miningBlockState(entry.getKey());
-            if (worldState.isAir()) missing++;
+            BlockPos pos = entry.getKey();
+            BlockState worldState = mod.miningBlockState(pos);
+            // GHOST-SUSPECT ((ce)): a non-air reading with the send's placement
+            // cooldown still armed can be our own client-side placement PREDICTION —
+            // never certify it. Counted missing so the verify/repair re-checks after
+            // the ghost window; a real block re-verifies clean on the repair pass.
+            boolean ghostSuspect = !worldState.isAir()
+                && mod.engine.placePending.containsKey(pos)
+                && mod.engine.placementCooldowns.getOrDefault(pos, 0) > 0;
+            if (worldState.isAir() || ghostSuspect) missing++;
             else if (!worldState.getBlock().equals(entry.getValue())) wrong++;
         }
         return new int[]{missing, wrong};

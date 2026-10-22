@@ -80,6 +80,14 @@ final class StepMaster {
     boolean stepSweepFeederActive;
     int stepSweepLane, stepSweepStartSpot, stepSweepEndSpot, stepSweepNextSpot, stepSweepDir;
     int stepSweepFedOrdinal = -1;   // ordinal of the most recently queued station (the hold gate reads it)
+    // BATCH 0 HOLD-THROUGH WALK (user design, 2026-10-22): the recording walk rides
+    // lane 125 (the N-gate -> S-fill-checkpoint lane) with the map held the whole
+    // way, ending at the S fill checkpoint. stepSweepExtraFinal = one extra final
+    // dwell waypoint appended by the feeder after the last station; set only for
+    // batch 0's W1. stepBatch0SouthPending gates break(2) until the master has
+    // transited from the S fill checkpoint to the S normal checkpoint (129, z112).
+    Vec3d stepSweepExtraFinal;
+    boolean stepBatch0SouthPending;
 
     StepMaster(StepCheckered mod) {
         this.mod = mod;
@@ -106,6 +114,8 @@ final class StepMaster {
         stepMasterBreak2Sent = false;
         stepMasterBreakAllSent = false;
         stepMasterCloseBreakSent = false;
+        stepSweepExtraFinal = null;
+        stepBatch0SouthPending = false;
         maps.resetForActivation();
         lock.resetForActivation();
         lastMasterCpLog = null;
@@ -142,6 +152,8 @@ final class StepMaster {
         stepMasterBreak2Sent = false;
         stepMasterBreakAllSent = false;
         stepMasterCloseBreakSent = false;
+        stepSweepExtraFinal = null;
+        stepBatch0SouthPending = false;
         maps.resetForActivation();
         lock.resetForActivation();
         stepSlaveReadyBatch = -1;
@@ -244,34 +256,11 @@ final class StepMaster {
             beginStepBatch(firstBatch);
             return;
         }
-        if (!mod.batch0SplitBuild.get()) {
-            // SPLIT DISABLED (user directive 2026-10-20): batch 0 runs the STANDARD
-            // flow like every other batch - build(4) -> W1 -> break(2) -> W2 ->
-            // break-all. No pre-build/priming phase at all.
-            mod.info("§aBatch 0: split-build disabled - running the standard batch flow.");
-            beginStepBatch(0);
-            return;
-        }
-        // UNIFIED BATCH 0, phase 1 (floor half): identical stages and signals to every
-        // other batch - WAIT_BATCH_BUILD, ready:0, then W1 on lane 125 (the batch-0
-        // lane pick in the standard consumer). Only the command differs: "prime" tells
-        // the slave to build the floor half; W1's completion then requests the tops
-        // half (the split-build physics: pair 0's floor must record with no tops above).
-        stepMasterBatch = 0;
-        stepMasterStage = StepMasterStage.WAIT_BATCH_BUILD;
-        stepMasterWaitTicks = 0;
-        stepSlaveReadyBatch = -1;
-        stepSlaveBreak2DoneBatch = -1;
-        stepSlaveDoneBatch = -1;
-        stepEchoBuildCount = 0;
-        stepEchoBreak2Count = 0;
-        stepEchoBatch = 0;
-        stepMasterBreak2Sent = false;
-        stepMasterBreakAllSent = false;
-        stepSendToSlave("prime");
-        stepQueueWaitHere("stepBatchSafe");
-        maps.stepStowMap();
-        mod.info("§aBatch 0 phase 1 (floor half): build requested; waiting in place.");
+        // BATCH 0 (user design, 2026-10-22): NO pre-build. The slave runs the plain
+        // standard build(4); the master's W1 recording walk rides lane 125 holding
+        // the map throughout (see the W1 lane pick), ending at the S fill checkpoint.
+        mod.info("§aBatch 0: standard build + hold-the-map lane-125 walk (no pre-build).");
+        beginStepBatch(0);
     }
 
     void beginStepBatch(int batch) {
@@ -298,15 +287,8 @@ final class StepMaster {
         stepEchoBatch = batch;
         stepMasterBreak2Sent = false;
         stepMasterBreakAllSent = false;
-        if (batch == 0 && mod.batch0SplitBuild.get()) {
-            // MERGED BATCH 0, split mode (resume safety - the fresh-run path goes through
-            // the priming walk merge): floor via the split flow if entered directly.
-            stepSendToSlave("buildhalf:0:f");
-            stepQueueWaitHere("stepBatchSafe");
-            maps.stepStowMap();
-            mod.info("§aStep-checker batch 0: SPLIT build (floor half) requested; waiting in place.");
-            return;
-        }
+        stepBatch0SouthPending = false;
+        stepSweepExtraFinal = null;
         stepSendToSlave("build:" + batch);
         // Build wait: IN PLACE at the nearest platform (the previous batch's W2 already
         // ended on this batch's W1 lane) - map stowed, no repositioning leg
@@ -401,6 +383,23 @@ final class StepMaster {
     void stepFeedSweepStations() {
         if (!stepSweepFeederActive || !mod.checkpoints.isEmpty()) return;
         if (stepSweepNextSpot == stepSweepEndSpot + stepSweepDir) {
+            if (stepSweepExtraFinal != null) {
+                // BATCH 0 W1 TERMINUS (user design, 2026-10-22): one extra final dwell
+                // beyond the last station - the S fill checkpoint (125,115). Its walk
+                // release resolves to the pass-done short-circuit (echo >= 6 is past
+                // the 4-echo max), so the master can only go there once the build is
+                // complete - the user ordering "S fill checkpoint reached before break(2)".
+                int ordinal = Math.abs(stepSweepEndSpot - stepSweepStartSpot) + 1;
+                if (!stepWalkReleased(ordinal)) {
+                    stepWaitTick("echo " + (ordinal + 1) + "/4 (walk to the S fill checkpoint)");
+                    return;
+                }
+                mod.checkpoints.add(new Pair<>(stepSweepExtraFinal, new Pair<>("stepDwellFinal", null)));
+                stepSweepFedOrdinal = ordinal;
+                stepMasterWaitTicks = 0;
+                stepSweepExtraFinal = null;   // consumed exactly once per sweep
+                return;
+            }
             stepSweepFeederActive = false;   // every station queued - the walk finishes itself
             return;
         }
@@ -410,7 +409,9 @@ final class StepMaster {
                 + "/5 of the " + (stepMasterStage == StepMasterStage.BATCH_WALK_B ? "break(2) shadow" : "print shadow") + ")");
             return;
         }
-        boolean isFinal = stepSweepNextSpot == stepSweepEndSpot;
+        // With an extra final queued behind them, the stations are plain dwells -
+        // ONLY the extra final point completes the sweep.
+        boolean isFinal = stepSweepNextSpot == stepSweepEndSpot && stepSweepExtraFinal == null;
         mod.checkpoints.add(new Pair<>(new Vec3d(
             mod.lowerMapCorner.getX() + stepSweepLane + 0.5,
             mod.lowerMapCorner.getY(),
@@ -496,19 +497,25 @@ final class StepMaster {
         if (mod.debugPrints.get()) mod.info("§3[dbg] sweep complete in stage §b" + stepMasterStage);
         switch (stepMasterStage) {
             case BATCH_WALK_A -> {
-                if (stepMasterBatch == 0 && mod.batch0SplitBuild.get() && !stepMasterBreak2Sent) {
-                    // BATCH 0 SPLIT (physics: pair 0's floor must record with no tops above,
-                    // so the build is split around W1): W1 recorded the floor+borrow clean.
-                    // Request the TOPS half now; W2 (on 127) records them. No break(2) for
-                    // batch 0 - W2 IS the tops' first and only record.
+                if (stepMasterBatch == 0) {
+                    // BATCH 0 (user design, 2026-10-22): the lane-125 hold-throughout
+                    // walk finished at the S fill checkpoint - pair 0 (floor + tops)
+                    // and pair 1's recessives are recorded in the one pass. Before
+                    // break(2) starts, transit (map stowed, normal discipline) to the
+                    // S NORMAL checkpoint of the W2 lane; break(2) is sent ON ARRIVAL
+                    // ("stepBatch0South"), then the standard flow takes over.
                     maps.stepStowMap();
-                    stepMasterBreak2Sent = true;   // reuses the flag as "first half done"
-                    stepSlaveReadyBatch = -1;
-                    stepSendToSlave("buildhalf:0:t");
-                    stepMasterStage = StepMasterStage.WAIT_BATCH_BUILD;
+                    stepW1Ms = System.currentTimeMillis() - stepPhaseStartMs;
+                    stepPhaseStartMs = System.currentTimeMillis();
+                    stepMasterStage = StepMasterStage.WAIT_BREAK_2;
                     stepMasterWaitTicks = 0;
-                    stepQueueWaitHere("stepBatchSafe");
-                    mod.info("§aBatch 0: floor recorded - tops half requested.");
+                    stepBatch0SouthPending = true;
+                    mod.checkpoints.clear();
+                    Vec3d southNormal = stepCheckpoint(2 * (stepMasterBatch + 1) + 127, STEP_CHECKPOINT_Z[4]);
+                    mod.checkpoints.add(new Pair<>(southNormal, new Pair<>("stepBatch0South", null)));
+                    prependLatticeTransit(southNormal.x, southNormal.z);
+                    mod.state = State.Walking;
+                    mod.info("§aBatch 0: lane-125 walk complete - moving to the S checkpoint before break(2).");
                     return;
                 }
                 // Standard flow: walk 1 recorded the batch -> break(2) NOW. W2 (the
@@ -527,17 +534,15 @@ final class StepMaster {
                 mod.info("§aBatch " + stepMasterBatch + ": walk 1 complete - break(2) requested; W2 follows its completion.");
             }
             case BATCH_WALK_B -> {
-                // W2 COMPLETE (and break(2) already completed before W2 started).
-                // Batch 0 split flow: NO break(2) exists - breakall directly.
-                // Standard flow: break2done has arrived (W2 was gated on it), so
-                // break-all is requested immediately.
+                // W2 COMPLETE (and break(2) already completed before W2 started):
+                // break2done has arrived (W2 was gated on it), so break-all is
+                // requested immediately.
                 maps.stepStowMap();
                 stepW2Ms = System.currentTimeMillis() - stepPhaseStartMs;
                 stepPhaseStartMs = System.currentTimeMillis();
                 stepMasterStage = StepMasterStage.WAIT_BREAK_ALL;
                 stepMasterWaitTicks = 0;
-                boolean batch0Split = stepMasterBatch == 0 && mod.batch0SplitBuild.get() && stepMasterBreak2Sent;
-                if ((batch0Split || stepSlaveBreak2DoneBatch == stepMasterBatch) && !stepMasterBreakAllSent) {
+                if (stepSlaveBreak2DoneBatch == stepMasterBatch && !stepMasterBreakAllSent) {
                     stepMasterBreakAllSent = true;
                     stepSendToSlave("breakall");
                     mod.info("§aBatch " + stepMasterBatch + ": W2 complete - break-all requested.");
@@ -674,8 +679,14 @@ final class StepMaster {
                     return;
                 }
                 // USER RULE: the map is held ONLY while dwelling at a checkpoint -
-                // the moment this dwell expires, stow before moving to the next one
-                if (stepMasterDwellTicks == 1) maps.stepStowMap();
+                // the moment this dwell expires, stow before moving to the next one.
+                // BATCH 0 EXCEPTION (user design, 2026-10-22): its lane-125 W1 holds
+                // the map THROUGHOUT the walk - dwell expiry keeps holding into the
+                // next leg; the sweep-complete handler stows at the S fill checkpoint.
+                if (stepMasterDwellTicks == 1
+                    && !(stepMasterStage == StepMasterStage.BATCH_WALK_A && stepMasterBatch == 0)) {
+                    maps.stepStowMap();
+                }
             }
             stepMasterDwellTicks--;
             if (stepMasterDwellTicks == 0 && stepMasterSweepCompletionPending) {
@@ -704,12 +715,16 @@ final class StepMaster {
                 // trails the pass: the map is only HELD at a station once the
                 // slave's echo count reaches station+2 (stepHoldReleased), so the
                 // record band stays >= ~21 rows behind the breaking frontier.
-                if (!stepMasterBreak2Sent) {
+                // Batch 0 holds the fallback: break(2) is sent by the "stepBatch0South"
+                // arrival handler, so the slave starts breaking only once the master
+                // stands at the S normal checkpoint (user ordering, 2026-10-22).
+                if (!stepMasterBreak2Sent && !stepBatch0SouthPending) {
                     stepMasterBreak2Sent = true;
                     stepSendToSlave("break2");
                     mod.info("§aBatch " + stepMasterBatch + ": break(2) requested.");
-                } else if (stepSlaveBreak2DoneBatch == stepMasterBatch
-                    || (stepEchoBatch == stepMasterBatch && stepEchoBreak2Count >= 1)) {
+                } else if (stepMasterBreak2Sent
+                    && (stepSlaveBreak2DoneBatch == stepMasterBatch
+                    || (stepEchoBatch == stepMasterBatch && stepEchoBreak2Count >= 1))) {
                     stepBreak2Ms = System.currentTimeMillis() - stepPhaseStartMs;
                     stepPhaseStartMs = System.currentTimeMillis();
                     stepMasterStage = StepMasterStage.BATCH_WALK_B;
@@ -724,21 +739,29 @@ final class StepMaster {
                 // W1 launches on ready (the full-wait fallback) or on print echo
                 // 1/4 - the WALK level. It then trails the print: the map is only
                 // HELD at a station once the slave's echo count reaches station+2
-                // (stepHoldReleased), keeping the record band >= ~21 rows behind
-                // the completeness frontier. Batch 0 split-build keeps its
-                // ready-gated choreography: its W1 records the floor+borrow half
-                // and must not start early.
-                boolean echoLaunch = stepEchoBatch == stepMasterBatch && stepEchoBuildCount >= 1
-                    && !(stepMasterBatch == 0 && mod.batch0SplitBuild.get());
+                // (stepHoldReleased), keeping the record band >= ~21 rows behind the
+                // completeness frontier.
+                boolean echoLaunch = stepEchoBatch == stepMasterBatch && stepEchoBuildCount >= 1;
                 if (stepSlaveReadyBatch == stepMasterBatch || echoLaunch) {
                     stepBuildMs = System.currentTimeMillis() - stepPhaseStartMs;
                     stepPhaseStartMs = System.currentTimeMillis();
                     stepMasterStage = StepMasterStage.BATCH_WALK_A;
-                    // Split mode only: batch 0's W1 rides lane 125 (floor record); every
-                    // other case uses the standard lane 2k+127.
-                    int lane = stepMasterBatch == 0 && mod.batch0SplitBuild.get() && !stepMasterBreak2Sent
-                        ? 125 : 2 * stepMasterBatch + 127;
+                    // BATCH 0 (user design, 2026-10-22): W1 rides lane 125 - the
+                    // N-gate -> S-fill-checkpoint lane - HOLDING THE MAP THROUGHOUT
+                    // (dwells AND transit legs), so lanes 0-3 at 122-125 blocks record
+                    // both classes in one pass; this walk replaces the old pre-build.
+                    // Every other batch uses the standard lane 2k+127.
+                    boolean batch0 = stepMasterBatch == 0;
+                    int lane = batch0 ? 125 : 2 * stepMasterBatch + 127;
                     stepStartSweep(lane, 0, 4);   // W1: fixed N->S
+                    if (batch0) {
+                        stepSweepExtraFinal = stepCheckpoint(125, 115);
+                        if (!maps.stepEnsureMapHeld()) {
+                            abortStepMaster("working map disappeared at the batch-0 walk start");
+                            return;
+                        }
+                        mod.info("§aBatch 0: W1 on lane 125, map held throughout; terminus = S fill checkpoint (125,115).");
+                    }
                     if (!echoLaunch || stepSlaveReadyBatch == stepMasterBatch) {
                         mod.info("§aBatch " + stepMasterBatch + ": build complete - W1 starting.");
                     } else {
@@ -754,8 +777,7 @@ final class StepMaster {
                 }
             }
             case WAIT_BREAK_ALL -> {
-                boolean batch0Split = stepMasterBatch == 0 && mod.batch0SplitBuild.get() && stepMasterBreak2Sent;
-                if (!stepMasterBreakAllSent && (batch0Split || stepSlaveBreak2DoneBatch == stepMasterBatch)) {
+                if (!stepMasterBreakAllSent && stepSlaveBreak2DoneBatch == stepMasterBatch) {
                     stepMasterBreakAllSent = true;
                     stepSendToSlave("breakall");
                     mod.info("§aBatch " + stepMasterBatch + ": break-all requested.");
@@ -882,6 +904,11 @@ final class StepMaster {
 
     void checkMapHoldGuard() {
         if (stepMasterDwellTicks > 0 || maps.controlHoldActive) return;
+        // BATCH 0 EXCEPTION: the lane-125 W1 holds the map through its transit legs
+        // too (that continuous recording is what replaces the old pre-build). Every
+        // other stage - including batch 0's own S->N walk and the post-fill transit -
+        // keeps the guard: moving with the map re-records pixels.
+        if (stepMasterStage == StepMasterStage.BATCH_WALK_A && stepMasterBatch == 0) return;
         Integer heldId = maps.mapIdOf(mc.player.getMainHandStack());
         if (heldId != null && heldId == maps.stepWorkingMapId) {
             maps.stepStowMap();
@@ -913,17 +940,32 @@ final class StepMaster {
             case "stepBatchSafe" -> {
                 if (stepMasterStage == StepMasterStage.WAIT_BATCH_BUILD && stepSlaveReadyBatch == stepMasterBatch) {
                     stepMasterStage = StepMasterStage.BATCH_WALK_A;
-                    // Batch 0 merged flow: the priming walk was W1, so the first sweep
-                    // triggered from this wait is W2 (tops) on lane 127 (direct-resume
-                    // safety: without the flag it is W1 (floor) on 125). Every other
-                    // batch sweeps its standard W1 lane. Direction: from whichever end
-                    // the master is at (record content is direction-independent).
-                    int lane = stepMasterBatch == 0 && mod.batch0SplitBuild.get() && !stepMasterBreak2Sent
-                        ? 125 : 2 * stepMasterBatch + 127;
+                    // Same pick as the tick-level consumer (arrival is only a fallback):
+                    // batch 0 rides lane 125 to the S fill checkpoint; every other
+                    // batch sweeps its standard W1 lane 2k+127, N->S.
+                    boolean batch0 = stepMasterBatch == 0;
+                    int lane = batch0 ? 125 : 2 * stepMasterBatch + 127;
                     stepStartSweep(lane, 0, 4);   // W1: fixed N->S
+                    if (batch0) {
+                        stepSweepExtraFinal = stepCheckpoint(125, 115);
+                        maps.stepEnsureMapHeld();
+                    }
                 } else if (stepMasterStage == StepMasterStage.WAIT_BATCH_BUILD) {
                     // Wait IN PLACE (map stowed - safety from map-closed, not distance)
                     requeueStepWait(stepMasterBatch + 1, "stepBatchSafe");
+                }
+            }
+            case "stepBatch0South" -> {
+                // BATCH 0 (user design, 2026-10-22): the master has reached the S normal
+                // checkpoint of the W2 lane - NOW break(2) may start. W2 itself still
+                // launches from the tick-level consumer on break2done/echo.
+                if (stepMasterStage == StepMasterStage.WAIT_BREAK_2 && stepBatch0SouthPending) {
+                    stepBatch0SouthPending = false;
+                    if (!stepMasterBreak2Sent) {
+                        stepMasterBreak2Sent = true;
+                        stepSendToSlave("break2");
+                        mod.info("§aBatch 0: S checkpoint reached - break(2) requested.");
+                    }
                 }
             }
             case "stepBreak2Point" -> {
@@ -1052,6 +1094,8 @@ final class StepMaster {
         stepSweepQueuePending = false;
         stepSweepFeederActive = false;
         stepSweepFedOrdinal = -1;
+        stepSweepExtraFinal = null;
+        stepBatch0SouthPending = false;
         stepMasterDwellTicks = 0;
         stepMasterSweepCompletionPending = false;
         Utils.setForwardPressed(false);

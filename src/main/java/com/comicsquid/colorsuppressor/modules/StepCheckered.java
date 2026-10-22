@@ -336,17 +336,10 @@ public class StepCheckered extends Module {
         .build()
     );
 
-    final Setting<Boolean> batch0SplitBuild = sgAdvanced.add(new BoolSetting.Builder()
-        .name("batch0-split-build")
-        .description("Split batch 0 into floor/tops halves around W1 (the proven fix for pair 0's floor recording). OFF = batch 0 runs the STANDARD flow exactly like every other batch: build(4) -> W1 -> break(2) -> W2 -> break-all, no pre-build phase.")
-        .defaultValue(false)
-        .build()
-    );
-
     final Setting<Integer> startBatch = sgAdvanced.add(new IntSetting.Builder()
         .name("start-batch")
-        .description("First batch to build in a fresh run - all batches before it are SKIPPED (nothing built, no walks). 0 = start at batch 0; set 1 to test the pipeline from batch 1 onward.")
-        .defaultValue(1)
+        .description("First batch to build in a fresh run - all batches before it are SKIPPED (nothing built, no walks). 0 = full run from batch 0 (batch 0 uses the lane-125 hold-the-map walk); raise it only to test later pipeline stages.")
+        .defaultValue(0)
         .sliderRange(0, 62)
         .build()
     );
@@ -471,7 +464,7 @@ public class StepCheckered extends Module {
 
     final Setting<Boolean> renderMasterArea = sgRender.add(new BoolSetting.Builder()
         .name("render-master-area")
-        .description("Draws the MASTER AREA bounding box (x 124..255, z 12..117 around the platform lattice) and the single ENTRY/EXIT GATE (north-west platform 125,14) in the special-checkpoints color. Inside the box the master moves only along lattice lines; it enters/exits only through the gate.")
+        .description("Draws the MASTER AREA bounding box (x 124..255, z 12..116 around the platform lattice) and the single ENTRY/EXIT GATE (north-west platform 125,14) in the special-checkpoints color. Inside the box the master moves only along lattice lines; it enters/exits only through the gate. The S fill checkpoint (125,115) sits just inside the south edge - it is the terminus of batch 0's hold-the-map walk.")
         .defaultValue(true)
         .visible(() -> render.get())
         .build()
@@ -574,11 +567,13 @@ public class StepCheckered extends Module {
 
     /** MASTER AREA (user rule, 2026-10-20): the platform lattice is a BOUNDED area -
      *  lanes x_rel 125..253 (x = 125+2j), rows z_rel {14,40,64,88,112}, plus the fill
-     *  at the gate too. Inside it the master moves ONLY along lattice lines; the area
-     *  is entered and exited ONLY through the north-west GATE (platform 125,14) -
-     *  never from anywhere else. Violations are logged by the lattice watchdog. */
+     *  spots: the N gate (125,14) where the empty map is filled, and the S fill
+     *  checkpoint (125,115) - the terminus of batch 0's hold-the-map lane-125 walk
+     *  (user design, 2026-10-22). Inside the area the master moves ONLY along lattice
+     *  lines; it is entered and exited ONLY through the north-west GATE (platform
+     *  125,14) - never from anywhere else. Violations are logged by the watchdog. */
     static final int MASTER_AREA_X0 = 124, MASTER_AREA_X1 = 255;
-    static final int MASTER_AREA_Z0 = 12, MASTER_AREA_Z1 = 114;
+    static final int MASTER_AREA_Z0 = 12, MASTER_AREA_Z1 = 116;
 
     private final StepRenderer renderer = new StepRenderer(this);
     final StepMaster master = new StepMaster(this);
@@ -1394,13 +1389,6 @@ public class StepCheckered extends Module {
     /** Consume one queued master command on the slave's client thread. */
 
 
-    /** BATCH 0, phase 1 - the floor half (recessive pairs 0+1). Identical route shape,
-     *  signals and machinery to every other batch: supply -> print pass -> awaitBreak2
-     *  (sends ready:0). The "prime" command is the only difference from "build:0" - it
-     *  builds the floor half that W1 records before the tops exist (split-build
-     *  physics). The supply run fetches the tops materials too, so the tops pass needs
-     *  no refill; mid-print shortages use the emergency restock. */
-
     /** Build the final dominant pair 63 after regular batch 62 has been recycled. */
     /** Builds the RESET ladder from (fromCol, fromSeg) in snake order - one station per
      *  (column, segment) - and appends the two-vantage final verification. */
@@ -1817,11 +1805,6 @@ public class StepCheckered extends Module {
         return stepLayers == null ? new HashMap<>() : stepLayers.assembleBatch(k, lowerMapCorner);
     }
 
-    /** Priming build: recessive-only floor (doc §4). */
-    public HashMap<BlockPos, Block> assemblePriming() {
-        return stepLayers == null ? new HashMap<>() : stepLayers.assemblePriming(lowerMapCorner);
-    }
-
     /** Closing build: dominant pair 63 at corner+2 (doc §4). */
     public HashMap<BlockPos, Block> assembleClosing() {
         return stepLayers == null ? new HashMap<>() : stepLayers.assembleClosing(lowerMapCorner);
@@ -1850,8 +1833,8 @@ public class StepCheckered extends Module {
             }
             if (debugPrints.get()) info("batch " + k + " plan: " + batch.size() + " blocks");
         }
-        info("Batch assembly: §a63 batches§7 = §a" + total + "§7 blocks, priming §a" + assemblePriming().size()
-            + "§7, closing §a" + assembleClosing().size() + "§7 - bounds " + (inBox ? "§aPASS" : "§cFAIL"));
+        info("Batch assembly: §a63 batches§7 = §a" + total + "§7 blocks, closing §a" + assembleClosing().size()
+            + "§7 - bounds " + (inBox ? "§aPASS" : "§cFAIL"));
     }
 
     // Rendering

@@ -234,13 +234,10 @@ final class SlaveEngine {
             echoNextBuild = 1;
             echoNextBreak2 = 1;
         }
-        // Batch 0 split-build keeps its own mid-build choreography (buildhalf) -
-        // its W1 must launch on ready, so that build pass sends no echoes.
-        boolean splitBatch0 = mod.currentBatch == 0 && mod.batch0SplitBuild.get();
         int botZ = mc.player.getBlockZ();
         int cornerZ = mod.lowerMapCorner.getZ();
         boolean inBox = botZ >= cornerZ && botZ <= cornerZ + 127;
-        if (mod.breakStage == 0 && !splitBatch0 && mod.currentBuildPlan != null
+        if (mod.breakStage == 0 && mod.currentBuildPlan != null
             && mod.state.equals(State.Walking) && inBox) {
             int traveled = botZ - cornerZ;   // print: fixed N->S
             while (echoNextBuild <= ECHO_ROW_THRESHOLDS.length && traveled >= ECHO_ROW_THRESHOLDS[echoNextBuild - 1]) {
@@ -1166,72 +1163,6 @@ final class SlaveEngine {
         String[] parts = command.split(":");
         String verb = parts[0];
         switch (verb) {
-            case "prime" -> {
-                if (mod.currentBuildPlan != null && mod.currentBatch < 0) {
-                    removePendingStepCommand();
-                } else if (mod.state == State.StandBy || mod.currentBuildPlan == null) {
-                    removePendingStepCommand();
-                    routes.beginPriming();
-                }
-            }
-            case "buildhalf" -> {
-                // SPLIT-BUILD batch 0 (creative-verified 0+0+0): "buildhalf:0:f" places
-                // floor+borrow (no tops - W1@125 records the floor clean), "buildhalf:0:t"
-                // places the west tops (W2@127 records them; floor frozen at 125.5+).
-                // Works from ANY mod.state - the tops half arrives while the slave waits
-                // in AwaitBreakPermission2 after the floor pass.
-                if (parts.length < 3) { removePendingStepCommand(); return; }
-                Integer batch = parseStepBatch(parts[1]);
-                if (batch == null || batch != 0) { removePendingStepCommand(); return; }
-                boolean tops = "t".equals(parts[2]);
-                removePendingStepCommand();
-                mod.checkpoints.clear();
-                printRepairPending = false;
-                mod.breakStage = 0;
-                mod.break2Permitted = false;
-                mod.breakAllPermitted = false;
-                mod.fullSweepActive = false;
-                HashMap<BlockPos, Block> half = tops
-                    ? mod.stepLayers.assembleTopsHalf(batch, mod.lowerMapCorner)
-                    : mod.stepLayers.assembleFloorHalf(batch, mod.lowerMapCorner);
-                mod.currentBuildPlan = half;
-                mod.currentBatch = batch;
-                batchPassRetries = 0;
-                mod.engine.placementAttempts.clear();
-                mod.engine.placePending.clear();
-                mod.engine.placeRejects.clear();
-                mod.engine.breakRetryStart.clear();
-                mod.slave.scan.collectSkips.clear();
-                mod.clearResetPending();
-                sweepReArmSig = null;
-                sweepWaitRounds = 0;
-                sweepWaitLogged = false;
-                double walkX = mod.lowerMapCorner.getX() + 2.0 * batch + 2.5;
-                if (tops) {
-                    // TOPS half: MINIMAL route - no supply (materials at hand), no break2
-                    // chain. Print pass from whichever side the bot is on, then wait for
-                    // breakall directly. The bot just finished the floor pass, so it's
-                    // already near lane 2 and materials are in inventory.
-                    // FIXED CYCLE: print N->S like every batch (no mirroring)
-                    double startZ = mod.lowerMapCorner.getZ() - 2;
-                    double farZ = mod.lowerMapCorner.getZ() + 128.7;
-                    mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), startZ), new Pair("batchBegin", null)));
-                    mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), farZ), new Pair("printDone", null)));
-                    // "awaitBreak2" (NOT "awaitBreakAll") - only this sends step:ready:N,
-                    // which the master needs to start W2. The breakall handler's batch-0
-                    // split path then picks the slave up from AwaitBreakPermission2.
-                    mod.checkpoints.add(new Pair(new Vec3d(walkX, mod.lowerMapCorner.getY(), farZ), new Pair("awaitBreak2", null)));
-                    routes.prependLaneCentering(walkX);
-                    mod.state = State.Walking;
-                    Utils.setForwardPressed(false);
-                    mod.info("§aBatch 0 split TOPS: §b" + half.size() + "§7 blocks (direct pass, no resupply).");
-                } else {
-                    // FLOOR half: normal batch start (supply + full print route)
-                    routes.beginBatch(batch);
-                    mod.currentBuildPlan = half;
-                    mod.info("§aBatch 0 split FLOOR: §b" + half.size() + "§7 blocks.");
-                }
-            }
             case "build" -> {
                 if (parts.length < 2) {
                     removePendingStepCommand();
@@ -1282,15 +1213,6 @@ final class SlaveEngine {
                 }
             }
             case "breakall" -> {
-                // Batch 0 split flow: breakall arrives while the slave waits at
-                // awaitBreak2 (no break(2) was ever sent). Skip straight to break-all.
-                if (mod.currentBatch == 0 && mod.state == State.AwaitBreakPermission2) {
-                    removePendingStepCommand();
-                    mod.breakAllPermitted = true;
-                    mod.checkpoints.clear();
-                    mod.slave.routes.startBreakAll();
-                    return;
-                }
                 if (mod.state == State.AwaitBreakPermissionAll) {
                     removePendingStepCommand();
                     mod.breakAllPermitted = true;

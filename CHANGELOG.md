@@ -32,11 +32,14 @@ Cartography Table
 
 ```
 IDLE → FETCH_MAP → FILL_MAP → WAIT_FILLED_MAP → pin map id
-  → WAIT_PRIMING_BUILD → PRIMING_WALK (x=125, z14→112, map held)
   → [per batch k = 0..62:]
-      WAIT_BATCH_BUILD → BATCH_WALK_A (x=2k+127, z14→112, dwell 4s, map held)
-                       → BATCH_WALK_B (x=2k+127, z112→14, dwell 4s, map held)
-                       → WAIT_BREAK_2 (signal "step:break2" to slave, stow map, hop east)
+      WAIT_BATCH_BUILD → BATCH_WALK_A (x=2k+127 normally; batch 0 rides x=125
+                         HOLDING THE MAP THROUGHOUT, terminus = S fill checkpoint
+                         (125,115), dwell 4s at stations + map held in transit too)
+                       → WAIT_BREAK_2 (break(2) at W1's end; batch 0 first transits
+                         map-stowed to the S normal checkpoint (129, z112) and sends
+                         break(2) on arrival there)
+                       → BATCH_WALK_B (x=2k+129, z112→14, dwell 4s, map held at dwells)
                        → WAIT_BREAK_ALL (signal "step:breakall" when slave confirms break2done)
                        → next batch (or closing)
   → WAIT_CLOSING_BUILD → CLOSING_WALK (x=253) → WAIT_CLOSING_BREAK
@@ -47,9 +50,8 @@ IDLE → FETCH_MAP → FILL_MAP → WAIT_FILLED_MAP → pin map id
 
 All batch-route phases walk **lane 2 — x = 2k+2.5, the exact center of block 2k+2
 (the borrow-west lane)**: its only blocks are borrow recessives at y2 (above the bot's
-head), so nothing ever sits at feet level on the walking lane. Priming walks the same
-relative lane (corner+2.5, its window = lanes 0-3); closing walks corner+127.5
-(block 127 center, lanes 126-127).
+head), so nothing ever sits at feet level on the walking lane. Batch 0 uses the same
+formula (corner+2.5); closing walks corner+127.5 (block 127 center, lanes 126-127).
 
 | # | Phase | What happens | Lane | Direction |
 |---|-------|-------------|------|-----------|
@@ -60,9 +62,8 @@ relative lane (corner+2.5, its window = lanes 0-3); closing walks corner+127.5
 | 5 | RECYCLE | Break-all pass over the whole 4×128×4 window + noobline, drops collected by proximity | lane 2 | N → S → N (batchExit) |
 | 6 | SWEEP | `batchExit` → `finishBatch()`: combined spatial break+collect of stragglers (loops back to batchExit while any remain), then `step:done:k` | window | in place |
 
-Mid-phase supply runs rebuild the route via `resumeBatchRoute(stage)`, which knows all
-three route shapes: regular batch (2k+2.5), priming (2.5), and closing (127.5 build /
-253.5 break).
+Mid-phase supply runs rebuild the route via `resumeBatchRoute(stage)`, which knows both
+route shapes: regular batch (2k+2.5) and closing (127.5 build / 253.5 break).
 
 ### RESET (full-area clear — checkpoint-batch ladder)
 
@@ -86,11 +87,101 @@ box (budget renews instead of declaring complete over visible work).
 - `targetGroundItem(item, action)` — walk-to-item checkpoint for vanilla pickup
 - `findNearestPrintBoxBlock()` — ring-scan for nearest non-air block in print box
 - `findRegisteredPickaxeItem()` — pickaxe from toolSet or materialDict
-- `assembleBatch(k)` / `assemblePriming()` / `assembleClosing()` — world-coord plans
+- `assembleBatch(k)` / `assembleClosing()` — world-coord plans
 
 ---
 
 ## Change history (most recent first)
+
+### 2026-10-22 (cf) — BATCH 0 REBUILT: hold-the-map lane-125 walk to the S fill checkpoint; pre-build/split-build DELETED (user: "we dont need pre build for batch 0... master will hold the map throughout walking from N->S")
+
+**Design (user directive):** batch 0 needs exactly ONE special thing — a second FILL
+CHECKPOINT at the SOUTH side (the N one is the gate platform (125,14) where the empty
+map is filled; the S one is (125,115), the long-standing fill-spot platform) — because
+that lane (x_rel 125) is 2 blocks closer to the map area than any normal checkpoint
+lane, which puts lanes 0-3 at 122-125 blocks: INSIDE the recessive record range
+(≤ ~125.46). So the master's batch-0 recording walk rides lane 125 (the lane that
+connects the two fill checkpoints) HOLDING THE MAP THROUGHOUT — dwells AND transit
+legs — and that single pass records pair 0's floor, pair 0's tops and pair 1's
+recessives with the tops standing. **This walk replaces the pre-build entirely.**
+
+**Batch-0 choreography (everything else standard):**
+1. Slave: plain `build:0` (full 681 window, normal prep/print route, build echoes on) — the slave is now 100% batch-agnostic.
+2. Master W1 on lane 125 N→S, echo-pipelined like every batch (launch on print echo 1/4 or ready:0; the master is already standing at station 0 = the gate after fill/pin). Map held from walk start through the entire walk (batch-0 exception to the hold-at-dwell rule).
+3. Walk terminus = the S fill checkpoint (125,115): the sweep feeder gained `stepSweepExtraFinal` — one extra `stepDwellFinal` waypoint after station 4 (z112). Its walk/hold releases need echo ≥ 6/7, past the 4-echo max, so they resolve to the pass-done short-circuit (ready:0) — it can only run once the build is complete. While an extra final exists, station 4 loses its `stepDwellFinal` tag (only the extra point completes the sweep).
+4. Sweep complete → map stowed → lattice transit (map-free, normal discipline) to the S NORMAL checkpoint of the W2 lane = `stepCheckpoint(129, 112)` → **on arrival there** (`stepBatch0South` action) `break(2)` is sent — the user's ordering: the master reaches the S normal checkpoint BEFORE the slave starts breaking. The WAIT_BREAK_2 tick-level fallback sender is gated on `stepBatch0SouthPending` so it can't fire early.
+5. From there the flow is stock: W2 S→N on lane 129 (existing formula `2(k+1)+127`, map at dwells only, break2-echo gated) → break-all at N on break2done:0 → slave sweep → done:0 → batch 1's W1 lane is 129 = exactly where W2 already ended. Kernel safety on 129: broken west tops (lanes 0,1) sit at 128.0-129.0 (beyond the ~127.2 dominant record edge — they cannot re-record); lanes 2,3 stay frozen at 126-127 (suppression intact).
+
+**Transit-hold safety argument (why holding through the legs is safe for batch 0):**
+a row transit-recorded slightly ahead of the slave's build frontier is air-scratch; the
+next station's echo-gated dwell re-records that row post-build, and every row of lanes
+0-3 falls inside some station's (or the fill point's) dwell band — so every row's LAST
+recording is always a post-build one. Nothing west of the window exists yet, so there
+is no frozen content to violate; after break(2) the master never holds the map within
+record range of lanes 0,1 again (the hold-guard exemption is scoped to
+BATCH_WALK_A && batch 0 ONLY — W2 and the post-fill transit keep the full guard).
+
+**Deleted with the pre-build (all split/priming machinery, master AND slave):**
+- `batch0-split-build` setting; `start-batch` default 1 → **0** (batch 0 no longer skipped; raise it only to test later stages — note the bots' SAVED configs still carry 1 and must be flipped in the HUD for the test).
+- Master: the split branches in `beginStepPrimingRun`/`beginStepBatch`/`stepHandleSweepComplete` (W-A tops branch, W-B direct-breakall), the echoLaunch exclusion, both split lane-pick conditions.
+- Slave: `"prime"` and `"buildhalf"` command handlers, the breakall-from-awaitBreak2 pickup (the old deadlock fix — moot, break(2) exists again), the batch-0 build-echo suppression (batch 0 now emits echoes like every batch).
+- `BatchRouter.beginPriming`, `StepCheckerLayers.assemblePriming/FloorHalf/TopsHalf`, the `mod.assemblePriming()` wrapper (boot log line updated), stale architecture-header lines here fixed.
+
+**Also:** `MASTER_AREA_Z1` 114 → 116 so the S fill spot counts as in-area (otherwise
+`prependLatticeTransit` from it would misroute via the gate — a long wrong walk north);
+the S fill checkpoint renders as a special point (special-checkpoints color) pre-run and
+throughout batch 0 (useful for the platform-existence check: it's the old fill-spot
+platform at corner+(125, y98, 115) — verify it exists before the first run); new flags
+`stepSweepExtraFinal`/`stepBatch0SouthPending` reset in resetForActivation/
+beginStepMasterRun/beginStepBatch/abortStepMaster.
+
+Known cosmetic: a gated-wait label at the extra final may read "station 6/5" (it
+releases on pass-done, so it rarely shows). Resume = the standard full-batch replay
+(build:0 re-arm re-places, W1 re-records, break(2) re-breaks).
+
+Verification gate before commit: restart-deploy (structural), platform pre-check, then
+RESET → START ALL with start-batch 0; `/status` mapPixels diff for lanes 0-3
+(dom pair 0 + floor + rec pair 1) vs the NBT-derived expectation must be 0 mismatches.
+NOT deployed, NOT committed (also in the tree, uncommitted: the parallel (ce)
+BreakPlaceEngine/WorldScanner work — builds green together).
+
+### 2026-10-22 (ce) — GHOST-BLINDED ORACLE FIXED + DROP-BLOCKED-CELL RESCUE (user: "DIDNT WORKED"; live batch-36 forensics — the run that finally proved it)
+
+**Live evidence (slave log 06:16-06:27):** batch 36 printed 644/644 CLEAN twice
+(06:18:37, 06:23:19) with the (cd) jar — cadence re-sends visible, confirms ≈
+sends. Then the user toggled the module OFF mid-collection (06:25:44, ~140
+drops uncollected in the box), re-enabled, and the reprint (06:26:08-32) ended
+**19 missing → repairs fixed 5 → 14 still missing → STOP** — while the ladder
+logged **zero rejections the entire run**. Cells like (-375,101,-217) were
+re-sent across all three passes over 40 s without one rejection count.
+
+**Root cause 1 — the confirmation oracle was client-PREDICTED, not server
+truth:** `interactBlock` ghost-writes the placed block into the client world at
+send time; a server-rejected place reads non-air for a few ticks, then reverts.
+`tickPlaceConfirmations` confirmed on raw world state → every ghost closed its
+window with a FALSE confirm → rejections never counted → escalation never fired
+→ the bot walked off "confirmed" ghosts that reverted behind it. Fix: a real
+confirm now requires the block to OUTLIVE the send's own ghost window (non-air
+AND placement cooldown expired); non-air with the cooldown still armed extends
+the window by 4 instead. `planDefects` also refuses to certify a ghost-suspect
+cell (non-air + pending open + cooldown armed counts missing → repair
+re-verifies; real blocks pass clean).
+
+**Root cause 2 — drop-occupied cells are server-unplaceable:** per (al)'s law
+the server rejects a placement clipping an entity, so a leftover drop INSIDE a
+plan cell blocks every send — standing or walking — until collected. The two
+clean prints had no drops; the reprint after the interrupted collection did
+(the 5 fixed by repairs = drops picked up en route; the 14 = drops still in
+their cells). Fix: `WorldScanner.findDropInCell`; at escalation (2 genuine
+rejections) the ladder inserts a `printDropPickup` walk-to-drop checkpoint
+(addFirst — print leg stays queued; outside adaptivePaceHold's leg scope so the
+escalation pin can't deadlock the walk; sub-floor drops left to the recovery
+dig), the bot collects it, and the resumed leg's standing re-send lands.
+
+With a truthful oracle the whole (cc)/(cd) chain now actually engages:
+genuine rejections → `[CONFIRM-PRINT]` → standing confirm-gated send →
+drop rescue when a drop is the blocker → persistent 5× warning → watchdog →
+repair. NOT deployed/committed.
 
 ### 2026-10-22 (cd) — NEVER-RELEASE-IN-REACH + WALKING RE-SEND CADENCE (user: "still, bot misses and move forward, i need a proper fix. without any speed reduction"; forensics: the (cc) jar was deployed but the sighting session printed ZERO blocks — old jar — yet re-review found (cc) still had the walk-off mechanism in it)
 

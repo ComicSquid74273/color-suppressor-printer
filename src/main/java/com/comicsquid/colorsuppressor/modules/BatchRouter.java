@@ -166,46 +166,6 @@ final class BatchRouter {
         prependNorthCorridor(walkX);
     }
 
-    void beginPriming() {
-        if (!mod.initialSetup()) {
-            mod.state = State.StandBy;
-            return;
-        }
-        mod.currentBatch = 0;
-        mod.breakStage = 0;
-        mod.slave.printRepairPending = false;
-        mod.engine.placementAttempts.clear();
-        mod.engine.placePending.clear();
-        mod.engine.placeRejects.clear();
-        mod.engine.breakRetryStart.clear();
-        mod.clearResetPending();
-        // A new run kills any leftover RESET mod.state - a stale mod.fullSweepActive here made
-        // the first mid-run supply run resurrect the dead reset ladder over the priming
-        mod.fullSweepActive = false;
-        mod.checkpoints.clear();
-        mod.state = State.Walking;
-
-        // Lane 2 center, same as the regular batches: block 2 of the 4-lane window
-        // (lanes 0-3), i.e. corner.x + 2.5 — the borrow-west lane, feet-level clean.
-        double stagingX = mod.lowerMapCorner.getX() + 2.5;
-        double northZ = mod.lowerMapCorner.getZ() - 2;
-        double southZ = mod.lowerMapCorner.getZ() + 128.7;
-        HashMap<BlockPos, Block> floorPlan = mod.assemblePriming();
-        if (mod.stepLayers != null) {
-            StepCheckerLayers.addLayerAt(floorPlan, mod.stepLayers.domLayers.get(0), mod.lowerMapCorner, 2);   // merged batch-0 supply basis
-        }
-        mod.currentBuildPlan = floorPlan;
-        queueStepBuildPreparation(stagingX);
-        mod.currentBuildPlan = mod.assemblePriming();   // the actual print plan (floor only)
-        // FIXED CYCLE: print N->S like every batch (no mirroring - see beginBatch)
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), northZ), new Pair("batchBegin", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), southZ), new Pair("printDone", null)));
-        mod.checkpoints.add(new Pair(new Vec3d(stagingX, mod.lowerMapCorner.getY(), southZ), new Pair("awaitBreak2", null)));
-        prependLaneCentering(stagingX);
-        prependNorthCorridor(stagingX);
-        mod.info("§aBatch 0 floor half: §b" + mod.currentBuildPlan.size() + "§7 blocks planned.");
-    }
-
     void beginClosing() {
         if (!mod.initialSetup()) {
             mod.state = State.StandBy;

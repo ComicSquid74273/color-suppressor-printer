@@ -6,16 +6,19 @@ import com.comicsquid.colorsuppressor.interfaces.IClientPlayerInteractionManager
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
+import net.minecraft.entity.ItemEntity;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.util.Hand;
+import net.minecraft.util.Pair;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -694,14 +697,19 @@ final class BreakPlaceEngine {
     }
 
     /** PLACE-CONFIRMATION LADDER — the print mirror of the break side's pending
-     *  bookkeeping. The FIRST send on a cell opens a 10-tick observation window
-     *  (putIfAbsent — cadence re-sends never reset it); the cell reading non-air
-     *  closes it (the echo landed). An expired window = one REJECTED observation
-     *  — the echo had its chance and the cell is still air. Rejections drive the
-     *  confirmed-print escalation: at CONFIRMED_PRINT_REJECTS the print hold pins
-     *  the bot for a standing final send (see printFrontierWithinGap). The ONE
-     *  bound is the pace-hold watchdog (print-retry-ticks): a cell rejecting
-     *  even standing sends is released to the repair pass — never before. */
+     *  bookkeeping, GHOST-BLINDED no more (2026-10-22 (ce), live batch 36: a run
+     *  with 14 permanently-missing cells logged ZERO rejections). The trap:
+     *  interactBlock PREDICTS the placement client-side — a sent cell reads
+     *  non-air the next tick even when the server rejects it, and the ghost
+     *  reverts to air a few ticks later. Confirming on raw world state closed
+     *  every window with a false confirm, so rejections never counted, the
+     *  escalation never fired, and the bot walked off "confirmed" ghosts. A
+     *  REAL confirm now requires the block to OUTLIVE the send's own ghost
+     *  window (placement cooldown still armed = the non-air may be our own
+     *  prediction). Window expiry = genuine rejection -> escalation; a drop
+     *  sitting inside the cell (interrupted-collection leftovers) blocks every
+     *  server place until picked up — the escalation walks the bot onto the
+     *  drop to collect it, then the standing re-send lands. */
     void tickPlaceConfirmations() {
         if (placePending.isEmpty()) return;
         int confirmedThisTick = 0, rejectedThisTick = 0;
@@ -709,21 +717,45 @@ final class BreakPlaceEngine {
         while (pendingIt.hasNext()) {
             BlockPos pending = pendingIt.next();
             int ticksLeft = placePending.get(pending) - 1;
-            if (!mod.miningBlockState(pending).isAir()) {
+            boolean nonAir = !mod.miningBlockState(pending).isAir();
+            if (nonAir && placementCooldowns.getOrDefault(pending, 0) <= 0) {
+                // block present AND past the send's own ghost window = server-confirmed
                 pendingIt.remove();
                 placeRejects.remove(pending);   // a confirmed cell's rejection history is spent
                 confirmedThisTick++;
+            } else if (nonAir) {
+                // our own predicted ghost with the cooldown still armed - wait it
+                // out; the server's verdict (standing block or revert) shows up
+                // before this extension expires
+                placePending.put(pending, Math.max(ticksLeft, 4));
             } else if (ticksLeft <= 0) {
-                // Window expired still-air = one REJECTED observation window. Re-arm
-                // the next window (rejects keep counting while failure persists) up
-                // to the warning level, then stop cycling — the cell is quiet, the
-                // watchdog release / repair pass owns it, no warning spam.
+                // Window expired still-air = one genuinely REJECTED observation
+                // window (ghost window excluded above). Re-arm the next window
+                // (rejects keep counting while failure persists) up to the warning
+                // level, then stop cycling — the cell is quiet, the watchdog
+                // release / repair pass owns it, no warning spam.
                 placeRejects.merge(pending, 1, Integer::sum);
                 rejectedThisTick++;
                 int rejects = placeRejects.get(pending);
                 if (rejects == CONFIRMED_PRINT_REJECTS) {
                     mod.info("§e[CONFIRM-PRINT]§7 " + pending.toShortString() + " rejected "
-                        + rejects + "x at pace - holding for a standing confirmed send.");
+                        + rejects + "x - holding for a standing confirmed send.");
+                    // DROP RESCUE (live batch 36 root cause): the server rejects a
+                    // placement clipping an entity — a leftover drop INSIDE the cell
+                    // blocks every send, standing or not, until collected. Walk onto
+                    // it (vanilla proximity pickup en route), then the resumed leg's
+                    // standing re-send lands. addFirst keeps the print leg queued;
+                    // "printDropPickup" is outside adaptivePaceHold's leg scope so
+                    // the escalation pin does not deadlock the walk. Sub-floor drops
+                    // route to the recovery dig instead.
+                    ItemEntity blocker = mod.slave.scan.findDropInCell(pending);
+                    if (blocker != null && !mod.slave.scan.isSubFloorDrop(blocker)
+                        && !mod.checkpoints.isEmpty()
+                        && !"printDropPickup".equals(mod.checkpoints.getFirst().getRight().getLeft())) {
+                        mod.checkpoints.addFirst(new Pair(new Vec3d(blocker.getX(), blocker.getY(), blocker.getZ()),
+                            new Pair("printDropPickup", null)));
+                        mod.info("§e[CONFIRM-PRINT]§7 cell blocked by a ground drop - walking onto it to pick it up, then re-printing.");
+                    }
                 } else if (rejects == 5) {
                     mod.warning("§6[CONFIRM-PRINT]§c PERSISTENT REJECTION: " + pending.toShortString()
                         + " rejected " + rejects + "x even standing - the pace-hold watchdog will release it to the repair pass.");

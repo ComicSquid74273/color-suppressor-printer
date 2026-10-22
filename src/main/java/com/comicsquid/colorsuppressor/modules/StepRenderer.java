@@ -100,10 +100,15 @@ final class StepRenderer {
                 }
             }
             // Special master points, distinct from the lane grid - rendered ONLY while
-            // their phase is relevant: the cartography lock position from the closing
-            // phase onward. (Both used to render every frame - the lock marker at rel
-            // x~98 showed up during every batch and looked like a stray checkpoint.)
+            // their phase is relevant: the S fill checkpoint (125,115) pre-run (batch -1,
+            // for the platform existence check) and throughout batch 0's hold-the-map
+            // walk; the cartography lock position from the closing phase onward. (Both
+            // used to render every frame - the lock marker at rel x~98 showed up during
+            // every batch and looked like a stray checkpoint.)
             ArrayList<Vec3d> specialPoints = new ArrayList<>();
+            if (mod.master.stepMasterBatch <= 0) {
+                specialPoints.add(new Vec3d(mod.lowerMapCorner.getX() + 125.5, mod.lowerMapCorner.getY() - 0.5, mod.lowerMapCorner.getZ() + 115.5));
+            }
             if (mod.cartographyTable != null
                 && (mod.master.stepMasterStage == StepMasterStage.CLOSING_WALK
                     || mod.master.stepMasterStage == StepMasterStage.WAIT_CLOSING_BREAK

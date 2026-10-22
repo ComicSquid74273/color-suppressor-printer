@@ -186,33 +186,10 @@ public final class StepCheckerLayers {
         return batch;
     }
 
-    /** Priming build: recessive-only - rec pair 0 at corner+0 + rec pair 1 at corner+2, NO dominants. */
-    public HashMap<BlockPos, Block> assemblePriming(BlockPos corner) {
-        HashMap<BlockPos, Block> batch = new HashMap<>();
-        addLayerAt(batch, recLayers.get(0), corner, 0);
-        addLayerAt(batch, recLayers.get(1), corner, 2);
-        return batch;
-    }
-
     /** Closing build: dominant pair 63 at corner+2 (lanes 126-127) - after batch 62, swept from x=253. */
     public HashMap<BlockPos, Block> assembleClosing(BlockPos corner) {
         HashMap<BlockPos, Block> batch = new HashMap<>();
         addLayerAt(batch, domLayers.get(63), corner, 2);
-        return batch;
-    }
-
-    /** Batch-0 SPLIT floor half: rec pair j at corner+0 + rec pair j+1 at corner+2 (no tops). */
-    public HashMap<BlockPos, Block> assembleFloorHalf(int j, BlockPos corner) {
-        HashMap<BlockPos, Block> batch = new HashMap<>();
-        addLayerAt(batch, recLayers.get(j), corner, 0);
-        addLayerAt(batch, recLayers.get(j + 1), corner, 2);
-        return batch;
-    }
-
-    /** Batch-0 SPLIT tops half: dominant pair j at corner+2 only. */
-    public HashMap<BlockPos, Block> assembleTopsHalf(int j, BlockPos corner) {
-        HashMap<BlockPos, Block> batch = new HashMap<>();
-        addLayerAt(batch, domLayers.get(j), corner, 2);
         return batch;
     }
 

@@ -10,9 +10,9 @@ import java.util.HashMap;
  * Two-bot step-checker coordination over the loopback TCP transport.
  *
  * Wire protocol (the ONLY messages this addon sends today):
- *   slave -> master: heartbeat, register, "step:<progress>"  (ready/break2done/done/closed)
- *   master -> slave: "step:<command>"                       (build/break2/breakall/prime/
- *                                                                buildhalf/close/closebreak/abort)
+ *   slave -> master: heartbeat, register, "step:<progress>"  (ready/break2done/done/echo/closed)
+ *   master -> slave: "step:<command>"                       (build/break2/breakall/
+ *                                                                close/closebreak/abort)
  * The legacy multi-slave printing protocol (layer/interval/pause/start/remove/skip/mine/
  * placeStatus/error/finished) was removed with the legacy two-layer engine - nothing
  * sends those messages anymore.
