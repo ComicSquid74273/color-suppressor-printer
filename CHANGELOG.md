@@ -93,6 +93,41 @@ box (budget renews instead of declaring complete over visible work).
 
 ## Change history (most recent first)
 
+### 2026-11-06 (ct) — NEW-ART NBT REJECTED: guard false-positive fixed + new PNG-to-NBT palette key supported (user: "why am i getting this issue??")
+
+**Symptom:** every export of the new art failed with "'*.nbt' is not a CLASSIC
+staircase export (x-span 128, y-span 126)". **Root causes (2):**
+
+1. **Guard false positive** — the y-span>100 reject in
+   `StepCheckerLayers.fromClassicStaircase` was calibrated on ONE good sample
+   (test_3-classic, y-span 49). y-span in a classic staircase is the art's
+   RELIEF height (longest monotone shade climb), art-dependent and legitimately
+   up to ~128: the new gradient-heavy art reliefs at 126 → false reject.
+   Verified the file obeys the proven shade law exactly (Δ(y−north) ∈ {-1,0,+1}
+   on all 16,384 art pixels, footprint 128×126×129 = Z-129). Fix: y-span check
+   DELETED; kept x-span>160 (the pre-encoded step-checker export measures
+   254×130×129 — caught with huge margin); ADDED maxZ<128 reject (2-layer
+   suppress exports have no z=128 tail; classic Z-129 always spans z 0..128,
+   which also makes the existing zOffset = maxZ−128 correct by construction).
+2. **Palette key renamed by the updated generator** — the live PNG-to-NBT site
+   (newer than our 2026-10-08 clone, which still writes `Name`) now writes
+   palette entries as `{id: "minecraft:x"}`. `Utils.getBlockPalette` read only
+   `Name` → empty palette → empty layers (silent garbage) had the guard passed.
+   Fix: `Name` OR `id`, stripping any inline `[props]` suffix.
+
+**Evidence (both user files decode bit-identically):** `imagen.nbt` (old
+writer, Name) and `imagen-classic.nbt` (new writer, id) decode to the SAME
+16,384-pixel (colour, shade) grid — 0 differences — despite 96 re-dithered
+materials, a cobblestone-vs-sparse noobline row, and uniform ±1 column offsets
+between them (all cancelled by the within-column shade law). Oracle totals for
+the art: **rec 12308 / dom 12198 / grand 24506** = the boot-verify acceptance
+numbers. test_3-classic (49), imagen (126): both valid classic staircases.
+
+**Impact:** palette reading (`Utils.getBlockPalette`) is shared by every map
+loader, so the `id` support fixes all modules for new-site exports. Files
+touched: `Utils.java`, `StepCheckerLayers.java`. NOTE: this entry is committed
+from a clean HEAD (cj); the parked restock/chest WIP (ck–cs) stays uncommitted.
+
 ### 2026-10-22 (cj) — RETRY-FIRST PICKER + RANGE−1 EDGE + PRINT-PHASE CHECKPOINTS REMOVED (user: "instead of waiting for unconfirmed block to wait for interaction range distance, wait til interaction range -1, and remove that u added small checkpoints in print phase, and give priority to retry Then closest new prints"; includes the rung-pacing half observed live on batch 39)
 
 **Live evidence (batch 39, jar 31c653b1):** batch 38 printed 664/664

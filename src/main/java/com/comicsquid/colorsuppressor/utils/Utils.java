@@ -233,10 +233,15 @@ public final class Utils {
             Optional<NbtCompound> block = paletteList.getCompound(i);
             if (block.isEmpty()) continue;
 
+            // Structure-format palette key: old writer uses "Name", the updated
+            // PNG-to-NBT site writes "id" (2026-11-05, imagen.nbt verified). The
+            // new style may carry inline state ("id": "x:y[props]") - strip it.
             Optional<String> blockName = block.get().getString("Name");
+            if (blockName.isEmpty()) blockName = block.get().getString("id");
             if (blockName.isEmpty()) continue;
+            String cleanName = blockName.get().split("\\[", 2)[0];
 
-            blockPaletteDict.put(i, new Pair(Registries.BLOCK.get(Identifier.of(blockName.get())), 0));
+            blockPaletteDict.put(i, new Pair(Registries.BLOCK.get(Identifier.of(cleanName)), 0));
         }
         return blockPaletteDict;
     }

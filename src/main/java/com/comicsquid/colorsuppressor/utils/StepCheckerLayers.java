@@ -93,11 +93,17 @@ public final class StepCheckerLayers {
                 maxY = Math.max(maxY, yOpt.get());
             }
         }
-        if (minX != Integer.MAX_VALUE && (maxX - minX > 160 || maxY - minY > 100)) {
+        // Pre-encoded step-checker exports are ~254 wide (phases side by side);
+        // 2-layer suppress exports lack the z=128 tail. A classic Z-129 staircase is
+        // always 128 wide with z 0..128. The y-span is the art's RELIEF height (the
+        // longest monotone shade climb) and is NOT a discriminator - test_3 reliefs
+        // at 49, the 2026-11 gradient art at 126, both valid (false-positive fix).
+        if (minX != Integer.MAX_VALUE && (maxX - minX > 160 || maxZ < 128)) {
             StepCheckerLayers reject = empty();
             reject.lastRejectReason = "x-span " + (maxX - minX + 1) + ", y-span " + (maxY - minY + 1)
-                + "). Pre-encoded step-checker/suppress exports stack phases "
-                + "vertically and produce WRONG layers. Export the art in staircase mode (Z-129) and use that file.";
+                + ", z-max " + maxZ + "). Pre-encoded step-checker exports are x-stacked and "
+                + "2-layer suppress exports lack the Z-129 tail - both produce WRONG layers. "
+                + "Export the art in staircase mode (Z-129) and use that file.";
             return reject;   // caller logs lastRejectReason with the file name
         }
         int xOffset = minX == Integer.MAX_VALUE ? 0 : minX;
